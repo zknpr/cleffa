@@ -33,6 +33,9 @@ make clean
   as objects in the Makefile so they get one; don't hand-list headers.
 - Benchmarks in `bench/*.m` are standalone and built by hand, e.g.
   `clang -O2 -fobjc-arc bench/gemm_bench.m -framework Metal -framework Foundation -o gemm-bench`.
+- `bench/jev_compare.py` compares SystemOne endpoints (Jev's API, `clef-server`) on the corpus:
+  `collect URL MODEL OUT REQUESTS --key-file jev.api`, then `compare A B ...`. The key file is
+  git-ignored; the script sends it only in the Authorization header and never prints it.
 - Python always runs through `.venv/bin/python` (Python 3.12, torch 2.11, transformers 5.10.2,
   tokenizers 0.22.2). `pyrightconfig.json` points at it.
 

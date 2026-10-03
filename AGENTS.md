@@ -33,4 +33,4 @@ The repository is git (`cleffa`). Stage explicit paths and use concise imperativ
 
 ## Security and configuration
 
-Treat requests and GGUF files as untrusted. Preserve bounds checks, request ownership, and strict-mode defaults. Keep public serving behind an authenticating, rate-limiting proxy. Import reference model code only from pinned snapshots.
+Treat requests and GGUF files as untrusted. Preserve bounds checks, request ownership, and strict-mode defaults. Keep public serving behind an authenticating, rate-limiting proxy. Import reference model code only from pinned snapshots. API keys (`jev.api` for `bench/jev_compare.py`) live in git-ignored files and are never printed or committed.

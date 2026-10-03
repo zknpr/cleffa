@@ -211,7 +211,8 @@ Host-side pieces must match Python byte for byte, and they do:
 Measured as the median of three warm passes, with BF16 activations. FP16 activations (the
 default since) measure the same within noise: 96.9 vs 96.2 ms median for a 260-token request.
 The Jev figure is Cloudflare's published median for its own corpus and hardware, so it's a
-target, not a like-for-like comparison.
+target, not a like-for-like comparison. A same-corpus measurement against Jev's API is in
+[Against Jev's hosted API](#against-jevs-hosted-api).
 
 **Idle traffic is slower.** Both columns were measured back to back. After the GPU has been idle
 for about a second its clocks ramp down, and the next request pays for it. On clef-flash with a
@@ -275,6 +276,53 @@ Idle gaps cost more on the 27B, for the same 260-token request:
 Under sparse traffic the 27B is slower than Jev's median. The engine is 1.3–1.6× faster than
 PyTorch up to ~360 tokens and 1.25–1.3× faster from 594 tokens up. The 27B hasn't been profiled,
 so where its long-input time goes is not yet measured.
+
+## Against Jev's hosted API
+
+Jev is Typesafe's own model behind the same SystemOne API, not Clef. On 2026-10-03 the corpus ran
+against Jev's API (`jev-latest`, which answered as `jev-1.13.0`) and against `clef-server` on
+localhost, with `bench/jev_compare.py`. Each endpoint got one warm-up request, then three
+back-to-back passes on one keep-alive connection, from an M5 Max in Italy.
+
+Jev's times include the network. An authenticated `GET /v1/models` took 192 ms (median) from
+here, so most of Jev's time is round trip, and its numbers depend on where the client is.
+
+| Requests (Clef tokens) | Jev (incl. network) | cleffa 27B | cleffa flash |
+|---|---:|---:|---:|
+| 17 requests, 153–363 tokens | 230–261 ms | 236–484 ms | 78–155 ms |
+| 594 tokens, 6 questions | 234 ms | 826 ms | 231 ms |
+| 2,235 | 273 ms | 3.03 s | 0.83 s |
+| 8,072 | 287 ms | 14.6 s | 4.26 s |
+| 16,347 | 334 ms | 42.3 s | 12.9 s |
+| **median (21 requests)** | **240 ms** | **398 ms** | **139 ms** |
+
+The 27B column is in the heat-soaked regime (the long requests run in every pass). Jev reported
+the full input (16,445 tokens for the 16k request), so it doesn't truncate.
+
+Jev rejects one corpus request: a `noul` question with neither instructions nor criteria, which
+the Clef reference accepts (`Noul question must have criteria or instructions`). The table and
+the comparison below cover the other 21.
+
+The corpus has no labels, so this measures agreement, not accuracy:
+
+| Pair | Same decision | Median total-variation distance |
+|---|---:|---:|
+| Jev vs cleffa 27B | 43/45 questions | 0.040 |
+| Jev vs cleffa flash | 38/45 | 0.041 |
+| cleffa 27B vs cleffa flash | 41/46 | 0.024 |
+
+Jev and the 27B differ on two low-margin questions: a double-charge ticket's urgency (Jev "this
+week" at 0.56, the 27B "today" at 0.62), and the most-affected service in an 8k-token log of
+uniformly random lines, where Jev's pick has the most 5xx statuses and the 27B's the most ERROR
+lines. For labeled accuracy, see Cloudflare's model card, where Clef and Jev each lead on
+different benchmarks.
+
+Jev's probabilities are rounded to two decimals and changed by up to 0.08 between passes; its
+decisions didn't. cleffa's responses were byte-identical across passes.
+
+Against Jev from here, local flash is faster on every request up to 363 tokens and level at 594.
+The 27B is slower on all but the shortest (153 tokens: 236 vs 254 ms). Jev's lead grows with
+length: 3× (flash) to 11× (27B) at 2k tokens, 39× to 127× at 16k.
 
 ## Design
 
