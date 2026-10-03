@@ -25,6 +25,7 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).parent))
 import corpus  # noqa: E402
+import golden_io  # noqa: E402
 
 
 def sync(device: str) -> None:
@@ -74,20 +75,7 @@ def main() -> None:
         for index, request in enumerate(requests):
             rf.write(json.dumps(request, ensure_ascii=False) + "\n")
             encoded = encode_record(tokenizer, request)
-            ef.write(json.dumps({
-                "id": request["id"],
-                "input_ids": list(encoded.input_ids),
-                "questions": [
-                    {
-                        "id": q.question_id,
-                        "type": q.question_type,
-                        "span": list(q.question_span),
-                        "option_spans": [list(s) for s in q.option_spans],
-                        "option_ids": list(q.option_ids),
-                    }
-                    for q in encoded.questions
-                ],
-            }, ensure_ascii=False) + "\n")
+            ef.write(golden_io.encoded_line(request, encoded))
 
             captured: dict[str, torch.Tensor] = {}
             hooks = []

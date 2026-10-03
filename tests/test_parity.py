@@ -43,6 +43,11 @@ def main() -> None:
     enc_c = subprocess.run([ROOT / "clef-tool", "encode", gguf], stdin=open(requests), capture_output=True,
                            text=True, check=True).stdout.splitlines()
     enc_g = [json.loads(l) for l in open(golden / "encoded.jsonl")]
+    n_req = sum(1 for _ in open(requests))
+    # zip() stops at the shorter list: missing output must fail, not shrink the comparison (review #4)
+    if not (len(enc_c) == len(enc_g) == n_req):
+        print(f"token ids: FAIL ({len(enc_c)} encoded by clef-tool, {len(enc_g)} golden, {n_req} requests)")
+        failures += 1
     bad = sum(json.loads(c)["input_ids"] != g["input_ids"] for c, g in zip(enc_c, enc_g))
     print(f"token ids: {len(enc_g) - bad}/{len(enc_g)} identical")
     failures += bad
@@ -79,10 +84,21 @@ def main() -> None:
     max_dl = max_dp = 0.0
     n_q = agree = 0
     worst = None
-    for req, line in zip((json.loads(l) for l in open(requests)), rows):
+    # every request must answer exactly the golden questions with the golden option counts; a short
+    # or partial output used to pass as "agreement 0/0" (review #4)
+    if len(rows) != n_req:
+        print(f"decisions: FAIL ({len(rows)} responses for {n_req} requests)")
+        failures += 1
+    for req, enc, line in zip((json.loads(l) for l in open(requests)), enc_g, rows):
         got = json.loads(line)
         if "error" in got:
             print(f"  {req['id']}: engine error {got['error']}")
+            failures += 1
+            continue
+        want = {q["id"]: len(q["option_ids"]) for q in enc["questions"]}
+        have = {qid: len(v) for qid, v in got.items()}
+        if have != want:
+            print(f"  {req['id']}: questions/options {have} differ from the golden {want}")
             failures += 1
             continue
         for qid, logits in got.items():

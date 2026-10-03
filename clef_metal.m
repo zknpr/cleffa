@@ -31,6 +31,8 @@ struct clef_gpu {
     bool debug_poison;                // CLEF_DEBUG_POISON=1 (tests): fill every activation buffer with NaN before each forward
     bool profile;                     // CLEF_PROFILE=1: GPU time per kernel category (serializes!)
     double prof_ms[8];
+    bool cb_failed;                   // a command buffer or encoder could not be created this pass
+    int nil_cb_at, cb_count;          // test hook CLEF_DEBUG_NIL_CMDBUF: creation #nil_cb_at fails
 };
 
 enum { P_GEMM, P_ATTN, P_SCAN, P_OTHER, P_N };
@@ -39,6 +41,18 @@ enum { ACT_NORM = 1, ACT_ATTN = 2, ACT_GDN = 4, ACT_MLP = 8 };
 enum { X_BF16, X_F16, X_F32 };
 static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "other" };
 
+// Command buffers and encoders are nullable (device loss, resource exhaustion). Messages to nil
+// are no-ops and a nil buffer has no .error, so a missing one let the pass "succeed" without
+// running and the head read the previous pass's activations, another request's (review #4,
+// tests/test_gpu_fail.sh). Every creation goes through here; a failure sticks for the pass and
+// clef_gpu_forward reports it.
+static bool new_cb(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc) {
+    *cb = ++g->cb_count == g->nil_cb_at ? nil : [g->queue commandBuffer];
+    *enc = *cb ? [*cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial] : nil;
+    if (!*cb || !*enc) g->cb_failed = true;
+    return !g->cb_failed;
+}
+
 // Profiling: end the current command buffer, attribute its GPU time to `cat`, start a new one.
 static void prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc, int cat) {
     if (!g->profile) return;
@@ -46,8 +60,7 @@ static void prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCo
     [*cb commit];
     [*cb waitUntilCompleted];
     g->prof_ms[cat] += ((*cb).GPUEndTime - (*cb).GPUStartTime) * 1e3;
-    *cb = [g->queue commandBuffer];
-    *enc = [*cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+    new_cb(g, cb, enc);   // a failure is checked at the end of the pass
 }
 
 static bool gerr(char *err, size_t errlen, const char *msg) {
@@ -123,6 +136,7 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         // (tiny GEMMs); CLEF_HEAD_BF16=1 restores the BF16 rounding the HF BF16 path applies there.
         g->act_f16 = getenv("CLEF_ACT_F16") ? atoi(getenv("CLEF_ACT_F16")) & 15 : ACT_NORM | ACT_ATTN | ACT_GDN | ACT_MLP;
         g->head_f32 = getenv("CLEF_HEAD_BF16") == NULL;
+        g->nil_cb_at = getenv("CLEF_DEBUG_NIL_CMDBUF") ? atoi(getenv("CLEF_DEBUG_NIL_CMDBUF")) : 0;
         // test hook (tests/test_f16_overflow.sh): a lower limit forces the BF16 rerun on real inputs
         g->f16_lim = getenv("CLEF_DEBUG_F16_LIMIT") ? strtof(getenv("CLEF_DEBUG_F16_LIMIT"), NULL) : 65504.0f;
         if (!(g->f16_lim > 0.0f) || g->f16_lim > 65504.0f) g->f16_lim = 65504.0f;
@@ -286,8 +300,10 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
         const int x_gdn = f_gdn ? X_F16 : X_BF16, x_mlp = f_mlp ? X_F16 : X_BF16;
         const int n_ssm = C + c->Hv * c->dv + 2 * c->Hv;
         const int n_attn = c->nh * 2 * c->hd + 2 * c->nkv * c->hd;
-        id<MTLCommandBuffer> cb = [g->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+        id<MTLCommandBuffer> cb;
+        id<MTLComputeCommandEncoder> enc;
+        g->cb_failed = false;
+        if (!new_cb(g, &cb, &enc)) return gerr(err, errlen, "cannot create a command buffer");
 
         // embedding
         {
@@ -305,8 +321,7 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
             [cb waitUntilCompleted];
             if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
             memcpy(dump_layers, (float *)g->x.contents + (size_t)(T - R) * H, (size_t)R * H * 4);
-            cb = [g->queue commandBuffer];
-            enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+            if (!new_cb(g, &cb, &enc)) return gerr(err, errlen, "cannot create a command buffer");
         }
 
         for (int l = 0; l < c->n_layer; l++) {
@@ -462,8 +477,7 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
                 [cb waitUntilCompleted];
                 if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
                 memcpy(dump_layers + (size_t)(l + 1) * R * H, (float *)g->x.contents + (size_t)(T - R) * H, (size_t)R * H * 4);
-                cb = [g->queue commandBuffer];
-                enc = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeSerial];
+                if (!new_cb(g, &cb, &enc)) return gerr(err, errlen, "cannot create a command buffer");
             }
         }
 
@@ -529,6 +543,7 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
         [cb commit];
         [cb waitUntilCompleted];
         if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
+        if (g->cb_failed) return gerr(err, errlen, "cannot create a command buffer (mid-pass)");   // see new_cb
         if (dump_layers) memcpy(dump_layers + (size_t)(c->n_layer + 1) * R * H, (float *)g->hfin.contents + (size_t)(T - R) * H, (size_t)R * H * 4);
         if (g->profile) {
             g->prof_ms[P_OTHER] += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;

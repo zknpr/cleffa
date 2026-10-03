@@ -71,7 +71,8 @@ Limits:
 | Headers | 16 KiB |
 | Body | `--max-body` (default 8 MiB) |
 | Connections | `--max-conn` (default 256) |
-| Socket I/O timeout | 30 s |
+| Request deadline | 30 s for headers and body together, measured monotonically (not per read) |
+| Error-response drain | 1 s and 1 MiB |
 
 Chunked bodies and duplicate `Content-Length` headers are refused. Error responses use a lingering
 close so they aren't lost to a TCP reset. `tests/test_server.py` checks HTTP output byte for byte
@@ -309,15 +310,17 @@ tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    # b
 tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # no read-before-write (NaN-poisoned buffers)
 tests/test_grow_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl # engine stays correct after a failed buffer growth
 tests/test_f16_overflow.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl # FP16 overflow -> per-record BF16 rerun
+tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl  # a failed Metal command buffer is an error, never stale results
 .venv/bin/python tests/test_strict.py gguf/clef-flash.gguf model-flash        # strict mode vs tokenizers reference
 .venv/bin/python tests/test_truncation.py gguf/clef-flash.gguf model-flash    # over-long state rejected exactly when the reference would cut it
 .venv/bin/python tests/verify_gguf.py model-flash gguf/clef-flash.gguf        # converter byte-exactness
 # against a running clef-server on PORT (test_server_hol needs --truncate; test_server_retry needs
-# CLEF_DEBUG_FAIL_MULTI=1 on the server):
+# CLEF_DEBUG_FAIL_MULTI=1 on the server; test_server_slow needs CLEF_DEBUG_IO_TIMEOUT=2):
 .venv/bin/python tests/test_server.py PORT gguf/clef-flash.gguf golden/clef-flash/requests.jsonl
 .venv/bin/python tests/test_server_hol.py PORT golden/clef-flash/requests.jsonl
 .venv/bin/python tests/test_server_headers.py PORT        # 16 KiB header limit holds for split and keep-alive reads
 .venv/bin/python tests/test_server_retry.py PORT golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
+.venv/bin/python tests/test_server_slow.py PORT           # trickling clients are dropped at the request deadline
 ```
 
 The FP32 ground truth for the 27B, which doesn't fit in FP32, comes from `ref/oracle_f32_stream.py`.
@@ -336,6 +339,11 @@ Debug hooks for tests:
 - `CLEF_DEBUG_FAIL_MULTI=1` fails every multi-record forward.
 - `CLEF_DEBUG_GROW_FAIL_ABOVE=N` fails activation-buffer growth past N tokens.
 - `CLEF_DEBUG_F16_LIMIT=X` treats FP16 operands above X as overflow.
+- `CLEF_DEBUG_NIL_CMDBUF=N` makes the Nth Metal command-buffer creation fail.
+- `CLEF_DEBUG_IO_TIMEOUT=S` shortens the server's request deadline to S seconds.
+
+Golden directories written before `ref/oracle_f32_stream.py` produced `encoded.jsonl` can get one
+with `ref/write_encoded.py MODEL_DIR GOLDEN_DIR`, which uses the tokenizer only.
 
 Precision diagnostics: `ref/act_stats.py MODEL` (largest Linear input per projection over the
 corpus) and `bench/mixed_bench.m` (GEMM rate and error for BF16, FP16 and FP32 activations).

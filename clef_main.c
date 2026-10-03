@@ -11,6 +11,7 @@
  *   --no-truncate reject requests whose state does not fit, instead of silently cutting it
  */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -96,9 +97,10 @@ int main(int argc, char **argv) {
     size_t cap = 0;
     bool dumped = false;
     int rc = 0;
+    int read_err = 0;
     for (;;) {
         int n = 0;
-        ssize_t len;
+        ssize_t len = 0;
         while (n < batch && (len = getline(&line, &cap, in)) >= 0) {
             while (len && (line[len - 1] == '\n' || line[len - 1] == '\r')) line[--len] = '\0';
             if (!len) continue;
@@ -115,6 +117,9 @@ int main(int argc, char **argv) {
             opts.reject_truncation = no_truncate;
             it->ok = it->encoded = it->req && clef_encode_request(e->tok, it->req, opts, &it->rec, it->err, sizeof(it->err));
         }
+        /* getline() returns -1 for EOF and for a read error (EISDIR, EIO, ENOMEM) alike; an error
+         * must not pass for a complete input (review #4). Lines read before it are still answered. */
+        if (len < 0 && ferror(in) && !read_err) read_err = errno ? errno : EIO;
         if (!n) break;
         int m = 0;
         for (int i = 0; i < n; i++) if (items[i].ok) { recs[m] = items[i].rec; map[m++] = i; }
@@ -170,6 +175,10 @@ int main(int argc, char **argv) {
             free(items[i].line);
         }
         fflush(stdout);
+    }
+    if (read_err) {
+        fprintf(stderr, "clef: cannot read %s: %s\n", input ? input : "stdin", strerror(read_err));
+        rc = 1;
     }
     free(line); free(items); free(recs); free(map);
     if (in != stdin) fclose(in);

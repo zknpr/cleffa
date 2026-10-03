@@ -6,7 +6,7 @@ requests' hidden states pass through it, and it is cast back. Peak extra memory 
 in f32 plus the hidden states. Mirrors Qwen3_5TextModel.forward and ClefModel.forward for
 text-only records (batch of one per request).
 
-Writes golden/<name>/{requests.jsonl, logits.safetensors, layers/<id>.safetensors}.
+Writes golden/<name>/{requests.jsonl, encoded.jsonl, logits.safetensors, layers/<id>.safetensors}.
 Validate against oracle.py --dtype float32 on a model that fits (tests: clef-flash).
 """
 
@@ -23,6 +23,7 @@ from safetensors.torch import save_file
 
 sys.path.insert(0, str(Path(__file__).parent))
 import corpus  # noqa: E402
+import golden_io  # noqa: E402
 
 
 def main() -> None:
@@ -105,6 +106,10 @@ def main() -> None:
     with open(out / "requests.jsonl", "w") as f:
         for r in requests:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    # tests/test_parity.py needs it (token ids, expected questions); it was missing here (review #4)
+    with open(out / "encoded.jsonl", "w") as f:
+        for r, enc in zip(requests, encoded):
+            f.write(golden_io.encoded_line(r, enc))
     save_file(logits_out, out / "logits.safetensors")
     for req, d in zip(requests, dumps):
         save_file({k: v.contiguous() for k, v in d.items()}, out / "layers" / f"{req['id']}.safetensors")

@@ -1,6 +1,10 @@
 CC      ?= clang
 CFLAGS  ?= -O2 -g -std=c11 -Wall -Wextra -Wno-unused-parameter -D_DARWIN_C_SOURCE -DACCELERATE_NEW_LAPACK
 OBJCFLAGS = $(CFLAGS) -fobjc-arc
+# Header dependencies come from the compiler (*.d files): every object rebuilds when any header it
+# includes changes, directly or through clef_engine.h. A hand-written list missed the transitive
+# ones, so a struct change could link objects built against different layouts (review #4).
+DEPFLAGS = -MMD -MP
 LDFLAGS ?=
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
@@ -12,27 +16,22 @@ ENGINE_OBJS = clef.o clef_head.o clef_metal.o
 
 all: clef clef-server clef-tool
 
+%.o: %.c
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
 clef_metal_src.inc: metal/clef.metal
 	{ printf 'static const char clef_metal_src[] = {'; xxd -i < $< ; printf '};\nstatic const unsigned long clef_metal_src_len = sizeof(clef_metal_src);\n'; } > $@
 
-clef_metal.o: clef_metal.m clef_metal_src.inc clef_engine.h
-	$(CC) $(OBJCFLAGS) -c -o $@ $<
+clef_metal.o: clef_metal.m clef_metal_src.inc
+	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -c -o $@ $<
 
-clef.o: clef.c clef_engine.h
-clef_head.o: clef_head.c clef_engine.h
-
-clef: clef_main.c $(ENGINE_OBJS) $(HOST_OBJS)
+clef: clef_main.o $(ENGINE_OBJS) $(HOST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(FRAMEWORKS)
 
-clef-server: clef_server.c $(ENGINE_OBJS) $(HOST_OBJS)
+clef-server: clef_server.o $(ENGINE_OBJS) $(HOST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(FRAMEWORKS) -lpthread
 
-clef_tok.o: clef_tok.c clef_tok.h clef_gguf.h clef_unicode.inc
-clef_json.o: clef_json.c clef_json.h
-clef_gguf.o: clef_gguf.c clef_gguf.h
-clef_record.o: clef_record.c clef_record.h clef_json.h clef_tok.h
-
-clef-tool: tests/clef_tool.c $(HOST_OBJS)
+clef-tool: tests/clef_tool.o $(HOST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
 # clef_unicode.inc is committed and regenerated only on purpose (`make unicode`): its Unicode version
@@ -40,8 +39,8 @@ clef-tool: tests/clef_tool.c $(HOST_OBJS)
 unicode:
 	.venv/bin/python tools/gen_unicode.py > clef_unicode.inc
 
-tests/test-head-attend: tests/test_head_attend.c clef_head.c $(HOST_OBJS)
-	$(CC) $(CFLAGS) -o $@ tests/test_head_attend.c $(HOST_OBJS) $(LDFLAGS) -framework Accelerate
+tests/test-head-attend: tests/test_head_attend.o $(HOST_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -framework Accelerate
 
 test: clef-tool tests/test-head-attend
 	tests/test-head-attend
@@ -49,4 +48,6 @@ test: clef-tool tests/test-head-attend
 	.venv/bin/python tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
 
 clean:
-	rm -f *.o clef clef-server clef-tool tests/test-head-attend clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d clef clef-server clef-tool tests/test-head-attend clef_metal_src.inc
+
+-include $(wildcard *.d tests/*.d)

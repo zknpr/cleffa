@@ -60,6 +60,7 @@ static struct {
     bool strict;             /* default on: content cannot inject chat-control tokens (--no-strict = reference) */     /* token budget per forward pass (the head job is always admitted) */
     size_t max_body;
     int max_conn;
+    double io_timeout;       /* seconds; request deadline and per-write timeout (IO_TIMEOUT_S) */
     atomic_int conns;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -165,11 +166,28 @@ static bool respond_error(int fd, int status, const char *msg, bool keep_alive) 
     return ok;
 }
 
-/* Reads one request. Returns 0 on success, -1 on EOF/IO error (close silently), or an
- * HTTP status for a protocol error to report. *buf keeps any bytes read past the body. */
+/* SO_RCVTIMEO bounds each read only, so a client that keeps trickling a byte at a time could hold
+ * a connection (and one of --max-conn slots) for as long as it liked: slowloris (review #4,
+ * tests/test_server_slow.py). Reads therefore run against a monotonic deadline: before each read
+ * the socket timeout is set to the time left, and none left means give up. */
+static double now_s(void) { return now_ms() / 1e3; }
+
+static bool read_deadline(int fd, double deadline) {
+    const double left = deadline - now_s();
+    if (left <= 0) return false;
+    struct timeval tv = { (time_t)left, (suseconds_t)((left - (double)(time_t)left) * 1e6) };
+    if (tv.tv_sec == 0 && tv.tv_usec == 0) tv.tv_usec = 1;   /* zero would mean no timeout */
+    return setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) == 0;
+}
+
+/* Reads one request. Returns 0 on success, -1 on EOF/IO error/deadline (close silently), or an
+ * HTTP status for a protocol error to report. *buf keeps any bytes read past the body. The whole
+ * request, headers and body, must arrive within S.io_timeout of the call (on a keep-alive
+ * connection that includes waiting for it). */
 typedef struct { char *p; size_t len, cap; } rbuf;
 
 static int read_request(int fd, rbuf *in, char **method, char **path, char **body, size_t *body_len, bool *keep_alive) {
+    const double deadline = now_s() + S.io_timeout;
     size_t hdr_end = 0;
     for (;;) {
         char *e = in->len >= 4 ? memmem(in->p, in->len, "\r\n\r\n", 4) : NULL;
@@ -191,6 +209,7 @@ static int read_request(int fd, rbuf *in, char **method, char **path, char **bod
          * earlier body on this keep-alive connection */
         size_t want = in->cap - in->len;
         if (want > MAX_HEADER + 4 - in->len) want = MAX_HEADER + 4 - in->len;
+        if (!read_deadline(fd, deadline)) return -1;
         ssize_t r = read(fd, in->p + in->len, want);
         if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
         in->len += (size_t)r;
@@ -249,6 +268,7 @@ static int read_request(int fd, rbuf *in, char **method, char **path, char **bod
         in->cap = need;
     }
     while (in->len < need) {
+        if (!read_deadline(fd, deadline)) return -1;
         ssize_t r = read(fd, in->p + in->len, need - in->len);
         if (r <= 0) { if (r < 0 && errno == EINTR) continue; return -1; }
         in->len += (size_t)r;
@@ -304,14 +324,14 @@ static void handle_systemone(int fd, const char *body, size_t len, bool keep_ali
 
 /* Error close with unread input: closing a TCP socket while bytes are pending sends RST,
  * which can destroy the error response before the client reads it. Half-close, then drain
- * briefly (bounded in time and bytes) so the response is delivered. */
+ * briefly so the response is delivered: at most 1 MiB and 1 s in total (a per-read timeout
+ * alone let a trickling client stretch the drain indefinitely, review #4). */
 static void lingering_close(int fd) {
     shutdown(fd, SHUT_WR);
-    struct timeval tv = { 1, 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    const double deadline = now_s() + (S.io_timeout < 1.0 ? S.io_timeout : 1.0);
     char sink[4096];
     size_t drained = 0;
-    while (drained < (1u << 20)) {
+    while (drained < (1u << 20) && read_deadline(fd, deadline)) {
         ssize_t r = read(fd, sink, sizeof(sink));
         if (r <= 0) break;
         drained += (size_t)r;
@@ -389,6 +409,10 @@ int main(int argc, char **argv) {
     S.strict = true;
     S.max_body = 8u << 20;
     S.max_conn = 256;
+    S.io_timeout = IO_TIMEOUT_S;
+    /* test hook (tests/test_server_slow.py): a short deadline instead of 30 s */
+    if (getenv("CLEF_DEBUG_IO_TIMEOUT")) S.io_timeout = atof(getenv("CLEF_DEBUG_IO_TIMEOUT"));
+    if (!(S.io_timeout > 0)) S.io_timeout = IO_TIMEOUT_S;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
@@ -446,8 +470,8 @@ int main(int argc, char **argv) {
             close(fd);
             continue;
         }
-        struct timeval tv = { IO_TIMEOUT_S, 0 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        struct timeval tv = { (time_t)S.io_timeout, (suseconds_t)((S.io_timeout - (double)(time_t)S.io_timeout) * 1e6) };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));   /* replaced per read by read_deadline */
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
