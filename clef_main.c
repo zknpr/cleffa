@@ -139,7 +139,9 @@ int main(int argc, char **argv) {
             it->ok = it->encoded = it->req && clef_encode_request(e->tok, it->req, opts, &it->rec, it->err, sizeof(it->err));
         }
         /* getline() returns -1 for EOF and for a read error (EISDIR, EIO, ENOMEM) alike; an error
-         * must not pass for a complete input (review #4). Lines read before it are still answered. */
+         * must not pass for a complete input (review #4). Lines read before it are still answered,
+         * then the run ends (the break after the batch): stdio retries a failed read, so after a
+         * transient error the lines that followed it used to be read and answered too (review #5). */
         if (len < 0 && ferror(in) && !read_err) read_err = errno ? errno : EIO;
         if (!n) break;
         int m = 0;

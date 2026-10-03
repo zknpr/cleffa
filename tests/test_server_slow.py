@@ -9,7 +9,9 @@ drops the connection:
   - headers that never finish;
   - a body that never finishes;
   - the drain after an error response (413), which used to read until 1 MiB had arrived.
-Pass: every connection is dropped within the deadline plus slack, well before the 10 s cap.
+Pass: every connection is dropped within the deadline plus slack, well before the 10 s cap, and
+the header and body arms not before the deadline, so a server that drops every slow connection at
+once fails too (review #5).
 """
 
 from __future__ import annotations
@@ -61,7 +63,7 @@ def main() -> None:
     fails = 0
     for name, prefix, expect_response in arms:
         dt, got = trickle(port, prefix, expect_response)
-        ok = dt <= TIMEOUT + SLACK and (not expect_response or got.startswith(b"HTTP/1.1 413"))
+        ok = dt <= TIMEOUT + SLACK and (got.startswith(b"HTTP/1.1 413") if expect_response else dt >= TIMEOUT - 0.5)
         fails += not ok
         shown = "still open at the 10 s cap" if dt == float("inf") else f"dropped after {dt:.1f} s"
         print(f"{name:22s} {shown:28s} {'OK' if ok else 'FAIL'}")

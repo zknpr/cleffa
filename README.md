@@ -328,6 +328,7 @@ tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl  # 
 .venv/bin/python -B tests/test_server_headers.py PORT        # 16 KiB header limit holds for split and keep-alive reads
 .venv/bin/python -B tests/test_server_retry.py PORT golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
 .venv/bin/python -B tests/test_server_slow.py PORT           # trickling clients are dropped at the request deadline
+tests/test_lingering_close.sh gguf/clef-flash.gguf        # starts its own server: an error response drains a half-closed client's body
 ```
 
 `test_parity.py` requires exact token ids and argmax agreement, finite logits/residuals, maximum
@@ -372,8 +373,11 @@ Requests and GGUF files are treated as untrusted:
   into another tenant's response; that bug is fixed and `tests/test_batch.sh` guards it.
 - **Server exposure:** the server binds to localhost by default. Exposing it with `--host` puts
   the GPU behind one FIFO queue. A long request (16k tokens takes ~12 s on clef-flash) is never
-  co-batched with short ones, but it does delay everything queued behind it, and slow clients can hold connection slots for up to 30 s each, up to
-  `--max-conn`. Put it behind an authenticating proxy with per-client rate limits before
+  co-batched with short ones, but it does delay everything queued behind it. Connection slots
+  are not protected either. The 30 s deadline bounds a request, not a connection, so a client that
+  sends a valid request on a keep-alive connection more often than that (a `GET /health` will
+  do) keeps its slot indefinitely, and `--max-conn` such connections get every other client a 503.
+  Put it behind an authenticating proxy with per-client rate and connection limits before
   exposing it.
 
 **Prompt-template injection, and strict mode.** The reference tokenizes request content with

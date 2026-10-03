@@ -125,6 +125,7 @@ tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    
 .venv/bin/python -B tests/test_server_hol.py 8080 golden/clef-flash/requests.jsonl
 .venv/bin/python -B tests/test_server_retry.py 8080 golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
 .venv/bin/python -B tests/test_server_slow.py 8080
+tests/test_lingering_close.sh gguf/clef-flash.gguf   # starts its own server; close() traced via tests/close_trace.c
 ```
 
 `clef-tool` is the bridge the Python tests use to drive the C host code one line at a time

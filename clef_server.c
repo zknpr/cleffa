@@ -12,7 +12,8 @@
  * not depend on batch composition (tests/test_batch.sh), so batching is invisible to clients.
  *
  * Exposure: binds 127.0.0.1 by default. Every input is bounded: request line + headers
- * (16 KiB), body (--max-body), connections (--max-conn), and a per-socket I/O timeout.
+ * (16 KiB), body (--max-body), connections (--max-conn), and a deadline per request. Slots are
+ * not protected from clients that keep sending valid requests (see read_deadline).
  * Strict mode (default): request content is tokenized without special-token recognition, so a
  * literal "<|im_end|>" cannot close the template's user turn. --no-strict reproduces the
  * reference exactly, including that injection (README, Security notes).
@@ -24,6 +25,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -169,7 +171,11 @@ static bool respond_error(int fd, int status, const char *msg, bool keep_alive) 
 /* SO_RCVTIMEO bounds each read only, so a client that keeps trickling a byte at a time could hold
  * a connection (and one of --max-conn slots) for as long as it liked: slowloris (review #4,
  * tests/test_server_slow.py). Reads therefore run against a monotonic deadline: before each read
- * the socket timeout is set to the time left, and none left means give up. */
+ * the socket timeout is set to the time left, and none left means give up.
+ * This bounds a request, not a slot. A client that sends a complete request on a keep-alive
+ * connection more often than the deadline (a 24-byte GET /health will do) keeps its slot, and
+ * --max-conn such connections get everyone else 503 (review #5). Nothing here can tell that
+ * client from a legitimate one; per-client limits belong in a proxy in front (README, Security). */
 static double now_s(void) { return now_ms() / 1e3; }
 
 static bool read_deadline(int fd, double deadline) {
@@ -327,13 +333,23 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
 /* Error close with unread input: closing a TCP socket while bytes are pending sends RST,
  * which can destroy the error response before the client reads it. Half-close, then drain
  * briefly so the response is delivered: at most 1 MiB and 1 s in total (a per-read timeout
- * alone let a trickling client stretch the drain indefinitely, review #4). */
+ * alone let a trickling client stretch the drain indefinitely, review #4).
+ * The wait is poll(), not read_deadline(): when the client has half-closed too, the socket is
+ * shut both ways after our shutdown, macOS then fails setsockopt with EINVAL, and the drain was
+ * skipped with the body unread (review #5, tests/test_lingering_close.sh). After POLLIN a read
+ * returns at once, with data or EOF. */
 static void lingering_close(int fd) {
     shutdown(fd, SHUT_WR);
     const double deadline = now_s() + (S.io_timeout < 1.0 ? S.io_timeout : 1.0);
     char sink[4096];
     size_t drained = 0;
-    while (drained < (1u << 20) && read_deadline(fd, deadline)) {
+    while (drained < (1u << 20)) {
+        const double left = deadline - now_s();
+        if (left <= 0) break;
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        int pr = poll(&pfd, 1, (int)(left * 1e3) + 1);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr <= 0) break;
         ssize_t r = read(fd, sink, sizeof(sink));
         if (r <= 0) break;
         drained += (size_t)r;
