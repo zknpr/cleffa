@@ -167,6 +167,9 @@ score-matrix offset `h·T²` reaches 2^32, a 32-bit overflow.
 - **Who it hits:** the 27B (24 heads) from 13,666 tokens. clef-flash (16 heads) never reaches it
   within its 16,384-token window.
 - **Reproduction:** `ref/mps_sdpa_bug.py`, with random tensors and no model.
+- **Upstream:** this is [pytorch/pytorch#179352](https://github.com/pytorch/pytorch/issues/179352),
+  closed as an Apple MPSGraph bug (Apple FB22437937). It is still present in torch 2.11.0 on
+  macOS 27.0.1.
 - **Workaround:** `--safe-attn` on the oracles (`ref/safe_attn.py`), which splits the heads so
   each call stays below the limit. With it, that layer's attention is 7.6e-6 from float64.
   Without it, heads 17–23 are 0.27–0.72 off.
