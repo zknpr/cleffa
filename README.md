@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="cleffa.png" alt="cleffa logo" width="220">
+</p>
+
 # cleffa — native Metal inference for Cloudflare Clef
 
 A small C + Metal engine for [Cloudflare/clef](https://huggingface.co/Cloudflare/clef) (27B)
