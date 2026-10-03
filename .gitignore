@@ -1,0 +1,27 @@
+# model snapshots, converted weights and oracle output (hundreds of GB; recreated by download_models.sh
+# and ref/oracle*.py)
+/model/
+/model-flash/
+/gguf/
+/golden/
+golden-*.log
+
+# Python environment (requirements.txt)
+/.venv/
+__pycache__/
+
+# build outputs
+*.o
+/clef
+/clef-server
+/clef-tool
+/tests/test-head-attend
+/clef_metal_src.inc
+/compile-check
+/edge-test
+/gemm-bench
+/tile-bench
+/mixed-bench
+
+.DS_Store
+*.dSYM/
