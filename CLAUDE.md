@@ -57,8 +57,8 @@ parity tests.
 Regenerate a GGUF after changing `tools/convert.py`, then verify byte-exactness:
 
 ```sh
-.venv/bin/python tools/convert.py model-flash gguf/clef-flash.gguf
-.venv/bin/python tests/verify_gguf.py model-flash gguf/clef-flash.gguf
+.venv/bin/python -B tools/convert.py model-flash gguf/clef-flash.gguf
+.venv/bin/python -B tests/verify_gguf.py model-flash gguf/clef-flash.gguf
 ```
 
 Every golden directory needs `encoded.jsonl` for `tests/test_parity.py`. Both oracles write it
@@ -68,14 +68,19 @@ from the tokenizer alone.
 Regenerate golden data (slow; loads the model in PyTorch on MPS):
 
 ```sh
-.venv/bin/python ref/oracle.py model-flash --name clef-flash                   # BF16
-.venv/bin/python ref/oracle.py model-flash --name clef-flash-f32 --dtype float32
-.venv/bin/python ref/oracle.py model --name clef --safe-attn                      # 27B BF16
-.venv/bin/python ref/oracle_f32_stream.py model --name clef-f32 --safe-attn       # 27B, layer-streamed FP32
+.venv/bin/python -B ref/oracle.py model-flash --name clef-flash                   # BF16
+.venv/bin/python -B ref/oracle.py model-flash --name clef-flash-f32 --dtype float32
+.venv/bin/python -B ref/oracle.py model --name clef --safe-attn                      # 27B BF16
+.venv/bin/python -B ref/oracle_f32_stream.py model --name clef-f32 --safe-attn       # 27B, layer-streamed FP32
 ```
 
 `joint_schema_model.py` is imported only by the oracles and tests, always from the pinned snapshot
 directory via `sys.path`. The engine never runs Python. Do not import it from an unpinned `main`.
+Verify the snapshot first with `tools/verify_snapshot.py DIR FULL_REVISION`: its checked-in
+`tools/snapshots/` manifests define the complete inventory, sizes and hashes independently of local
+download metadata. Extra files (including cached Python bytecode) and symbolic links are rejected;
+only `.cache/huggingface/` bookkeeping is ignored. Remove stale snapshot bytecode before verification
+and run reference scripts with Python `-B`. Direct oracle invocations assume prior verification.
 
 27B references must use `--safe-attn`: PyTorch's MPS SDPA returns wrong output for heads with
 `h·T² >= 2^32` (`ref/mps_sdpa_bug.py`), which the 27B's 24 heads reach at 13,666 tokens. If the
@@ -88,22 +93,24 @@ for the HF snapshot, not an engine test. `golden-*.log` files at the root are or
 
 ## Tests
 
-`make test` builds `clef-tool` and `tests/test-head-attend` and runs the head unit test, the JSON
-byte-parity test, and the tokenizer parity test against `gguf/clef-flash.gguf` + `model-flash`.
-Everything else is run explicitly, with the model and golden directory as arguments. Use clef-flash
-for iteration; the 27B is for final parity only.
+`make test` runs the head and UTF-8 error unit tests, JSON byte parity, tokenizer parity against
+`gguf/clef-flash.gguf` + `model-flash`, HTTP write-failure handling, and snapshot/GGUF verifier and
+numerical parity regressions using tiny generated fixtures.
+`make test-errors` uses the flash GGUF to check CLI allocation/output failures, CLI/HTTP error responses, and
+Metal execution-error propagation and recovery. Everything else is run explicitly, with the model
+and golden directory as arguments. Use clef-flash for iteration; the 27B is for final parity only.
 
 ```sh
 # host-side byte parity against Python (no GPU)
-.venv/bin/python tests/test_json.py
-.venv/bin/python tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
-.venv/bin/python tests/test_record.py gguf/clef-flash.gguf model-flash model-flash
-.venv/bin/python tests/test_strict.py gguf/clef-flash.gguf model-flash
+.venv/bin/python -B tests/test_json.py
+.venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
+.venv/bin/python -B tests/test_record.py gguf/clef-flash.gguf model-flash model-flash
+.venv/bin/python -B tests/test_strict.py gguf/clef-flash.gguf model-flash
 
 # engine vs oracle
-.venv/bin/python tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump
 ./clef -m gguf/clef-flash.gguf --logits golden/clef-flash/requests.jsonl > golden/engine_logits.jsonl
-.venv/bin/python tests/compare3.py golden/clef-flash golden/clef-flash-f32 golden/engine_logits.jsonl golden/engine_dump.bin
+.venv/bin/python -B tests/compare3.py golden/clef-flash golden/clef-flash-f32 golden/engine_logits.jsonl golden/engine_dump.bin
 
 # invariants
 tests/test_batch.sh  gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # batch invariance + tenant isolation
@@ -114,10 +121,10 @@ tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    
 # server (start it first; test_server_retry needs CLEF_DEBUG_FAIL_MULTI=1 on the server,
 # test_server_slow needs CLEF_DEBUG_IO_TIMEOUT=2)
 ./clef-server -m gguf/clef-flash.gguf --port 8080 &
-.venv/bin/python tests/test_server.py 8080 gguf/clef-flash.gguf golden/clef-flash/requests.jsonl
-.venv/bin/python tests/test_server_hol.py 8080 golden/clef-flash/requests.jsonl
-.venv/bin/python tests/test_server_retry.py 8080 golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
-.venv/bin/python tests/test_server_slow.py 8080
+.venv/bin/python -B tests/test_server.py 8080 gguf/clef-flash.gguf golden/clef-flash/requests.jsonl
+.venv/bin/python -B tests/test_server_hol.py 8080 golden/clef-flash/requests.jsonl
+.venv/bin/python -B tests/test_server_retry.py 8080 golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
+.venv/bin/python -B tests/test_server_slow.py 8080
 ```
 
 `clef-tool` is the bridge the Python tests use to drive the C host code one line at a time
@@ -196,11 +203,13 @@ activations (`clef_head_inputs.kv`); `clef_head.c` explains why dropping the bia
 
 Compare the engine against the **FP32** oracle, not BF16. Engine-vs-BF16 differences are mostly the
 reference's own rounding; `tests/compare3.py` reports engine->f32 and bf16HF->f32 distances per layer
-and per question. Point `test_parity.py` at an FP32 golden: it exits 1 on any argmax disagreement, and
-against BF16 the engine disagrees exactly where BF16 is wrong (clef-flash `r004/urgency`, `r006/urgency`).
-A real bug shows as a jump at one layer (`test_parity.py --dump` flags it; informational, and BF16
-references show their own jump at the first attention layer), noise
-as smooth drift. An argmax flip on a small FP32 top-2 margin is precision, not a bug.
+and per question. Point `test_parity.py` at an FP32 golden: it exits 1 on any argmax disagreement,
+non-finite logits/residuals, max absolute logit error > 0.05, max probability error > 0.002, or
+(with `--dump`) per-layer relative L2 error > 0.01. Explicit experiments can override these with
+`--max-logit-error`, `--max-prob-error` and `--max-layer-rel-l2`. Against BF16 the engine disagrees
+exactly where BF16 is wrong (clef-flash `r004/urgency`, `r006/urgency`). A jump at one layer helps
+locate a bug (`--dump` prints jump markers); smooth drift can reflect reference rounding.
+An argmax flip on a small FP32 top-2 margin can be precision error rather than an implementation bug.
 Judge a precision change by its error against FP32 over all questions (mean |dp|, logit error), not
 argmax. `r019/service` has an FP32 margin of 0.004 and flips with noise. FP16 on a single producer
 class reached 46/46 there without lowering the error; FP16 on all classes cut it ~7x.

@@ -2,9 +2,9 @@
 # cleffa model setup, after ds4's download_model.sh. Cloudflare publishes safetensors, not GGUF, so
 # the setup is four steps per model:
 #   1. download the snapshot at a pinned revision (Hugging Face `hf download`);
-#   2. check every file against the commit and hashes Hugging Face recorded for it
-#      (tools/verify_snapshot.py). The reference oracles import joint_schema_model.py from the
-#      snapshot, so it is code that runs;
+#   2. check the full inventory, sizes and hashes against checked-in pinned manifests
+#      (tools/verify_snapshot.py), independently of local metadata. The oracles import
+#      joint_schema_model.py from the snapshot, so it is code that runs;
 #   3. convert it to one GGUF (tools/convert.py);
 #   4. check the GGUF against the safetensors tensor by tensor (tests/verify_gguf.py).
 # The conversion is written to a temporary file and moved into place only after it verifies.

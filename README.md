@@ -38,14 +38,20 @@ echo '{"model":"clef","state":"Checkout is down","questions":{"outage":{"type":"
 What `./download_models.sh` does for each model:
 1. Creates `.venv` from `requirements.txt` on first use.
 2. Downloads the Hugging Face snapshot at a pinned revision.
-3. Checks every file against the commit and hashes Hugging Face recorded for it
-   (`tools/verify_snapshot.py`). The reference oracles import Cloudflare's `joint_schema_model.py`
-   from the snapshot, so it is code that runs.
+3. Checks the complete file inventory, sizes and hashes against checked-in manifests from Hugging
+   Face's API at the pinned revisions (`tools/snapshots/`, `tools/verify_snapshot.py`). Verification
+   is offline and does not trust local download metadata. The reference oracles import Cloudflare's
+   `joint_schema_model.py` from the snapshot, so it is code that runs.
 4. Converts the snapshot to one GGUF.
 5. Checks every tensor of the GGUF against the safetensors before putting it in place.
 
 Use `clef` for the 27B, `all` for both, and `--skip-download` to use (and still verify) a snapshot
 already in `model/` or `model-flash/`.
+
+Missing files, extra files and symbolic links fail verification; only `.cache/huggingface/`
+download bookkeeping is excluded. Remove stale `__pycache__` bytecode in an existing snapshot
+before verifying it, and run Python reference scripts with `-B` to keep the snapshot unchanged.
+Verify snapshots before invoking reference scripts directly; those scripts do not run the verifier.
 
 ### Server
 
@@ -299,39 +305,45 @@ The tests need `gguf/clef-flash.gguf` and `model-flash/` (`./download_models.sh 
 parity tests also need golden data from the PyTorch oracles (below).
 
 ```sh
-make test                                            # JSON + head unit tests
-.venv/bin/python tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
-.venv/bin/python tests/test_record.py gguf/clef-flash.gguf model-flash model-flash
-.venv/bin/python ref/oracle.py model-flash --name clef-flash                  # BF16 oracle (MPS)
-.venv/bin/python ref/oracle.py model-flash --name clef-flash-f32 --dtype float32
-.venv/bin/python tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump   # vs FP32: vs BF16 it fails where BF16 is wrong
-.venv/bin/python tests/compare3.py golden/clef-flash golden/clef-flash-f32 golden/engine_logits.jsonl
+make test                                            # host parity, HTTP write failures, verifier/parity regressions
+make test-errors                                     # CLI allocation/output errors, HTTP errors, Metal failures
+.venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
+.venv/bin/python -B tests/test_record.py gguf/clef-flash.gguf model-flash model-flash
+.venv/bin/python -B ref/oracle.py model-flash --name clef-flash                  # BF16 oracle (MPS)
+.venv/bin/python -B ref/oracle.py model-flash --name clef-flash-f32 --dtype float32
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump   # vs FP32: vs BF16 it fails where BF16 is wrong
+.venv/bin/python -B tests/compare3.py golden/clef-flash golden/clef-flash-f32 golden/engine_logits.jsonl
 tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    # batch invariance, tenant isolation
 tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # no read-before-write (NaN-poisoned buffers)
 tests/test_grow_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl # engine stays correct after a failed buffer growth
 tests/test_f16_overflow.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl # FP16 overflow -> per-record BF16 rerun
 tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl  # a failed Metal command buffer is an error, never stale results
-.venv/bin/python tests/test_strict.py gguf/clef-flash.gguf model-flash        # strict mode vs tokenizers reference
-.venv/bin/python tests/test_truncation.py gguf/clef-flash.gguf model-flash    # over-long state rejected exactly when the reference would cut it
-.venv/bin/python tests/verify_gguf.py model-flash gguf/clef-flash.gguf        # converter byte-exactness
+.venv/bin/python -B tests/test_strict.py gguf/clef-flash.gguf model-flash        # strict mode vs tokenizers reference
+.venv/bin/python -B tests/test_truncation.py gguf/clef-flash.gguf model-flash    # over-long state rejected exactly when the reference would cut it
+.venv/bin/python -B tests/verify_gguf.py model-flash gguf/clef-flash.gguf        # complete tensor inventory, shapes/types, byte-exactness
 # against a running clef-server on PORT (test_server_hol needs --truncate; test_server_retry needs
 # CLEF_DEBUG_FAIL_MULTI=1 on the server; test_server_slow needs CLEF_DEBUG_IO_TIMEOUT=2):
-.venv/bin/python tests/test_server.py PORT gguf/clef-flash.gguf golden/clef-flash/requests.jsonl
-.venv/bin/python tests/test_server_hol.py PORT golden/clef-flash/requests.jsonl
-.venv/bin/python tests/test_server_headers.py PORT        # 16 KiB header limit holds for split and keep-alive reads
-.venv/bin/python tests/test_server_retry.py PORT golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
-.venv/bin/python tests/test_server_slow.py PORT           # trickling clients are dropped at the request deadline
+.venv/bin/python -B tests/test_server.py PORT gguf/clef-flash.gguf golden/clef-flash/requests.jsonl
+.venv/bin/python -B tests/test_server_hol.py PORT golden/clef-flash/requests.jsonl
+.venv/bin/python -B tests/test_server_headers.py PORT        # 16 KiB header limit holds for split and keep-alive reads
+.venv/bin/python -B tests/test_server_retry.py PORT golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
+.venv/bin/python -B tests/test_server_slow.py PORT           # trickling clients are dropped at the request deadline
 ```
+
+`test_parity.py` requires exact token ids and argmax agreement, finite logits/residuals, maximum
+absolute logit error <= 0.05, maximum probability error <= 0.002, and (with `--dump`) per-layer
+relative L2 error <= 0.01. These defaults target both models' FP32 references. Override them with
+`--max-logit-error`, `--max-prob-error` and `--max-layer-rel-l2` for explicit precision experiments.
 
 The FP32 ground truth for the 27B, which doesn't fit in FP32, comes from `ref/oracle_f32_stream.py`.
 It upcasts one layer at a time and is bitwise identical to the full FP32 oracle on clef-flash.
 27B references need `--safe-attn` (see Accuracy):
 
 ```sh
-.venv/bin/python ref/oracle.py model --name clef --safe-attn
-.venv/bin/python ref/oracle_f32_stream.py model --name clef-f32 --safe-attn
-.venv/bin/python tests/compare3.py golden/clef golden/clef-f32 golden/engine_logits_clef.jsonl
-.venv/bin/python ref/mps_sdpa_bug.py              # the MPS attention bug, standalone
+.venv/bin/python -B ref/oracle.py model --name clef --safe-attn
+.venv/bin/python -B ref/oracle_f32_stream.py model --name clef-f32 --safe-attn
+.venv/bin/python -B tests/compare3.py golden/clef golden/clef-f32 golden/engine_logits_clef.jsonl
+.venv/bin/python -B ref/mps_sdpa_bug.py              # the MPS attention bug, standalone
 ```
 
 Debug hooks for tests:

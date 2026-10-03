@@ -10,7 +10,7 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
 HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o
 
-.PHONY: all clean test unicode
+.PHONY: all clean test test-errors unicode
 
 ENGINE_OBJS = clef.o clef_head.o clef_metal.o
 
@@ -42,12 +42,35 @@ unicode:
 tests/test-head-attend: tests/test_head_attend.o $(HOST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) -framework Accelerate
 
-test: clef-tool tests/test-head-attend
+tests/test-record-errors: tests/test_record_errors.o $(HOST_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+tests/test-server-writes: tests/test_server_writes.o $(ENGINE_OBJS) $(HOST_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(FRAMEWORKS) -lpthread
+
+tests/test-cli-alloc: tests/test_cli_alloc.o $(ENGINE_OBJS) $(HOST_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(FRAMEWORKS)
+
+# The test includes the Metal backend to wrap its command queue; do not link clef_metal.o twice.
+tests/test-metal-errors: tests/test_metal_errors.m clef_metal.m clef_metal_src.inc clef.o clef_head.o $(HOST_OBJS)
+	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -o $@ tests/test_metal_errors.m clef.o clef_head.o $(HOST_OBJS) $(LDFLAGS) $(FRAMEWORKS)
+
+test: clef-tool tests/test-head-attend tests/test-record-errors tests/test-server-writes
 	tests/test-head-attend
-	.venv/bin/python tests/test_json.py
-	.venv/bin/python tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
+	tests/test-record-errors
+	tests/test-server-writes
+	.venv/bin/python -B tests/test_json.py
+	.venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
+	.venv/bin/python -B tests/test_verify_gguf.py
+	.venv/bin/python -B tests/test_verify_snapshot.py
+	.venv/bin/python -B tests/test_parity_checks.py
+
+test-errors: all tests/test-metal-errors tests/test-cli-alloc
+	.venv/bin/python -B tests/test_cli_errors.py gguf/clef-flash.gguf
+	tests/test-cli-alloc gguf/clef-flash.gguf
+	tests/test-metal-errors gguf/clef-flash.gguf
 
 clean:
-	rm -f *.o *.d tests/*.o tests/*.d clef clef-server clef-tool tests/test-head-attend clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d clef clef-server clef-tool tests/test-head-attend tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc clef_metal_src.inc
 
 -include $(wildcard *.d tests/*.d)

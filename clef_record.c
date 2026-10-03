@@ -10,8 +10,14 @@ static const char SYSTEM_PROMPT[] =
     "must be exactly one of that field's allowed options.";
 
 static bool fail(char *err, size_t errlen, const char *fmt, const char *arg, size_t arg_len) {
-    if (arg) snprintf(err, errlen, fmt, (int)(arg_len > 200 ? 200 : arg_len), arg);
-    else snprintf(err, errlen, "%s", fmt);
+    if (arg) {
+        size_t n = arg_len > 200 ? 200 : arg_len;
+        if (errlen && n >= errlen) n = errlen - 1;
+        /* IDs are validated UTF-8. Keep a whole-character prefix, also when the
+         * caller's buffer is small; the remaining format text is ASCII. */
+        while (n && n < arg_len && ((unsigned char)arg[n] & 0xc0) == 0x80) n--;
+        snprintf(err, errlen, fmt, (int)n, arg);
+    } else snprintf(err, errlen, "%s", fmt);
     return false;
 }
 

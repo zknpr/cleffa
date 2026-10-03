@@ -1,0 +1,75 @@
+{
+  "repo": "Cloudflare/clef-flash",
+  "revision": "17f0b0ad64efb65d273590632833508766b2aae6",
+  "source": "https://huggingface.co/api/models/Cloudflare/clef-flash/revision/17f0b0ad64efb65d273590632833508766b2aae6?blobs=true",
+  "files": {
+    ".gitattributes": {
+      "size": 1570,
+      "hash": "52373fe24473b1aa44333d318f578ae6bf04b49b"
+    },
+    "LICENSE": {
+      "size": 11544,
+      "hash": "f938136e3adacfd92be087f6e113b5d6d97f678f"
+    },
+    "README.md": {
+      "size": 10222,
+      "hash": "e31e072ba292d49c4c5bb2d29487a1a68864eb24"
+    },
+    "chat_template.jinja": {
+      "size": 7756,
+      "hash": "a585dec894e63da457d9440ec6aa7caa16d20860"
+    },
+    "config.json": {
+      "size": 2832,
+      "hash": "aff766f2ab6e0e48b6aa297265689b981bdd2042"
+    },
+    "generation_config.json": {
+      "size": 116,
+      "hash": "54056568766c020050fab57761fea673becbc131"
+    },
+    "joint_head.safetensors": {
+      "size": 243538016,
+      "hash": "19cdcec8c81dc9212be320fff47462ab342fbc1278be4368fb3da71241cf5ba0"
+    },
+    "joint_head_config.json": {
+      "size": 119,
+      "hash": "52467b6c7f7d1a7e628b518eb7a6cd7e9bdb9a57"
+    },
+    "joint_schema_model.py": {
+      "size": 23263,
+      "hash": "6a3ac5fc030a3f33f7fa860a1271886b64a6606d"
+    },
+    "model-00001-of-00004.safetensors": {
+      "size": 4942706120,
+      "hash": "8b45a8e968141cdcc58fb71c9adfc258e2c77b5f062bc636c1fd5bc5d916b565"
+    },
+    "model-00002-of-00004.safetensors": {
+      "size": 4987757928,
+      "hash": "7590856c713eed844a2dcf48e6c43c4de165b788bc3f80e328311183cdbc7db8"
+    },
+    "model-00003-of-00004.safetensors": {
+      "size": 4954810240,
+      "hash": "e6eac2467952c33361ed7dcb3c7959d1086bbe57201cd3749c3d769fdc17fe63"
+    },
+    "model-00004-of-00004.safetensors": {
+      "size": 3934446832,
+      "hash": "9fcecc6556b39171238373a465f409794b7f821fb4cd1e6459e3a9c0fe317af7"
+    },
+    "model.safetensors.index.json": {
+      "size": 69253,
+      "hash": "778b7bbb7ebec3f1e100b1059b1c6d54bd00e3c1"
+    },
+    "processor_config.json": {
+      "size": 1191,
+      "hash": "33818c7f9e991ad735fd240209f4fa73e6c28c50"
+    },
+    "tokenizer.json": {
+      "size": 19989325,
+      "hash": "06b9509352d2af50381ab2247e083b80d32d5c0aba91c272ca9ff729b6a0e523"
+    },
+    "tokenizer_config.json": {
+      "size": 1075,
+      "hash": "0f19934ef65115549ff9629ff2c83d15e40e32d8"
+    }
+  }
+}

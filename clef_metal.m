@@ -54,13 +54,22 @@ static bool new_cb(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLCompute
 }
 
 // Profiling: end the current command buffer, attribute its GPU time to `cat`, start a new one.
-static void prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc, int cat) {
-    if (!g->profile) return;
+static bool prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc,
+                 int cat, char *err, size_t errlen) {
+    if (!g->profile) return true;
     [*enc endEncoding];
     [*cb commit];
     [*cb waitUntilCompleted];
+    // Check before replacing the buffer: later stages must never consume a failed
+    // stage's incomplete activations, even if the final command buffer succeeds.
+    NSError *error = (*cb).error;
+    if (error) { snprintf(err, errlen, "metal: %s", error.localizedDescription.UTF8String); return false; }
     g->prof_ms[cat] += ((*cb).GPUEndTime - (*cb).GPUStartTime) * 1e3;
-    new_cb(g, cb, enc);   // a failure is checked at the end of the pass
+    if (!new_cb(g, cb, enc)) {
+        snprintf(err, errlen, "metal: cannot create a command buffer (mid-pass)");
+        return false;
+    }
+    return true;
 }
 
 static bool gerr(char *err, size_t errlen, const char *msg) {
@@ -274,6 +283,7 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
     if (!bf16_only && g->act_f16 && !overflow) return gerr(err, errlen, "FP16 activations need the overflow flags (pass overflow or bf16_only)");
     if (!ensure_capacity(g, c, T, n_seq, err, errlen)) return false;
     @autoreleasepool {
+        memset(g->prof_ms, 0, sizeof(g->prof_ms));   // a prior failed pass may have partial timings
         if (g->debug_poison) {
             // Test hook: rows a kernel must not depend on hold NaN. Every row it does need is
             // rewritten by attn_prep, so correct code gives identical results (tests/test_poison.sh).
@@ -338,9 +348,9 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
             rows_kernel(g, enc, @"rmsnorm_act", T, H);
 
             if (c->layer_full[l]) {
-                prof(g, &cb, &enc, P_OTHER);
+                if (!prof(g, &cb, &enc, P_OTHER, err, errlen)) return false;
                 gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->attn_qkv), n_attn, H, g->P, 0, T);
-                prof(g, &cb, &enc, P_GEMM);
+                if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
                 attn_prep_args pa = { c->nh, c->nkv, c->hd, c->n_rot, n_attn, c->eps };
                 [enc setComputePipelineState:g->ps[@"attn_prep"]];
                 [enc setBytes:&pa length:sizeof(pa) atIndex:0];
@@ -388,14 +398,14 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
                     [enc setThreadgroupMemoryLength:(NSUInteger)grp * (8 * 32 + 64) * 4 atIndex:0];
                     [enc dispatchThreadgroups:MTLSizeMake((T + 7) / 8, c->nkv, 1) threadsPerThreadgroup:MTLSizeMake(32 * grp, 1, 1)];
                 }
-                prof(g, &cb, &enc, P_ATTN);
+                if (!prof(g, &cb, &enc, P_ATTN, err, errlen)) return false;
 
                 gemm(g, enc, x_attn, true, g->A, 0, woff(lw->attn_output), H, c->nh * c->hd, g->x, 0, T);
-                prof(g, &cb, &enc, P_GEMM);
+                if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
             } else {
-                prof(g, &cb, &enc, P_OTHER);
+                if (!prof(g, &cb, &enc, P_OTHER, err, errlen)) return false;
                 gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->ssm_in), n_ssm, H, g->P, 0, T);
-                prof(g, &cb, &enc, P_GEMM);
+                if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
                 conv_args ca = { C, n_ssm, c->ssm_kernel };
                 [enc setComputePipelineState:g->ps[@"ssm_conv"]];
                 [enc setBytes:&ca length:sizeof(ca) atIndex:0];
@@ -416,7 +426,7 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
                 [enc setBuffer:g->gate offset:0 atIndex:6];
                 [enc dispatchThreadgroups:MTLSizeMake(T, 2 * c->Hk + c->Hv, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-                prof(g, &cb, &enc, P_OTHER);   // boundary must precede the encoder setup below
+                if (!prof(g, &cb, &enc, P_OTHER, err, errlen)) return false;   // boundary must precede the encoder setup below
                 gdn_args ga = { c->Hk, c->Hv, c->dk, c->dv, C };
                 [enc setComputePipelineState:g->ps[[NSString stringWithFormat:@"gdn_scan_%d", g->scan_lpc]]];
                 [enc setBytes:&ga length:sizeof(ga) atIndex:0];
@@ -426,7 +436,7 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
                 [enc setBuffer:g->seq_bounds offset:0 atIndex:4];
                 [enc setBuffer:g->O offset:0 atIndex:5];
                 [enc dispatchThreadgroups:MTLSizeMake(c->Hv, c->dv / (32 / g->scan_lpc), n_seq) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                prof(g, &cb, &enc, P_SCAN);
+                if (!prof(g, &cb, &enc, P_SCAN, err, errlen)) return false;
 
                 gdn_out_args go = { c->Hv, c->dv, n_ssm, C, c->eps };
                 [enc setComputePipelineState:g->ps[@"gdn_out"]];
@@ -440,9 +450,9 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
                 [enc setBuffer:g->ovf offset:0 atIndex:7];
                 [enc dispatchThreadgroups:MTLSizeMake(T, c->Hv, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-                prof(g, &cb, &enc, P_OTHER);
+                if (!prof(g, &cb, &enc, P_OTHER, err, errlen)) return false;
                 gemm(g, enc, x_gdn, true, g->A, 0, woff(lw->ssm_out), H, c->Hv * c->dv, g->x, 0, T);
-                prof(g, &cb, &enc, P_GEMM);
+                if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
             }
 
             [enc setComputePipelineState:g->ps[@"rmsnorm_act"]];
@@ -454,9 +464,9 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
             [enc setBuffer:g->seq_start offset:0 atIndex:5];
             [enc setBuffer:g->ovf offset:0 atIndex:6];
             rows_kernel(g, enc, @"rmsnorm_act", T, H);
-            prof(g, &cb, &enc, P_OTHER);
+            if (!prof(g, &cb, &enc, P_OTHER, err, errlen)) return false;
             gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->ffn_gate_up), 2 * c->ffn, H, g->P, 0, T);
-            prof(g, &cb, &enc, P_GEMM);
+            if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
             swiglu_args sa = { c->ffn };
             [enc setComputePipelineState:g->ps[@"swiglu"]];
             [enc setBytes:&sa length:sizeof(sa) atIndex:0];
@@ -466,9 +476,9 @@ bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, con
             [enc setBuffer:g->seq_start offset:0 atIndex:4];
             [enc setBuffer:g->ovf offset:0 atIndex:5];
             [enc dispatchThreads:MTLSizeMake(c->ffn, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            prof(g, &cb, &enc, P_OTHER);
+            if (!prof(g, &cb, &enc, P_OTHER, err, errlen)) return false;
             gemm(g, enc, x_mlp, true, g->A, 0, woff(lw->ffn_down), H, c->ffn, g->x, 0, T);
-            prof(g, &cb, &enc, P_GEMM);
+            if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
 
             if (dump_layers) {
                 // Debug path: finish this command buffer and copy the residual out.

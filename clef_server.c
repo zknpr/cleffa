@@ -137,7 +137,7 @@ static void *worker(void *arg) {
 static bool write_all(int fd, const char *p, size_t n) {
     while (n) {
         ssize_t w = write(fd, p, n);
-        if (w < 0) { if (errno == EINTR) continue; return false; }
+        if (w <= 0) { if (w < 0 && errno == EINTR) continue; return false; }
         p += w;
         n -= (size_t)w;
     }
@@ -278,10 +278,10 @@ static int read_request(int fd, rbuf *in, char **method, char **path, char **bod
     return 0;
 }
 
-static void handle_systemone(int fd, const char *body, size_t len, bool keep_alive) {
+static bool handle_systemone(int fd, const char *body, size_t len, bool keep_alive) {
     char err[256];
     jarena *a = jarena_new();
-    if (!a) { respond_error(fd, 500, "out of memory", false); return; }
+    if (!a) { respond_error(fd, 500, "out of memory", false); return false; }
     jval *req = json_parse(a, body, len, err, sizeof(err));
     job j;
     memset(&j, 0, sizeof(j));
@@ -289,9 +289,9 @@ static void handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     opts.strict = S.strict;
     opts.reject_truncation = !S.truncate;
     if (!req || !clef_encode_request(S.e->tok, req, opts, &j.rec, err, sizeof(err))) {
-        respond_error(fd, 400, err, keep_alive);
+        bool sent = respond_error(fd, 400, err, keep_alive);
         jarena_free(a);
-        return;
+        return sent;
     }
     j.req = req;
     pthread_mutex_init(&j.mu, NULL);
@@ -306,12 +306,13 @@ static void handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
     pthread_mutex_unlock(&j.mu);
 
+    bool sent;
     if (!j.ok) {
-        respond_error(fd, 500, j.err, keep_alive);
+        sent = respond_error(fd, 500, j.err, keep_alive);
     } else {
         jbuf b = {0};
-        if (!clef_build_response(req, &j.rec, j.probs, &b)) respond_error(fd, 500, "out of memory", keep_alive);
-        else respond(fd, 200, b.p, b.len, keep_alive);
+        if (!clef_build_response(req, &j.rec, j.probs, &b)) sent = respond_error(fd, 500, "out of memory", keep_alive);
+        else sent = respond(fd, 200, b.p, b.len, keep_alive);
         jbuf_free(&b);
         for (int q = 0; q < j.rec.nq; q++) free(j.probs[q]);
         free(j.probs);
@@ -320,6 +321,7 @@ static void handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     pthread_mutex_destroy(&j.mu);
     pthread_cond_destroy(&j.cv);
     jarena_free(a);
+    return sent;
 }
 
 /* Error close with unread input: closing a TCP socket while bytes are pending sends RST,
@@ -377,20 +379,23 @@ static void *connection(void *arg) {
             break;
         }
         size_t consumed = (size_t)(body - in.p) + body_len;
+        bool sent;
         if (!strcmp(path, "/v1/systemone")) {
-            if (strcmp(method, "POST")) respond_error(fd, 405, "use POST", keep_alive);
-            else handle_systemone(fd, body, body_len, keep_alive);
+            if (strcmp(method, "POST")) sent = respond_error(fd, 405, "use POST", keep_alive);
+            else sent = handle_systemone(fd, body, body_len, keep_alive);
         } else if (!strcmp(path, "/health")) {
             jbuf b = {0};
             jbuf_puts(&b, "{\"status\":\"ok\",\"model\":");
             json_put_string(&b, S.model_name, strlen(S.model_name));
             jbuf_puts(&b, "}");
-            respond(fd, 200, b.p, b.len, keep_alive);
+            sent = !b.oom && respond(fd, 200, b.p, b.len, keep_alive);
             jbuf_free(&b);
         } else {
-            respond_error(fd, 404, "not found", keep_alive);
+            sent = respond_error(fd, 404, "not found", keep_alive);
         }
-        if (!keep_alive) break;
+        /* A partial response cannot be repaired by sending another response on
+         * this stream. Drop pipelined requests after any failed write. */
+        if (!sent || !keep_alive) break;
         memmove(in.p, in.p + consumed, in.len - consumed);   /* pipelined bytes, if any */
         in.len -= consumed;
     }

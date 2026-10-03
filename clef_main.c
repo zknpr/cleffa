@@ -32,15 +32,23 @@ static double now_ms(void) {
  * text, question and option ids), and responses are built after the whole batch is read. */
 typedef struct { char *line; jarena *arena; jval *req; clef_record rec; bool ok, encoded; char err[256]; } item;
 
-static void emit(item *it, float **p, bool logits) {
+static void free_items(item *items, int n) {
+    for (int i = 0; i < n; i++) {
+        if (items[i].encoded) clef_record_free(&items[i].rec);
+        jarena_free(items[i].arena);
+        free(items[i].line);
+    }
+}
+
+static bool emit(item *it, float **p, bool logits) {
     if (!it->ok) {
         jbuf b = {0};
         jbuf_puts(&b, "{\"error\":");
         json_put_string(&b, it->err, strlen(it->err));
         jbuf_puts(&b, "}");
-        printf("%s\n", b.p);
+        bool ok = printf("%s\n", b.oom ? "{\"error\":\"out of memory\"}" : b.p) >= 0;
         jbuf_free(&b);
-        return;
+        return ok;
     }
     jbuf b = {0};
     if (logits) {
@@ -59,8 +67,9 @@ static void emit(item *it, float **p, bool logits) {
     } else {
         clef_build_response(it->req, &it->rec, p, &b);
     }
-    printf("%s\n", b.oom ? "{\"error\":\"out of memory\"}" : b.p);
+    bool ok = printf("%s\n", b.oom ? "{\"error\":\"out of memory\"}" : b.p) >= 0;
     jbuf_free(&b);
+    return ok;
 }
 
 int main(int argc, char **argv) {
@@ -87,17 +96,25 @@ int main(int argc, char **argv) {
     char err[512];
     double t0 = now_ms();
     clef_engine *e = clef_open(model, err, sizeof(err));
-    if (!e) { fprintf(stderr, "clef: %s\n", err); return 1; }
+    if (!e) { fprintf(stderr, "clef: %s\n", err); if (in != stdin) fclose(in); return 1; }
     if (timing) fprintf(stderr, "clef: loaded %s in %.0f ms\n", model, now_ms() - t0);
 
     item *items = calloc((size_t)batch, sizeof(*items));
     clef_record *recs = calloc((size_t)batch, sizeof(*recs));
     int *map = calloc((size_t)batch, sizeof(int));
+    if (!items || !recs || !map) {
+        fprintf(stderr, "clef: out of memory (batch of %d)\n", batch);
+        free(items); free(recs); free(map);
+        if (in != stdin) fclose(in);
+        clef_close(e);
+        return 1;
+    }
     char *line = NULL;
     size_t cap = 0;
     bool dumped = false;
     int rc = 0;
     int read_err = 0;
+    int write_err = 0;
     for (;;) {
         int n = 0;
         ssize_t len = 0;
@@ -110,7 +127,11 @@ int main(int argc, char **argv) {
             line = NULL;
             cap = 0;
             it->arena = jarena_new();
-            if (!it->arena) { fprintf(stderr, "clef: out of memory\n"); return 1; }
+            if (!it->arena) {
+                snprintf(it->err, sizeof(it->err), "out of memory");
+                read_err = ENOMEM;
+                break;
+            }
             it->req = json_parse(it->arena, it->line, (size_t)len, it->err, sizeof(it->err));
             clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
             opts.strict = strict;
@@ -130,7 +151,12 @@ int main(int argc, char **argv) {
             dump_rows = recs[0].ids.len;
             if (dump_last > 0 && (size_t)dump_last < dump_rows) dump_rows = (size_t)dump_last;
             dump = calloc((size_t)(e->cfg.n_layer + 2) * dump_rows * e->cfg.H, sizeof(float));
-            if (!dump) { fprintf(stderr, "clef: cannot allocate dump\n"); return 1; }
+            if (!dump) {
+                fprintf(stderr, "clef: cannot allocate dump\n");
+                free_items(items, n);
+                rc = 1;
+                break;
+            }
         }
         double t1 = now_ms();
         if (m && !clef_run_ex(e, recs, dump ? 1 : m, &probs, logits, dump, (int)dump_rows, err, sizeof(err))) {
@@ -149,8 +175,16 @@ int main(int argc, char **argv) {
             /* the dump run covered only the first record; run the rest normally */
             if (m > 1) {
                 float ***rest = NULL;
-                if (!clef_run_ex(e, recs + 1, m - 1, &rest, logits, NULL, 0, err, sizeof(err))) { fprintf(stderr, "clef: %s\n", err); return 1; }
                 float ***all = calloc((size_t)m, sizeof(*all));
+                if (!all || !clef_run_ex(e, recs + 1, m - 1, &rest, logits, NULL, 0, err, sizeof(err))) {
+                    fprintf(stderr, "clef: %s\n", all ? err : "out of memory (combined results)");
+                    /* Until combined, probs owns one record, not m records. */
+                    clef_free_probs(recs, 1, probs);
+                    free(all); free(dump);
+                    free_items(items, n);
+                    rc = 1;
+                    break;
+                }
                 all[0] = probs[0];
                 for (int i = 1; i < m; i++) all[i] = rest[i - 1];
                 free(probs); free(rest);
@@ -165,19 +199,27 @@ int main(int argc, char **argv) {
         free(dump);
         int k = 0;
         for (int i = 0; i < n; i++) {
-            emit(&items[i], items[i].ok && probs ? probs[k] : NULL, logits);
+            errno = 0;
+            if (!emit(&items[i], items[i].ok && probs ? probs[k] : NULL, logits)) {
+                write_err = errno ? errno : EIO;
+                break;
+            }
             if (items[i].ok) k++;
         }
         clef_free_probs(recs, m, probs);
-        for (int i = 0; i < n; i++) {
-            if (items[i].encoded) clef_record_free(&items[i].rec);
-            jarena_free(items[i].arena);
-            free(items[i].line);
-        }
-        fflush(stdout);
+        free_items(items, n);
+        /* Buffered output may fail only on flush. Stop after freeing the batch;
+         * continuing inference cannot recover an output stream that lost results. */
+        errno = 0;
+        if (!write_err && fflush(stdout) == EOF) write_err = errno ? errno : EIO;
+        if (write_err || read_err) break;
     }
     if (read_err) {
         fprintf(stderr, "clef: cannot read %s: %s\n", input ? input : "stdin", strerror(read_err));
+        rc = 1;
+    }
+    if (write_err) {
+        fprintf(stderr, "clef: cannot write stdout: %s\n", strerror(write_err));
         rc = 1;
     }
     free(line); free(items); free(recs); free(map);

@@ -16,6 +16,10 @@ __pycache__/
 /clef-server
 /clef-tool
 /tests/test-head-attend
+/tests/test-record-errors
+/tests/test-metal-errors
+/tests/test-server-writes
+/tests/test-cli-alloc
 /clef_metal_src.inc
 /compile-check
 /edge-test
