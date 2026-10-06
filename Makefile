@@ -10,7 +10,7 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
 HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o
 
-.PHONY: all clean test test-errors test-attention test-gemm test-gdn test-head-tsan test-prefix-attention unicode
+.PHONY: all clean test test-errors test-attention test-gemm test-gdn test-head-tsan test-prefix-attention test-prefix-model unicode
 
 ENGINE_OBJS = clef.o clef_head.o clef_metal.o
 
@@ -115,6 +115,13 @@ tests/test-prefix-attention: tests/test_prefix_attention.m bench/attention_bench
 
 test-prefix-attention: tests/test-prefix-attention
 	tests/test-prefix-attention metal/clef.metal metal/clef.metal
+
+# Opens both models: a populated entry is rejected by another engine and by a reopened one.
+# The test takes one request; r019 (2,235 tokens) has a state long enough to fill an entry.
+test-prefix-model: tests/test-prefix-owner-model
+	.venv/bin/python -B -c "import json, sys; [sys.stdout.write(l) for l in open('golden/clef-flash/requests.jsonl') if json.loads(l)['id'] == 'r019']" > tests/owner-model-request.jsonl
+	tests/test-prefix-owner-model gguf/clef-flash.gguf gguf/clef.gguf tests/owner-model-request.jsonl
+	rm -f tests/owner-model-request.jsonl
 
 test: clef-tool tests/test-prefix-owner tests/test-prefix-planner tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-record-errors tests/test-server-writes
 	tests/test-prefix-owner

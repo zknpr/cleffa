@@ -27,6 +27,7 @@ __pycache__/
 /tests/test-prefix-planner
 /tests/test-prefix-owner-model
 /tests/test-prefix-attention
+/tests/owner-model-request.jsonl
 /clef_metal_src.inc
 /compile-check
 /edge-test

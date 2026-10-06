@@ -56,6 +56,11 @@ def make_tree(root: Path):
     nested = exp / 'article-customer'
     nested.mkdir()
     (nested / 'requests.jsonl').write_text('{"state": "customer text"}\n')   # nested private workload
+    (exp / '.env').write_text('OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz\n')   # credential dotfile
+    (exp / 'notes').write_text('API_KEY=abcdefghijklmnopqrstuvwxyz0123\n')   # extensionless, not allowlisted
+    (exp / 'dump.log').write_text('export MY_SECRET=abcdefghijklmnopqrstuvwxyz0123\n')   # key assignment in a log
+    (exp / 'Makefile').write_text('all:\n\ttrue\n')
+    (exp / 'LICENSE').write_text('MIT\n')
     secret = b'Bearer abcdefghijklmnopqrstuvwxyz0123'
     (exp / 'late.log').write_bytes(b'ok line\n' * 700 + secret.decode().encode('utf-16-le') + b'\n')   # NULs past the 4 KiB probe
     hdr16 = json.dumps({'l': {'dtype': 'F32', 'shape': [len(secret) // 2], 'data_offsets': [0, 2 * len(secret)]}}).encode()
@@ -117,6 +122,7 @@ class EvidenceArchive(unittest.TestCase):
         self.assertEqual(names, {
             'gemm-probe-20261004/result.json', 'gemm-probe-20261004/run.py',
             'gemm-probe-20261004/journal.jsonl', 'gemm-probe-20261004/small.safetensors',
+            'gemm-probe-20261004/Makefile', 'gemm-probe-20261004/LICENSE',
             'ds4-qwen-perf-20261004/groups-summary.json',
             'clef-flash-f32/logits.safetensors', 'clef-flash-f32/requests.jsonl', 'clef-flash-f32/latency.json',
             'engine_logits.jsonl',
@@ -148,6 +154,11 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/payload.safetensors', names)  # a U8 tensor carrying text
         self.assertNotIn('gemm-probe-20261004/utf16.safetensors', names)  # text as UTF-16 inside an F32 payload
         self.assertNotIn('gemm-probe-20261004/late.log', names)  # UTF-16 text after a clean 4 KiB prefix
+        self.assertNotIn('gemm-probe-20261004/.env', names)  # dotfiles never
+        self.assertNotIn('gemm-probe-20261004/notes', names)  # extensionless only when allowlisted
+        self.assertNotIn('gemm-probe-20261004/dump.log', names)  # key=value credential shape
+        self.assertIn('gemm-probe-20261004/Makefile', names)
+        self.assertIn('gemm-probe-20261004/LICENSE', names)
         self.assertNotIn('gemm-probe-20261004/upper.SAFETENSORS', names)  # suffix case must not skip the checks
         self.assertFalse([n for n in names if 'Bearer' in n], 'forbidden string in a path component')
         self.assertNotIn('gemm-probe-20261004/lower.log', names)  # lowercase bearer

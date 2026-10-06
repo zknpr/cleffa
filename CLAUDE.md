@@ -427,8 +427,8 @@ and eval-comparator regressions. The planner test checks saved token identities
 and recurrent checksums independently of its slot-eviction policy, including
 partial writes, overflow and head failure.
 `make test-prefix-attention` checks exact full/resumed attention, poisoned guards
-and float64 error bounds. `tests/test_prefix_owner_model.c` exercises populated
-entries across models and reopened engines. `tests/test_prefix_cache.py` covers
+and float64 error bounds. `make test-prefix-model` runs `tests/test_prefix_owner_model.c`,
+which exercises populated entries across both models and a reopened engine. `tests/test_prefix_cache.py` covers
 transitions, overflow, bypass and allocation recovery; `test_prefix_public.py`
 covers poisoned public fill/hit pairs. `test_server_prefix.py` checks HTTP bytes,
 key isolation and oversized-entry eviction. Run GPU tests under the shared lock.

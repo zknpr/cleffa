@@ -27,6 +27,8 @@ Excluded
   - every other undated directory, Cloudflare subscription and usage dumps (`subscriptions.json`,
     `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
+  - dotfiles and extensionless files other than Makefile and LICENSE, key=value assignments
+    that look like credentials,
   - any file with "private" in any component of its path, and any text file that still matches a
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
     including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
@@ -62,7 +64,7 @@ MAX_TEXT = 64 * 1024 * 1024
 
 TEXT_EXT = {'.json', '.jsonl', '.log', '.txt', '.md', '.csv', '.patch', '.diff', '.yaml', '.yml',
             '.toml', '.py', '.m', '.metal', '.c', '.h', '.sh', '.mk', '.cfg'}
-TEXT_NAMES = {'Makefile'}
+TEXT_NAMES = {'Makefile', 'LICENSE'}   # the only extensionless files admitted
 ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latency.json'}
 EXPERIMENT = re.compile(r'^[a-z0-9-]+-20\d{6}$')
 ORACLE_DIR = re.compile(r'^clef(-flash)?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
@@ -90,15 +92,16 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'Bearer [A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
-                       r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}', re.IGNORECASE)
+                       r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
+                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)\s*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}', re.IGNORECASE)
 
 
 def is_text(path: Path) -> bool:
     """Text by extension or, without one, by content; a NUL byte anywhere disqualifies either,
     so binary or NUL-padded (UTF-16) data under a text name is excluded rather than archived.
     Files are bounded by MAX_TEXT, so reading them whole here is affordable."""
-    if not (path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES or path.suffix == ''):
-        return False
+    if not (path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES):
+        return False   # an extensionless file is admitted by name only (review #42)
     if path.stat().st_size > MAX_TEXT:
         return True   # classify() excludes it as oversized without reading it
     raw = path.read_bytes()
@@ -116,6 +119,8 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     # does a forbidden pattern in the path itself, which becomes a tar member name.
     if any('private' in part.lower() for part in parts):
         return False, 'private-named path'
+    if any(part.startswith('.') for part in parts):
+        return False, 'dotfile'   # .env, .gitignore, editor state: never evidence
     if FORBIDDEN.search(rel.as_posix()):
         return False, 'forbidden path'
     if any(p in EXCLUDE_DIR_PARTS for p in parts):

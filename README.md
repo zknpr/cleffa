@@ -529,6 +529,7 @@ tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl  # 
 .venv/bin/python -B tests/test_server_slow.py PORT           # trickling clients are dropped at the request deadline
 tests/test_lingering_close.sh gguf/clef-flash.gguf        # starts its own server: an error response drains a half-closed client's body
 make test-prefix-attention                           # exact full vs resumed attention, poisoned guards, float64 bounds; no model needed
+make test-prefix-model                               # both models: a populated cache entry is refused by another engine and by a reopened one
 make test-head-tsan                                  # ThreadSanitizer check of the CPU head's first-use configuration
 .venv/bin/python -B tests/test_gemm_dispatch.py gguf/clef-flash.gguf     # exact logits across the Flash 768-1,024 tile boundaries
 .venv/bin/python -B tests/test_prefix_cache.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    # cache transitions, overflow, bypass, allocation recovery
