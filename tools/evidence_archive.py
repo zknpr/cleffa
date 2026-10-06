@@ -197,12 +197,26 @@ def json_strings(text: str) -> str | None:
     return '\n'.join(found)
 
 
+ESCAPE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))')
+
+
+def unescape(text: str) -> str:
+    """The text with \\uXXXX and \\xXX escapes replaced by the characters they denote. A token
+    written as `abcdefgh\\u002dijkl` in a log line, or in a JSON document that is not parsed as a
+    whole, would otherwise never line up with the FORBIDDEN pattern (review #53)."""
+    if '\\' not in text:
+        return text
+    return ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+
+
 def forbidden_in(text: str) -> bool:
-    """FORBIDDEN over the text and, when it is JSON, over its decoded strings."""
-    if FORBIDDEN.search(text):
-        return True
+    """FORBIDDEN over the text, over its decoded strings when it is JSON, and over both with
+    character escapes decoded."""
+    views = [text, unescape(text)]
     decoded = json_strings(text)
-    return decoded is not None and FORBIDDEN.search(decoded) is not None
+    if decoded is not None:
+        views += [decoded, unescape(decoded)]
+    return any(FORBIDDEN.search(v) for v in views)
 
 
 FLOAT_DTYPES = {'F64': 8, 'F32': 4, 'F16': 2, 'BF16': 2}   # element sizes in bytes
@@ -214,7 +228,7 @@ def bytes_read_as_text(payload: bytes) -> bool:
     UTF-32 ASCII looks like once the NULs are dropped)."""
     views = [payload.decode('latin-1'), payload.replace(b'\0', b'').decode('latin-1'),
              payload.decode('utf-16-le', 'ignore'), payload.decode('utf-16-be', 'ignore')]
-    return any(FORBIDDEN.search(v) for v in views)
+    return any(forbidden_in(v) for v in views)
 
 
 def safetensors_payload_ok(raw: bytes, header: str) -> bool:
@@ -299,14 +313,18 @@ def prepare(path: Path, raw: bytes | None = None) -> tuple[bytes | None, bool, s
     return new.encode('utf-8'), new != text, 'included'
 
 
-def read_snapshot(path: Path) -> tuple[bytes, os.stat_result]:
+def read_snapshot(path: Path, limit: int) -> tuple[bytes | None, os.stat_result]:
     """The file's bytes and metadata from one descriptor; a file whose size, inode or mtime
     differ between the stat before and the stat after the read is being changed, and the build
-    stops rather than describe a snapshot that never existed (review #50)."""
+    stops rather than describe a snapshot that never existed (review #50). A file longer than
+    `limit` by the time it is read returns None: the stat-time size check does not bind the
+    bytes actually read (review #54)."""
     with open(path, 'rb') as fh:
         before = os.fstat(fh.fileno())
-        raw = fh.read()
+        raw = fh.read(limit + 1)   # never more than the limit allows into memory
         after = os.fstat(fh.fileno())
+    if len(raw) > limit:
+        return None, before
     same = (before.st_size, before.st_ino, before.st_dev, before.st_mtime_ns) == (after.st_size, after.st_ino, after.st_dev, after.st_mtime_ns)
     if not same or len(raw) != before.st_size:
         raise SystemExit(f'{path} changed while it was being archived')
@@ -323,7 +341,12 @@ def collect(golden: Path):
             if not ok:
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
-            raw, st = read_snapshot(path)
+            tensor = path.suffix.lower() == '.safetensors'
+            raw, st = read_snapshot(path, SMALL_TENSOR if tensor else MAX_TEXT)
+            if raw is None:
+                reason = 'tensor size' if tensor else 'oversized text'
+                excluded[reason] = excluded.get(reason, 0) + 1
+                continue
             data, rewritten, reason = prepare(path, raw)
             if data is None:
                 excluded[reason] = excluded.get(reason, 0) + 1
@@ -341,7 +364,7 @@ LABEL = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
 
 
 def build(golden: Path, out: Path, label: str | None) -> dict:
-    if label is not None and (not LABEL.match(label) or '..' in label):
+    if label is not None and (not LABEL.match(label) or '..' in label or forbidden_in(label)):
         # The label is every member's leading path component; keep it a single safe name so
         # an extractor that honours '..' or '/' cannot be steered outside its directory.
         raise SystemExit(f'label {label!r} must be a single path component [A-Za-z0-9._-]')
@@ -370,7 +393,11 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     }
     readme = README.format(label=label, n=len(entries), rewritten=sum(e['rewritten'] for e in entries),
                            excluded=json.dumps(manifest['excluded_counts'], indent=2))
-    # Final control: the archived bytes must not contain any forbidden pattern.
+    # Final control: the archived bytes, the member names and the generated members must not
+    # contain any forbidden pattern.
+    for name, text in (('README.md', readme), ('manifest.json', json.dumps(manifest))):
+        if forbidden_in(text):
+            raise SystemExit(f'forbidden pattern in the generated {name}')
     for rel, path, data, _, _ in included:
         if FORBIDDEN.search(rel):
             raise SystemExit(f'forbidden pattern in the path {rel}')

@@ -74,6 +74,11 @@ def make_tree(root: Path):
     (exp / 'late.log').write_bytes(b'ok line\n' * 700 + secret.decode().encode('utf-16-le') + b'\n')   # NULs past the 4 KiB probe
     hdr16 = json.dumps({'l': {'dtype': 'F16', 'shape': [len(secret)], 'data_offsets': [0, 2 * len(secret)]}}).encode()
     (exp / 'utf16.safetensors').write_bytes(len(hdr16).to_bytes(8, 'little') + hdr16 + secret.decode().encode('utf-16-le'))
+    doc = b'{"auth": "Bearer abcdefgh\\u002dijklmnopqrstuvwxyz0123"}'
+    doc += b' ' * (-len(doc) % 4)   # trailing spaces keep it valid JSON and a whole number of floats
+    hdrj = json.dumps({'l': {'dtype': 'F32', 'shape': [len(doc) // 4], 'data_offsets': [0, len(doc)]}}).encode()
+    (exp / 'jsonpayload.safetensors').write_bytes(len(hdrj).to_bytes(8, 'little') + hdrj + doc)
+    (exp / 'escaped.log').write_text('Authorization: Bearer abcdefgh\\u002dijklmnopqrstuvwxyz0123\n')   # escape in plain text
     hdr8 = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
     (exp / 'upper.SAFETENSORS').write_bytes(len(hdr8).to_bytes(8, 'little') + hdr8 + secret)   # suffix case variant
     hdr = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
@@ -167,6 +172,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/badmeta2.safetensors', names)  # __metadata__ values not strings
         self.assertNotIn('gemm-probe-20261004/payload.safetensors', names)  # a U8 tensor carrying text
         self.assertNotIn('gemm-probe-20261004/utf16.safetensors', names)  # text as UTF-16 inside an F32 payload
+        self.assertNotIn('gemm-probe-20261004/jsonpayload.safetensors', names)  # JSON-escaped token in a payload
+        self.assertNotIn('gemm-probe-20261004/escaped.log', names)  # \\u002d escape in plain text
         self.assertNotIn('gemm-probe-20261004/late.log', names)  # UTF-16 text after a clean 4 KiB prefix
         self.assertNotIn('gemm-probe-20261004/.env', names)  # dotfiles never
         self.assertNotIn('gemm-probe-20261004/notes', names)  # extensionless only when allowlisted
@@ -308,6 +315,31 @@ class EvidenceArchive(unittest.TestCase):
         self.assertEqual(hashlib.sha256(a.read_bytes()).hexdigest(), hashlib.sha256(b.read_bytes()).hexdigest())
         with tarfile.open(a) as tar:
             self.assertTrue(all(m.name.startswith(f'cleffa-evidence-{day}/') for m in tar.getmembers()))
+
+    def test_rejects_forbidden_label(self):
+        # The label lands in every member name and in the generated README and manifest.
+        for label in ('Zknpr', 'squid-run', 'pop_v22', 'logs.personal'):
+            with self.subTest(label=label), self.assertRaises(SystemExit):
+                ea.build(self.root, Path(self.tmp.name) / f'f{abs(hash(label))}.tar.gz', label)
+
+    def test_size_limits_apply_to_the_bytes_read(self):
+        # A file that passes the stat-time size check but is larger by the time it is read must
+        # still be excluded, and never read whole.
+        from unittest.mock import patch
+        big = ea.MAX_TEXT
+        ea.MAX_TEXT = 1024
+        real = ea.classify
+        try:
+            def permissive(golden, path):
+                ok, reason = real(golden, path)
+                return (True, 'included') if path.name == 'grown.log' else (ok, reason)
+            (self.root / 'gemm-probe-20261004' / 'grown.log').write_text('x' * 4096 + '\n')
+            with patch.object(ea, 'classify', permissive):
+                manifest = ea.build(self.root, Path(self.tmp.name) / 'grown.tar.gz', 'ev')
+        finally:
+            ea.MAX_TEXT = big
+        self.assertNotIn('gemm-probe-20261004/grown.log', {e['path'] for e in manifest['files']})
+        self.assertIn('oversized text', manifest['excluded_counts'])
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
