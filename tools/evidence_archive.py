@@ -205,7 +205,7 @@ def forbidden_in(text: str) -> bool:
     return decoded is not None and FORBIDDEN.search(decoded) is not None
 
 
-FLOAT_DTYPES = {'F64', 'F32', 'F16', 'BF16'}
+FLOAT_DTYPES = {'F64': 8, 'F32': 4, 'F16': 2, 'BF16': 2}   # element sizes in bytes
 
 
 def bytes_read_as_text(payload: bytes) -> bool:
@@ -218,8 +218,9 @@ def bytes_read_as_text(payload: bytes) -> bool:
 
 
 def safetensors_payload_ok(raw: bytes, header: str) -> bool:
-    """The data section must hold only floating-point tensors whose offsets tile it exactly,
-    and must not read as forbidden text: a U8 tensor can carry arbitrary bytes."""
+    """The data section must hold only floating-point tensors whose offsets tile it exactly and
+    whose shape times element size equals their span (so a loader can read them), and must not
+    read as forbidden text: a U8 tensor can carry arbitrary bytes."""
     n = int.from_bytes(raw[:8], 'little')
     payload = raw[8 + n:]
     spans = []
@@ -228,8 +229,15 @@ def safetensors_payload_ok(raw: bytes, header: str) -> bool:
             continue
         if not isinstance(spec, dict) or spec.get('dtype') not in FLOAT_DTYPES:
             return False
-        off = spec.get('data_offsets')
-        if not (isinstance(off, list) and len(off) == 2 and all(isinstance(x, int) for x in off) and 0 <= off[0] <= off[1] <= len(payload)):
+        off, shape = spec.get('data_offsets'), spec.get('shape')
+        if not (isinstance(off, list) and len(off) == 2 and all(type(x) is int for x in off) and 0 <= off[0] <= off[1] <= len(payload)):
+            return False
+        if not (isinstance(shape, list) and all(type(d) is int and d >= 0 for d in shape)):
+            return False
+        count = 1
+        for d in shape:
+            count *= d   # Python integers do not overflow
+        if count * FLOAT_DTYPES[spec['dtype']] != off[1] - off[0]:
             return False
         spans.append((off[0], off[1]))
     spans.sort()

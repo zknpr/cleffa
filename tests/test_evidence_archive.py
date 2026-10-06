@@ -44,6 +44,8 @@ def make_tree(root: Path):
     (exp / 'small.safetensors').write_bytes(safetensors({'__metadata__': {'format': 'pt'}, 'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (exp / 'leaky.safetensors').write_bytes(safetensors({'__metadata__': {'source': f'{HOME}/run/x.pt'}, 'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (exp / 'broken.safetensors').write_bytes(b'\0' * 100)   # not a safetensors header
+    (exp / 'misshaped.safetensors').write_bytes(safetensors({'l': {'dtype': 'F32', 'shape': [1000], 'data_offsets': [0, 16]}}))   # 1000 floats in 16 bytes
+    (exp / 'badshape.safetensors').write_bytes(safetensors({'l': {'dtype': 'F32', 'shape': [-4], 'data_offsets': [0, 16]}}))
     (exp / 'escaped.safetensors').write_bytes(len(b'{"__metadata__": {"source": "\\u002froot\\u002fsecret.txt"}, "l": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}').to_bytes(8, 'little')
                                              + b'{"__metadata__": {"source": "\\u002froot\\u002fsecret.txt"}, "l": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}' + b'\0' * 16)
     (exp / 'escaped.json').write_text('{"cli": "\\u002fUsers\\u002fsomeone\\u002fclef"}\n')   # escaped home path in JSON text
@@ -66,7 +68,7 @@ def make_tree(root: Path):
     (exp / 'LICENSE').write_text('MIT\n')
     secret = b'Bearer abcdefghijklmnopqrstuvwxyz0123'
     (exp / 'late.log').write_bytes(b'ok line\n' * 700 + secret.decode().encode('utf-16-le') + b'\n')   # NULs past the 4 KiB probe
-    hdr16 = json.dumps({'l': {'dtype': 'F32', 'shape': [len(secret) // 2], 'data_offsets': [0, 2 * len(secret)]}}).encode()
+    hdr16 = json.dumps({'l': {'dtype': 'F16', 'shape': [len(secret)], 'data_offsets': [0, 2 * len(secret)]}}).encode()
     (exp / 'utf16.safetensors').write_bytes(len(hdr16).to_bytes(8, 'little') + hdr16 + secret.decode().encode('utf-16-le'))
     hdr8 = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
     (exp / 'upper.SAFETENSORS').write_bytes(len(hdr8).to_bytes(8, 'little') + hdr8 + secret)   # suffix case variant
@@ -155,6 +157,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('engine_logits-private.jsonl', names)  # private top-level file, ahead of the allowlist
         self.assertNotIn('gemm-probe-20261004/leaky.safetensors', names)  # forbidden string in the safetensors header
         self.assertNotIn('gemm-probe-20261004/broken.safetensors', names)  # unparseable safetensors header
+        self.assertNotIn('gemm-probe-20261004/misshaped.safetensors', names)  # shape x dtype size != span
+        self.assertNotIn('gemm-probe-20261004/badshape.safetensors', names)  # negative dimension
         self.assertNotIn('gemm-probe-20261004/payload.safetensors', names)  # a U8 tensor carrying text
         self.assertNotIn('gemm-probe-20261004/utf16.safetensors', names)  # text as UTF-16 inside an F32 payload
         self.assertNotIn('gemm-probe-20261004/late.log', names)  # UTF-16 text after a clean 4 KiB prefix
