@@ -67,7 +67,8 @@ The free-only run was bounded before collection. Cloudflare's
 [pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/) provides 10,000
 free neurons per day on both Free and Paid plans. The plan estimated 1,536.42 neurons from
 full inputs and checked account usage before and between models, reserving another 1,000
-neurons. The returned token counts imply 1,145.82 neurons at the published rates. Analytics
+neurons through the run's own guard, kept with its artifacts (`bench/cloudflare_checkout.py`
+has no budget guard; the later corpus collector in `bench/cloudflare_corpus.py` reserves 2,000). The returned token counts imply 1,145.82 neurons at the published rates. Analytics
 initially returned no rows, then reported 967.07 neurons at 12:36 UTC; this delayed figure
 is not a final billing total. No plan changes, deployments or additional inference calls
 were made.

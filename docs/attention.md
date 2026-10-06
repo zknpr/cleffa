@@ -310,9 +310,8 @@ instrumented prototype. It gives about 1.7–1.8% lower median inference-plus-he
 16,347 tokens. Shorter-input improvements are small and noisier. No packed-throughput
 benefit is claimed for this change. Projections remain the main cost, especially at 1–2K.
 
-The generated Metal include was rebuilt with Make.
-
-Final SHA-256:
+The generated Metal include was rebuilt with Make. The final source and binary hashes are
+recorded in `golden/attention-retention-20261004/`.
 
 ## Direct fragment rescaling
 

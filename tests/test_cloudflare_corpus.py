@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from cloudflare_corpus import check_budget, daily_usage, hosted_payload
+from cloudflare_corpus import check_budget, daily_usage, final_usage, hosted_payload
 
 
 class BudgetTests(unittest.TestCase):
@@ -46,6 +46,22 @@ class BudgetTests(unittest.TestCase):
                         daily_usage("a" * 32, "secret")
                 connection.return_value.request.assert_called_once()
                 connection.return_value.close.assert_called_once()
+
+    def test_final_usage_is_best_effort(self):
+        import io
+        out = io.StringIO()
+        with patch("cloudflare_corpus.daily_usage", return_value={"type": "budget", "used_neurons": 5}):
+            final_usage(out, "a" * 32, "secret-token")
+        self.assertEqual(json.loads(out.getvalue().splitlines()[-1])["used_neurons"], 5)
+        for exc in (RuntimeError("Cannot verify daily usage; stopping inference"), OSError("reset"),
+                    KeyError("data"), ValueError("bad"), TypeError("none"), RuntimeError("leak secret-token here")):
+            out = io.StringIO()
+            with patch("cloudflare_corpus.daily_usage", side_effect=exc):
+                final_usage(out, "a" * 32, "secret-token")   # must not raise: the run is already complete
+            record = json.loads(out.getvalue().splitlines()[-1])
+            self.assertEqual(record["type"], "budget")
+            self.assertIn("error", record)
+            self.assertNotIn("secret-token", json.dumps(record))
 
 
 if __name__ == "__main__":

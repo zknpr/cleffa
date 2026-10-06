@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import statistics
+import sys
 import time
 
 import mlx.core as mx
@@ -63,10 +64,24 @@ def main():
     shape = mx.array([t, n, k], dtype=mx.int32)
     mx.eval(x, weight, xf, wf, shape)
 
-    # Match gemm() in clef_metal.m. Using a custom MLX kernel puts the MPP and
-    # native MLX paths behind the same Python/lazy-evaluation timing boundary.
-    tm = 64 if t >= 1024 else 32
-    tn = 256 if t < 1024 and k >= 5120 and n >= 5120 else 128
+    # Match the tile that gemm() in clef_metal.m selects for an FP16 activation
+    # matrix: 64-row tiles from 1,024 rows, 32x256 for short 27B shapes and for
+    # long down projections. Two production rules are not reproduced and are
+    # recorded in the report instead: Flash's 64-row tiles at 768-1,023 rows
+    # (the model is unknown here) and the grouped tile order for long 27B
+    # expansions (same tiles and reductions, different threadgroup order).
+    # Using a custom MLX kernel puts the MPP and native MLX paths behind the
+    # same Python/lazy-evaluation timing boundary.
+    wide_down = t >= 4096 and n >= 5120 and k >= 2 * n
+    tm = 64 if t >= 1024 and not wide_down else 32
+    tn = 256 if wide_down or (t < 1024 and k >= 5120 and n >= 5120) else 128
+    tile_notes = []
+    if 768 <= t < 1024 and (t % 64 == 0 or t % 64 > 32):
+        tile_notes.append("production uses 64-row tiles for this shape on clef-flash")
+    if t >= 4096 and k >= 5120 and n >= 4 * k:
+        tile_notes.append("production uses gemm_f16_g4_64x128: grouped tile order, same tiles and reductions")
+    for note in tile_notes:
+        print(f"note: {note}", file=sys.stderr)
     header = """
     #include <metal_tensor>
     #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
@@ -111,10 +126,14 @@ def main():
     samples = {name: [] for name in methods}
     outputs = {}
     order = list(methods)
+    round_order = []
     # Four warm-ups per method, eight timed calls. Reverse order each round to
     # reduce ordering bias; conversions for MLX_precast are outside this loop.
     for rep in range(12):
-        for name in order if rep % 2 == 0 else order[::-1]:
+        this_round = order if rep % 2 == 0 else order[::-1]
+        if rep >= 4:
+            round_order.append(list(this_round))
+        for name in this_round:
             mx.synchronize()
             start = time.perf_counter()
             z = methods[name]()
@@ -126,7 +145,8 @@ def main():
             outputs[name] = z
 
     report = {
-        "T": t, "K": k, "N": n, "tile": [tm, tn],
+        "T": t, "K": k, "N": n, "tile": [tm, tn], "tile_notes": tile_notes,
+        "round_order": round_order,
         "mlx_version": importlib.metadata.version("mlx"),
         "device": mx.device_info(),
         "tf32": os.environ.get("MLX_ENABLE_TF32", "default"),

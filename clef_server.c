@@ -166,7 +166,13 @@ static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
         return clef_run(S.e, &j->rec, 1, probs, err, errlen);
     }
     fprintf(stderr, "clef-server: prefix cache: reused %d of %zu tokens\n", reused, j->rec.ids.len);
-    /* over budget: least recently used first; an entry larger than the whole budget goes too */
+    /* An entry larger than the whole budget can never be retained: drop it alone, before the
+       LRU pass below would evict every other key's entry on its behalf (review #6). */
+    if (clef_prefix_bytes(cache[i].p) > S.cache_bytes) {
+        cache_drop(i, "larger than budget");
+        return true;
+    }
+    /* over budget: least recently used first; the newest entry goes last */
     while (cache_total() > S.cache_bytes) {
         int lru = -1;
         for (int k = 0; k < CACHE_ENTRIES; k++)

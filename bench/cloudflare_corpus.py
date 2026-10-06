@@ -142,6 +142,18 @@ def check_budget(used: float, estimate: float) -> None:
         raise ValueError("Insufficient free allowance; no further inference will be sent")
 
 
+def final_usage(out, account: str, token: str) -> None:
+    """Record the post-run usage observation. The journal is already complete, so a failure
+    here is recorded, with the token redacted, instead of failing a valid run."""
+    try:
+        record = daily_usage(account, token)
+    except (RuntimeError, ValueError, OSError, KeyError, TypeError) as exc:
+        record = {"type": "budget", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                  "error": str(exc).replace(token, "[REDACTED]")}
+    out.write(json.dumps(record) + "\n")
+    out.flush()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
@@ -174,7 +186,7 @@ def main() -> None:
                     out, account, token)
         out.write(json.dumps({"type": "complete", "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}) + "\n")
         out.flush()
-        out.write(json.dumps(daily_usage(account, token)) + "\n")
+        final_usage(out, account, token)
 
 
 if __name__ == "__main__":

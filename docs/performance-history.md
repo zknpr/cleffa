@@ -191,7 +191,7 @@ All 166 GEMM shape/mode checks and both 46-question FP32-oracle suites pass. The
 22-record normal and NaN-poisoned batch-1/batch-8 outputs are byte-identical to the saved
 baseline. Long-request residual rows and forced BF16 fallback also match that baseline.
 
-See [the performance report](#) for the rejected persistent, specialized and attention
+See [rejected experiments](rejected-experiments.md#gemm) for the rejected persistent, specialized and attention
 variants, profiling evidence and validation details.
 
 ### Experiment record
@@ -257,7 +257,7 @@ failure/recovery of each scratch allocation. The two value-column tiles return i
 bits. Scratch grows atomically, is reused between records and layers, and costs about 1.3 GB
 at 16,347 tokens. The final production-dispatch comparison repeats the long case at
 26,325.30 versus 25,708.25 ms, a 2.3% reduction, with both measured rounds improving. See
-[the performance report](#) for the build hashes and localhost timings.
+[the production selection record](#production-selection) for the localhost timings.
 
 ### Experiment record
 
@@ -816,7 +816,7 @@ Read-only GEMM resource metadata, untracked/shared or private weight storage, an
 attention threadgroups were also measured; none established a useful repeatable gain, so
 they are not enabled.
 
-The [performance follow-up](#) adds shared attention probabilities for single requests of at
+The [performance follow-up](attention.md#shared-probabilities-for-long-single-requests) adds shared attention probabilities for single requests of at
 least 4,096 tokens. At 16,347 tokens, complete-request medians improve from 8.39 to 7.49 s
 for Flash and 28.76 to 27.25 s for 27B, with identical logits. Reuse also applies to packed
 batches of up to eight records with at least 4,096 total tokens. Two 8,072-token records

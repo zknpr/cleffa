@@ -97,8 +97,10 @@ def measure(model: str, rows: list[dict], args: argparse.Namespace) -> list[dict
                 # Reject speed obtained by processing fewer tokens than the full request.
                 if answer["usage"]["input_tokens"] != counts[row["id"]]:
                     raise RuntimeError(f"{row['id']}: input count differs from full strict encoding")
-                return {"ms": elapsed, "response": answer}
+                seq[0] += 1
+                return {"ms": elapsed, "response": answer, "seq": seq[0]}
 
+            seq = [0]   # execution order of every call, warm-ups included, kept with each sample
             for _ in range(3):
                 call(rows[0])
             calls = {r["id"]: [] for r in rows}
@@ -120,7 +122,8 @@ def measure(model: str, rows: list[dict], args: argparse.Namespace) -> list[dict
                                "request_sha256": hashlib.sha256(request_body(row, model)).hexdigest(),
                                "input_tokens": counts[row["id"]], "response": samples[0]["response"],
                                "median_ms": statistics.median(s["ms"] for s in samples),
-                               "samples_ms": [s["ms"] for s in samples]})
+                               "samples_ms": [s["ms"] for s in samples],
+                               "sample_seq": [s["seq"] for s in samples]})
             return result
         finally:
             if conn:

@@ -66,6 +66,13 @@ int main(void) {
     rejects(&first,p,"bad length");
     assert(clef_prefix_keep_warm(&first,p,err,sizeof(err)));
     assert(clef_prefix_bytes(p)==0);
+    /* NULL handles are rejected explicitly, as clef_prefix_free accepts them. The volatile
+       pointers keep the compiler from folding a constant NULL dereference into unreachable code. */
+    clef_prefix *volatile no_prefix=NULL;
+    clef_engine *volatile no_engine=NULL;
+    assert(clef_prefix_bytes(no_prefix)==0);
+    err[0]=0;
+    assert(!clef_keep_warm(no_engine,err,sizeof(err)) && strstr(err,"invalid engine"));
     clef_prefix_free(p);
     puts("PASS: cache binds before buffer use; other engines and recycled addresses fail explicitly; empty keep-warm performs no GPU work");
     return 0;

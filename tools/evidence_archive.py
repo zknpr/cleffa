@@ -141,7 +141,9 @@ def prepare(path: Path) -> tuple[bytes | None, bool, str]:
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError:
-        return (None, False, 'undecodable text') if FORBIDDEN.search(raw.decode('latin-1')) else (raw, False, 'included')
+        # Evidence files are UTF-8. Anything else cannot be rewritten or scanned reliably, so it
+        # is excluded rather than archived raw (review #11).
+        return None, False, 'undecodable text'
     new = text
     for pat, repl in REWRITES:
         new = pat.sub(repl, new)

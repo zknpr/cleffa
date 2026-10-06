@@ -31,6 +31,7 @@ def make_tree(root: Path):
     (exp / 'capture.trace').mkdir()
     (exp / 'capture.trace' / 'data.bin').write_bytes(b'\0' * 8)
     (exp / 'gpu-values.xml').write_text('<x/>')
+    (exp / 'latin.log').write_bytes(b'path /Volumes/scratch/x \xff\xfe not utf-8\n')
     (exp / 'small.safetensors').write_bytes(b'\0' * 100)
     (exp / 'big.safetensors').write_bytes(b'\0' * (ea.SMALL_TENSOR + 1))
     art = root / 'article-batch-20261005'
@@ -90,6 +91,8 @@ class EvidenceArchive(unittest.TestCase):
                             by_path['gemm-probe-20261004/result.json']['source_sha256'])
         ex = manifest['excluded_counts']
         self.assertNotIn('gemm-probe-20261004/calls.jsonl', names)  # account ID inside a recorded URL
+        self.assertNotIn('gemm-probe-20261004/latin.log', names)  # undecodable text is never archived raw
+        self.assertIn('undecodable text', manifest['excluded_counts'])
         for reason in ('binary', 'private-named file', 'forbidden content', 'private workload directory',
                        'upstream clone', 'trace or dSYM bundle', 'tensor size', 'oracle directory'):
             self.assertIn(reason, ex, reason)

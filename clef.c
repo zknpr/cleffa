@@ -331,7 +331,7 @@ void clef_prefix_free(clef_prefix *p) {
     free(p);
 }
 
-size_t clef_prefix_bytes(const clef_prefix *p) { return clef_gpu_prefix_bytes(p->gpu); }
+size_t clef_prefix_bytes(const clef_prefix *p) { return p ? clef_gpu_prefix_bytes(p->gpu) : 0; }
 
 static bool prefix_owner_ok(const clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
     if (!e || !p || !e->instance_id) {
@@ -490,6 +490,7 @@ bool clef_run_template(clef_engine *e, clef_prefix *p, const clef_record *rec, f
 }
 
 bool clef_keep_warm(clef_engine *e, char *err, size_t errlen) {
+    if (!e) { snprintf(err, errlen, "invalid engine"); return false; }
     return clef_gpu_keepalive(e->gpu, err, errlen);
 }
 

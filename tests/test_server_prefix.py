@@ -10,6 +10,8 @@ REQUESTS.jsonl is the corpus; its long log requests supply the states.
      log shows which reused an entry. A second key never reuses the first key's entry, although
      its requests are identical. A request without the header never touches an entry.
   3. A budget smaller than one entry drops each entry after serving it; answers do not change.
+     A budget that holds a short entry but not a long one drops only the long entry: the other
+     key's entry survives and keeps reusing.
   4. A key with a character outside [A-Za-z0-9._-], or longer than 64, is HTTP 400.
 """
 
@@ -30,7 +32,7 @@ ROOT = Path(__file__).resolve().parents[1]
 model, corpus_path = sys.argv[1], sys.argv[2]
 corpus = [json.loads(line) for line in open(corpus_path)]
 logs = sorted((r for r in corpus if isinstance(r["state"], str) and len(r["state"]) > 2000), key=lambda r: len(r["state"]))
-A, B = logs[0], logs[1]
+A, B, LONG = logs[0], logs[1], logs[-1]
 other_q = next(r["questions"] for r in corpus if r["questions"] != A["questions"])
 REUSED = re.compile(r"prefix cache: reused (\d+) of (\d+) tokens")
 
@@ -98,7 +100,8 @@ with tempfile.TemporaryDirectory() as t:
     ref = Server([], tmp, "plain")
     try:
         want = [ref.post(r) for r in requests]
-        if any(st != 200 for st, _ in want):
+        want_long = ref.post(LONG)
+        if any(st != 200 for st, _ in want + [want_long]):
             fail("reference server returned an error")
         if ref.post(A, "tenant-1") != want[0] or ref.reused():
             fail("the header changed an answer on a server without --prefix-cache-mb")
@@ -147,3 +150,21 @@ with tempfile.TemporaryDirectory() as t:
         print(f"server prefix cache over budget: {small.dropped()} entries dropped, answers unchanged")
     finally:
         small.stop()
+
+    # 700 MiB holds the entry for A (2,235 tokens, under 0.5 GB with its checkpoints) but not the
+    # one for LONG (16,347 tokens, about 1.9 GB). The oversized entry must be the only one dropped.
+    mid = Server(["--prefix-cache-mb", "700"], tmp, "mid")
+    try:
+        if mid.post(requests[0], "tenant-1") != want[0] or mid.post(requests[1], "tenant-1") != want[1]:
+            fail("an answer changed under the 700 MiB budget")
+        if mid.reused()[-1] == 0:
+            fail("the short entry did not fit the 700 MiB budget; the scenario needs a larger budget")
+        if mid.post(LONG, "tenant-2") != want_long:
+            fail("the oversized request's answer changed")
+        if mid.dropped() != 1:
+            fail(f"an oversized entry evicted other keys' entries: {mid.dropped()} drops")
+        if mid.post(requests[1], "tenant-1") != want[1] or mid.reused()[-1] == 0:
+            fail("the short entry was evicted by an oversized entry under another key")
+        print(f"server prefix cache oversized entry: 1 drop, other key kept reusing ({mid.reused()})")
+    finally:
+        mid.stop()
