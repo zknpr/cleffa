@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import os
+import shutil
 import sys
 import tarfile
 import tempfile
@@ -365,8 +366,12 @@ class EvidenceArchive(unittest.TestCase):
             return verdict
         with patch.object(ea, 'classify', swap_after), self.assertRaises(SystemExit):
             ea.build(self.root, Path(self.tmp.name) / 'swap.tar.gz', 'ev')
-        with self.assertRaises(SystemExit):
-            ea.read_snapshot(target, ea.MAX_TEXT)   # a link is refused by the read on its own
+        root_fd = ea.open_tree(self.root)
+        try:
+            with self.assertRaises(SystemExit):
+                ea.read_snapshot(root_fd, Path('gemm-probe-20261004/swap.log'), ea.MAX_TEXT)   # refused on its own
+        finally:
+            os.close(root_fd)
 
     def test_unreadable_directory_fails_the_build(self):
         # os.walk() skips a directory it cannot list unless told otherwise, and an archive that
@@ -463,13 +468,42 @@ class EvidenceArchive(unittest.TestCase):
         signal.alarm(10)
         try:
             manifest = ea.build(self.root, Path(self.tmp.name) / 'fifo.tar.gz', 'ev')
-            with self.assertRaises(SystemExit):
-                ea.read_snapshot(fifo, ea.MAX_TEXT)   # refused on the descriptor, without blocking
+            root_fd = ea.open_tree(self.root)
+            try:
+                with self.assertRaises(SystemExit):
+                    ea.read_snapshot(root_fd, Path('gemm-probe-20261004/pipe.log'), ea.MAX_TEXT)   # refused without blocking
+            finally:
+                os.close(root_fd)
         finally:
             signal.alarm(0)
             signal.signal(signal.SIGALRM, previous)
         self.assertNotIn('gemm-probe-20261004/pipe.log', {e['path'] for e in manifest['files']})
         self.assertIn('not a regular file', manifest['excluded_counts'])
+
+    def test_ancestor_swapped_for_a_symlink_is_refused(self):
+        # O_NOFOLLOW protects the final component only. A directory the walk already passed can
+        # be replaced by a link to an external tree holding the same file name; opening every
+        # component relative to its parent without following links refuses that.
+        from unittest.mock import patch
+        ext = Path(self.tmp.name) / 'ext'
+        ext.mkdir()
+        (ext / 'zz-swap.log').write_text('k9f3q8z1x7v2b6n4m0c5l8p3w1e9r7t2\n')   # unlabelled token
+        probe = self.root / 'swap-probe-20261004'
+        probe.mkdir()
+        target = probe / 'zz-swap.log'
+        target.write_text('benign\n')
+        real = ea.classify
+
+        def swap_ancestor(golden, path):
+            verdict = real(golden, path)
+            if path == target:
+                shutil.rmtree(probe)
+                probe.symlink_to(ext, target_is_directory=True)
+            return verdict
+        out = Path(self.tmp.name) / 'ancestor.tar.gz'
+        with patch.object(ea, 'classify', swap_ancestor), self.assertRaises(SystemExit):
+            ea.build(self.root, out, 'ev')
+        self.assertFalse(out.exists())
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

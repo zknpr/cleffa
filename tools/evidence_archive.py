@@ -43,8 +43,9 @@ scan over every archived text file fails the build if a FORBIDDEN pattern surviv
 rewrite rules are checked rather than trusted. JSON text (documents, JSONL lines and
 safetensors headers) is scanned both as written and as decoded strings, since an escaped
 form such as \u002f survives a textual match and json.loads reassembles it. Text files may not contain a NUL byte
-anywhere, which is what UTF-16 text would need to hide in them. Files are opened without
-following symlinks and must still be the regular file the path named once read; a directory
+anywhere, which is what UTF-16 text would need to hide in them. Files are opened relative to
+the evidence root one component at a time without following symlinks, and must still be the
+singly linked regular file the path named once read; a directory
 the walk cannot list fails the build unless its path excludes it, in which case it is pruned
 unread; and the included payloads, held in memory until the archive is written, are bounded
 by MAX_TOTAL in total.
@@ -344,8 +345,19 @@ def prepare(path: Path, raw: bytes) -> tuple[bytes | None, bool, str]:
     return new.encode('utf-8'), new != text, 'included'
 
 
-def read_snapshot(path: Path, limit: int) -> tuple[bytes | None, os.stat_result]:
-    """The file's bytes and metadata from one descriptor; a file whose size, inode or mtime
+def open_tree(golden: Path) -> int:
+    """A descriptor for the evidence root. Every snapshot is opened relative to it, one
+    component at a time, so no directory below the root may be a symlink at read time: a
+    directory the walk already passed can be swapped for a link to an external tree holding
+    the same file name, which O_NOFOLLOW on the final component alone would traverse
+    (review #62). The root itself may be a link; the operator chose it."""
+    if os.open not in os.supports_dir_fd or os.stat not in os.supports_dir_fd:   # lstat is stat without following
+        raise SystemExit('this platform cannot open paths relative to a directory descriptor')
+    return os.open(golden, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+
+
+def read_snapshot(root_fd: int, rel: Path, limit: int) -> tuple[bytes | None, os.stat_result]:
+    """The bytes and metadata of `rel` below the root descriptor, read once; a file whose size, inode or mtime
     differ between the stat before and the stat after the read is being changed, and the build
     stops rather than describe a snapshot that never existed (review #50). A file longer than
     `limit` by the time it is read returns None: the stat-time size check does not bind the
@@ -354,27 +366,37 @@ def read_snapshot(path: Path, limit: int) -> tuple[bytes | None, os.stat_result]
     rejected links by name, and the name can be replaced by one in between (review #55). The
     open is non-blocking so a FIFO cannot stall it before the type check (review #61); reads of
     a regular file ignore that flag. A link count above one is refused here as in classify()
-    (review #60)."""
+    (review #60). Each directory component is opened with O_DIRECTORY | O_NOFOLLOW relative
+    to its parent, and the final lstat is relative to that parent too (review #62)."""
+    dirs: list[int] = []
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except OSError as e:   # ELOOP for a link; a vanished or unreadable file is an error too
-        raise SystemExit(f'{path}: cannot open: {e.strerror}')
-    with os.fdopen(fd, 'rb') as fh:
-        before = os.fstat(fh.fileno())
-        if not stat.S_ISREG(before.st_mode):
-            raise SystemExit(f'{path} is not a regular file')
-        if before.st_nlink != 1:
-            raise SystemExit(f'{path} has {before.st_nlink} links')
-        raw = fh.read(limit + 1)   # never more than the limit allows into memory
-        after = os.fstat(fh.fileno())
-    named = os.lstat(path)
+        parent = root_fd
+        try:
+            for part in rel.parts[:-1]:
+                parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                dirs.append(parent)
+            fd = os.open(rel.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent)
+        except OSError as e:   # ELOOP for a link, ENOTDIR for a swapped directory, a vanished file
+            raise SystemExit(f'{rel}: cannot open: {e.strerror}')
+        with os.fdopen(fd, 'rb') as fh:
+            before = os.fstat(fh.fileno())
+            if not stat.S_ISREG(before.st_mode):
+                raise SystemExit(f'{rel} is not a regular file')
+            if before.st_nlink != 1:
+                raise SystemExit(f'{rel} has {before.st_nlink} links')
+            raw = fh.read(limit + 1)   # never more than the limit allows into memory
+            after = os.fstat(fh.fileno())
+        named = os.stat(rel.name, dir_fd=parent, follow_symlinks=False)
+    finally:
+        for d in dirs:
+            os.close(d)
     if (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
-        raise SystemExit(f'{path} was replaced while it was being archived')
+        raise SystemExit(f'{rel} was replaced while it was being archived')
     if len(raw) > limit:
         return None, before
     same = (before.st_size, before.st_ino, before.st_dev, before.st_mtime_ns) == (after.st_size, after.st_ino, after.st_dev, after.st_mtime_ns)
     if not same or len(raw) != before.st_size:
-        raise SystemExit(f'{path} changed while it was being archived')
+        raise SystemExit(f'{rel} changed while it was being archived')
     return raw, before
 
 
@@ -385,6 +407,14 @@ def walk_error(error: OSError):
 
 
 def collect(golden: Path):
+    root_fd = open_tree(golden)
+    try:
+        return collect_below(golden, root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def collect_below(golden: Path, root_fd: int):
     included, excluded = [], {}
     total = 0
     for dirpath, dirnames, filenames in os.walk(golden, onerror=walk_error):
@@ -401,7 +431,7 @@ def collect(golden: Path):
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
             tensor = path.suffix.lower() == '.safetensors'
-            raw, st = read_snapshot(path, SMALL_TENSOR if tensor else MAX_TEXT)
+            raw, st = read_snapshot(root_fd, path.relative_to(golden), SMALL_TENSOR if tensor else MAX_TEXT)
             if raw is None:
                 reason = 'tensor size' if tensor else 'oversized text'
                 excluded[reason] = excluded.get(reason, 0) + 1
