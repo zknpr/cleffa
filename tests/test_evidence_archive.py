@@ -78,6 +78,7 @@ def make_tree(root: Path):
     doc += b' ' * (-len(doc) % 4)   # trailing spaces keep it valid JSON and a whole number of floats
     hdrj = json.dumps({'l': {'dtype': 'F32', 'shape': [len(doc) // 4], 'data_offsets': [0, len(doc)]}}).encode()
     (exp / 'jsonpayload.safetensors').write_bytes(len(hdrj).to_bytes(8, 'little') + hdrj + doc)
+    (exp / 'macho.log').write_bytes(b'\xcf\xfa\xed\xfe' + b'1' * 12)   # Mach-O magic, no NUL, text name
     (exp / 'escaped.log').write_text('Authorization: Bearer abcdefgh\\u002dijklmnopqrstuvwxyz0123\n')   # escape in plain text
     hdr8 = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
     (exp / 'upper.SAFETENSORS').write_bytes(len(hdr8).to_bytes(8, 'little') + hdr8 + secret)   # suffix case variant
@@ -174,6 +175,7 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/utf16.safetensors', names)  # text as UTF-16 inside an F32 payload
         self.assertNotIn('gemm-probe-20261004/jsonpayload.safetensors', names)  # JSON-escaped token in a payload
         self.assertNotIn('gemm-probe-20261004/escaped.log', names)  # \\u002d escape in plain text
+        self.assertNotIn('gemm-probe-20261004/macho.log', names)  # Mach-O magic under a text name
         self.assertNotIn('gemm-probe-20261004/late.log', names)  # UTF-16 text after a clean 4 KiB prefix
         self.assertNotIn('gemm-probe-20261004/.env', names)  # dotfiles never
         self.assertNotIn('gemm-probe-20261004/notes', names)  # extensionless only when allowlisted
@@ -396,6 +398,17 @@ class EvidenceArchive(unittest.TestCase):
         from unittest.mock import patch
         with patch.object(ea, 'MAX_TOTAL', 64), self.assertRaisesRegex(SystemExit, 'MAX_TOTAL'):
             ea.build(self.root, Path(self.tmp.name) / 'total.tar.gz', 'ev')
+
+    def test_classification_reads_no_content(self):
+        # A size check at stat time cannot bound a read made afterwards, so classify() decides by
+        # name and metadata alone; the bounded snapshot is the only read of a file's content.
+        from unittest.mock import patch
+
+        def refuse(*args, **kwargs):
+            raise AssertionError('file content read during classification')
+        for name in ('result.json', 'run.py', 'small.safetensors'):
+            with patch.object(ea.Path, 'read_bytes', refuse), patch('builtins.open', refuse):
+                self.assertTrue(ea.classify(self.root, self.root / 'gemm-probe-20261004' / name)[0], name)
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

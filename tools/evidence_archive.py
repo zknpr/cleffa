@@ -108,15 +108,10 @@ CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)$', re.IGNORECA
 
 
 def is_text(path: Path) -> bool:
-    """Text by extension or, without one, by content; a NUL byte anywhere disqualifies either,
-    so binary or NUL-padded (UTF-16) data under a text name is excluded rather than archived.
-    Files are bounded by MAX_TEXT, so reading them whole here is affordable."""
-    if not (path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES):
-        return False   # an extensionless file is admitted by name only (review #42)
-    if path.stat().st_size > MAX_TEXT:
-        return True   # classify() excludes it as oversized without reading it
-    raw = path.read_bytes()
-    return raw[:4] not in MACHO and b'\0' not in raw
+    """Text by name: a listed extension, or one of the two extensionless names (review #42).
+    Content is judged by prepare() on the bounded snapshot, never here: a read made after the
+    stat-time size check would be unbounded (review #58)."""
+    return path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES
 
 
 def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
@@ -307,11 +302,10 @@ def safetensors_header(raw: bytes) -> str | None:
     return text
 
 
-def prepare(path: Path, raw: bytes | None = None) -> tuple[bytes | None, bool, str]:
-    """Return (archived bytes, rewritten?, reason). None means exclude. `raw` is the file's
-    content when the caller has already read it, so one read serves the archive and the manifest."""
-    if raw is None:
-        raw = path.read_bytes()
+def prepare(path: Path, raw: bytes) -> tuple[bytes | None, bool, str]:
+    """Return (archived bytes, rewritten?, reason). None means exclude. `raw` is the bounded
+    snapshot read_snapshot() returned: that one read serves the content checks, the archive
+    and the manifest, and nothing here opens the path again."""
     if path.suffix.lower() == '.safetensors':
         header = safetensors_header(raw)
         if header is None:
@@ -321,8 +315,8 @@ def prepare(path: Path, raw: bytes | None = None) -> tuple[bytes | None, bool, s
         if not safetensors_payload_ok(raw, header):
             return None, False, 'safetensors payload'
         return raw, False, 'included'
-    if b'\0' in raw:
-        return None, False, 'binary'   # NUL-padded (UTF-16) or binary data under a text name (review #40)
+    if raw[:4] in MACHO or b'\0' in raw:
+        return None, False, 'binary'   # Mach-O, NUL-padded (UTF-16) or binary data under a text name (review #40)
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError:
