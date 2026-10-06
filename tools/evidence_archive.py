@@ -13,7 +13,8 @@ Included
   - experiment sources (.py, .m, .metal, .c, .h, .sh, Makefile)
   - .safetensors files up to SMALL_TENSOR bytes (saved logits; never layer dumps) whose JSON
     header passes the FORBIDDEN scan and whose data section holds only floating-point tensors
-    that tile it exactly and do not read as forbidden text
+    that tile it exactly and do not read as forbidden text in any byte-, NUL-padded or UTF-16
+    view; the suffix test is case-insensitive everywhere
   - for the oracle directories ref/oracle.py writes (clef, clef-flash and their documented
     variants, no date suffix): requests.jsonl, encoded.jsonl,
     logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump
@@ -195,6 +196,15 @@ def forbidden_in(text: str) -> bool:
 FLOAT_DTYPES = {'F64', 'F32', 'F16', 'BF16'}
 
 
+def bytes_read_as_text(payload: bytes) -> bool:
+    """Whether the bytes contain a forbidden pattern under any encoding text could hide in:
+    one byte per character, UTF-16 in either order, or ASCII padded with NULs (what UTF-16 or
+    UTF-32 ASCII looks like once the NULs are dropped)."""
+    views = [payload.decode('latin-1'), payload.replace(b'\0', b'').decode('latin-1'),
+             payload.decode('utf-16-le', 'ignore'), payload.decode('utf-16-be', 'ignore')]
+    return any(FORBIDDEN.search(v) for v in views)
+
+
 def safetensors_payload_ok(raw: bytes, header: str) -> bool:
     """The data section must hold only floating-point tensors whose offsets tile it exactly,
     and must not read as forbidden text: a U8 tensor can carry arbitrary bytes."""
@@ -216,7 +226,7 @@ def safetensors_payload_ok(raw: bytes, header: str) -> bool:
         if a != end:
             return False
         end = b
-    return end == len(payload) and not FORBIDDEN.search(payload.decode('latin-1'))
+    return end == len(payload) and not bytes_read_as_text(payload)
 
 
 def safetensors_header(raw: bytes) -> str | None:
@@ -240,7 +250,7 @@ def safetensors_header(raw: bytes) -> str | None:
 def prepare(path: Path) -> tuple[bytes | None, bool, str]:
     """Return (archived bytes, rewritten?, reason). None means exclude."""
     raw = path.read_bytes()
-    if path.suffix == '.safetensors':
+    if path.suffix.lower() == '.safetensors':
         header = safetensors_header(raw)
         if header is None:
             return None, False, 'malformed safetensors'
@@ -319,8 +329,9 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     for rel, path, data, _ in included:
         if FORBIDDEN.search(rel):
             raise SystemExit(f'forbidden pattern in the path {rel}')
-        text = safetensors_header(data) if path.suffix == '.safetensors' else data.decode('utf-8', 'replace')
-        if text is None or forbidden_in(text) or (path.suffix == '.safetensors' and not safetensors_payload_ok(data, text)):
+        tensor = path.suffix.lower() == '.safetensors'
+        text = safetensors_header(data) if tensor else data.decode('utf-8', 'replace')
+        if text is None or forbidden_in(text) or (tensor and not safetensors_payload_ok(data, text)):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'wb') as fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \

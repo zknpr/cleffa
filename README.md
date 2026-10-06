@@ -569,6 +569,7 @@ Debug hooks for tests:
 - `CLEF_DEBUG_KEEPWARM_MS=N` sets the idle-pass interval (0 disables); `CLEF_DEBUG_KEEPWARM_NOWEIGHTS=1` omits the weights from idle passes.
 - `CLEF_DEBUG_PREFIX_FAIL_ABOVE=N` fails cache-capacity growth above N tokens; `CLEF_DEBUG_PREFIX_CKPT_FAIL=N` fails the Nth new checkpoint allocation.
 - `CLEF_DEBUG_HEAD_SPLIT_MIN=N` sets the CPU head's two-worker threshold (0 disables the linear split).
+- `CLEF_DEBUG_SIMD_WIDTH_FOR=NAME` makes the named attention pipeline report a 16-lane SIMDgroup at open, which must be refused.
 
 Golden directories written before `ref/oracle_f32_stream.py` produced `encoded.jsonl` can get one
 with `ref/write_encoded.py MODEL_DIR GOLDEN_DIR`, which uses the tokenizer only.

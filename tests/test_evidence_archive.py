@@ -57,6 +57,10 @@ def make_tree(root: Path):
     nested.mkdir()
     (nested / 'requests.jsonl').write_text('{"state": "customer text"}\n')   # nested private workload
     secret = b'Bearer abcdefghijklmnopqrstuvwxyz0123'
+    hdr16 = json.dumps({'l': {'dtype': 'F32', 'shape': [len(secret) // 2], 'data_offsets': [0, 2 * len(secret)]}}).encode()
+    (exp / 'utf16.safetensors').write_bytes(len(hdr16).to_bytes(8, 'little') + hdr16 + secret.decode().encode('utf-16-le'))
+    hdr8 = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
+    (exp / 'upper.SAFETENSORS').write_bytes(len(hdr8).to_bytes(8, 'little') + hdr8 + secret)   # suffix case variant
     hdr = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
     (exp / 'payload.safetensors').write_bytes(len(hdr).to_bytes(8, 'little') + hdr + secret)   # text as tensor bytes
     (exp / 'usage-20261004.json').write_text('{"used_neurons": 1}')
@@ -141,6 +145,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/leaky.safetensors', names)  # forbidden string in the safetensors header
         self.assertNotIn('gemm-probe-20261004/broken.safetensors', names)  # unparseable safetensors header
         self.assertNotIn('gemm-probe-20261004/payload.safetensors', names)  # a U8 tensor carrying text
+        self.assertNotIn('gemm-probe-20261004/utf16.safetensors', names)  # text as UTF-16 inside an F32 payload
+        self.assertNotIn('gemm-probe-20261004/upper.SAFETENSORS', names)  # suffix case must not skip the checks
         self.assertFalse([n for n in names if 'Bearer' in n], 'forbidden string in a path component')
         self.assertNotIn('gemm-probe-20261004/lower.log', names)  # lowercase bearer
         self.assertNotIn('gemm-probe-20261004/env.log', names)  # lowercase token variable

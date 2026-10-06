@@ -440,6 +440,8 @@ settings before applying this selector.
 `CLEF_DEBUG_PREFIX_FAIL_ABOVE=N` injects cache-capacity failures above N tokens to
 check invalidation, explicit errors and recovery. `CLEF_DEBUG_PREFIX_CKPT_FAIL=N`
 fails the Nth new checkpoint allocation for partial-entry recovery tests.
+`CLEF_DEBUG_SIMD_WIDTH_FOR=NAME` reports that pipeline as 16 lanes wide at open, to check that
+every pipeline using `rescale_fragment` (reuse, prefetch and the cached FP32 attention) refuses to open.
 
 
 ### Measuring latency

@@ -47,6 +47,18 @@ class CliErrors(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 1, p.stderr)   # the flag is fine; opening the model is what fails
 
+    def test_simd_width_guard_covers_every_rescaling_pipeline(self):
+        # rescale_fragment reads a SIMDgroup's two local fragment elements; every pipeline that
+        # uses it must refuse to open on a device reporting another width, including the cached
+        # FP32 attention path. The hook fakes one pipeline's reported width.
+        for name in ("attention_reuse_4", "attention_prefetch_64", "attention_prefix_64"):
+            with self.subTest(pipeline=name):
+                env = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+                env["CLEF_DEBUG_SIMD_WIDTH_FOR"] = name
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, "--time"], input="", capture_output=True, text=True, env=env)
+                self.assertNotEqual(p.returncode, 0, f"{name} opened on a 16-lane SIMDgroup")
+                self.assertIn(f"{name} requires a 32-lane SIMDgroup", p.stderr)
+
     def test_truncation_requires_explicit_opt_in(self):
         request = {**REQUEST, "state": "alpha " * 20000}
         # A failed first command buffer detects whether encoding reached inference,

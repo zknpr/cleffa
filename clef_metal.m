@@ -114,8 +114,12 @@ static id<MTLComputePipelineState> pipeline(clef_gpu *g, id<MTLLibrary> lib, con
     id<MTLComputePipelineState> p = [g->dev newComputePipelineStateWithFunction:fn error:&e];
     if (!p) { snprintf(err, errlen, "metal: pipeline %s: %s", name, e.localizedDescription.UTF8String); return nil; }
     // Direct attention fragment rescaling accesses the two local float elements.
-    if ((!strcmp(name, "attention_reuse_4") || !strcmp(name, "attention_prefetch_64")) &&
-        p.threadExecutionWidth != 32) {
+    // test hook (tests/test_cli_errors.py): CLEF_DEBUG_SIMD_WIDTH_FOR=NAME reports that pipeline as 16 lanes wide
+    const char *fake = getenv("CLEF_DEBUG_SIMD_WIDTH_FOR");
+    const NSUInteger width = fake && !strcmp(fake, name) ? 16 : p.threadExecutionWidth;
+    // attention_prefix_64 (cached FP32 attention) shares that rescaling (review #38).
+    if ((!strcmp(name, "attention_reuse_4") || !strcmp(name, "attention_prefetch_64") || !strcmp(name, "attention_prefix_64")) &&
+        width != 32) {
         snprintf(err, errlen, "metal: %s requires a 32-lane SIMDgroup", name);
         return nil;
     }
