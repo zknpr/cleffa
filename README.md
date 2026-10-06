@@ -155,14 +155,16 @@ assign keys per tenant and conversation: callers sharing a key can observe one
 another's cache hits through latency. Keys are not authentication credentials.
 
 The server retains at most 32 entries and evicts least recently used entries
-after a request exceeds the budget. The budget uses MiB and limits retained cache
-buffers, not total process memory or peak allocation during a request. Each entry
+after a request exceeds the budget. The budget uses MiB and limits the cache's buffers:
+a request whose entry would exceed it is served uncached without allocating one, and an
+entry that would grow past it is dropped first. It does not bound total process memory, and
+capacity growth copies an entry's planes, so a growing entry transiently needs up to twice
+its size. Each entry
 can retain up to twelve recurrent-state checkpoints, adding 50.25 MiB per
 checkpoint on Flash or 149.625 MiB on 27B, plus attention and head-memory buffers.
 A 16K Flash entry with eight checkpoints measured about 2.14 GiB, beyond the
 engine's own buffers; changing prefixes can allocate more checkpoints. All
-retained buffers count toward the budget. An entry larger than the budget is
-dropped after serving the request. Allocation failures fall back to an uncached
+retained buffers count toward the budget. Allocation failures fall back to an uncached
 server request. See the [checkpoint measurements](docs/prefix-cache.md#recurrent-state-checkpoints)
 for shared-prefix speedups, memory costs and qualification.
 

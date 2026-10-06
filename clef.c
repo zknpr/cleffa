@@ -466,14 +466,55 @@ static bool run_entry(clef_engine *e, clef_prefix *p, const clef_record *rec, in
     return true;
 }
 
+/* The snapshot row clef_run_prefix uses for a record, 0 when it takes the plain path. */
+static int snapshot_row(const clef_record *rec) {
+    const int Ls = rec->schema_start > CLEF_PREFIX_MARGIN ? (rec->schema_start - CLEF_PREFIX_MARGIN) / 32 * 32 : 0;
+    return Ls >= CLEF_PREFIX_MIN ? Ls : 0;
+}
+
+size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const clef_record *rec) {
+    if (!e || !p || !rec || !e->gpu) return 0;
+    const int Ls = snapshot_row(rec);
+    const int T = rec->ids.len <= (size_t)(1 << 20) ? (int)rec->ids.len : 0;
+    /* The same plain-path conditions as run_entry: nothing would be allocated. */
+    bool spans_ok = Ls > 0 && Ls < T;
+    for (int q = 0; spans_ok && q < rec->nq; q++) {
+        spans_ok = rec->q[q].span[0] >= Ls;
+        for (int k = 0; spans_ok && k < rec->q[q].n_opt; k++) spans_ok = rec->q[q].opt_span[k][0] >= Ls;
+    }
+    if (!spans_ok || !clef_gpu_prefix_supported(e->gpu)) return 0;
+    /* run_entry's resume point, read-only: checkpoints past the shared tokens would be invalidated. */
+    const int cls = clef_gpu_prefix_class(e, T);
+    int same = 0;
+    if (p->len > 0 && p->cls == cls) {
+        const int n = p->len < Ls ? p->len : Ls;
+        while (same < n && p->ids[same] == rec->ids.ids[same]) same++;
+    }
+    const bool left = p->len > 0 && p->cls == cls && same < p->len && same < Ls;
+    int L = 0;
+    for (int i = 0; i < CLEF_PREFIX_CKPT; i++)
+        if (p->ck_row[i] <= same && p->ck_row[i] > L) L = p->ck_row[i];
+    /* The rows the pass would store, counted as run_entry enumerates them. */
+    int period = CLEF_PREFIX_PERIOD, n = 0, last = 0;
+    while ((Ls - 1) / period > CLEF_PREFIX_CKPT - 3) period *= 2;
+    const int at = same / 32 * 32;
+    const bool anchor = left && at > L && at >= CLEF_PREFIX_MIN && at % period;
+    for (int r = (L / period + 1) * period; r < Ls; r += period) {
+        if (anchor && at < r && (n == 0 || last < at)) { n++; last = at; }
+        n++; last = r;
+    }
+    if (anchor && at < Ls && (n == 0 || last < at)) n++;
+    if (Ls > L) n++;
+    return clef_gpu_prefix_estimate(e->gpu, &e->cfg, p->gpu, T, n);
+}
+
 bool clef_run_prefix(clef_engine *e, clef_prefix *p, const clef_record *rec, float ****out, bool raw,
                      int *reused, char *err, size_t errlen) {
     /* The snapshot sits where the schema begins, on attention's 32-query-row boundary. A request
      * with fewer than 128 cacheable tokens takes the plain path and leaves the entry alone: every
      * request shares the template tokens, so it would otherwise "match" and then overwrite an
      * entry that took seconds to fill. clef_run_template is the entry for those tokens. */
-    const int Ls = rec->schema_start > CLEF_PREFIX_MARGIN ? (rec->schema_start - CLEF_PREFIX_MARGIN) / 32 * 32 : 0;
-    return run_entry(e, p, rec, Ls >= CLEF_PREFIX_MIN ? Ls : 0, true, out, raw, reused, err, errlen);
+    return run_entry(e, p, rec, snapshot_row(rec), true, out, raw, reused, err, errlen);
 }
 
 bool clef_run_template(clef_engine *e, clef_prefix *p, const clef_record *rec, float ****out, bool raw,

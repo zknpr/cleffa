@@ -76,6 +76,9 @@ void clef_free_probs(const clef_record *recs, int n, float ***probs);
 clef_prefix *clef_prefix_new(void);
 void clef_prefix_free(clef_prefix *p);
 size_t clef_prefix_bytes(const clef_prefix *p);   /* GPU memory the entry holds */
+/* GPU memory the entry would hold after clef_run_prefix on this record (an upper bound; 0 when the
+ * pass would take the plain path), for a caller that enforces a budget before anything is allocated. */
+size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const clef_record *rec);
 bool clef_prefix_keep_warm(clef_engine *e, const clef_prefix *p, char *err, size_t errlen);
 /* Template reuse. Every request starts with the same template tokens, so an entry pinned to
  * their first 32 reuses only public state; no request key is needed. The entry buffers also
@@ -128,6 +131,7 @@ typedef struct { int load, n, row[CLEF_PREFIX_CKPT], slot[CLEF_PREFIX_CKPT]; } c
 clef_gpu_prefix *clef_gpu_prefix_new(void);
 void clef_gpu_prefix_free(clef_gpu_prefix *px);
 size_t clef_gpu_prefix_bytes(const clef_gpu_prefix *px);
+size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts);
 bool clef_gpu_prefix_supported(const clef_gpu *g);
 bool clef_gpu_prefix_keepalive(clef_gpu *g, const clef_gpu_prefix *px, char *err, size_t errlen);
 int clef_gpu_prefix_class(const clef_engine *e, int length);

@@ -10,7 +10,9 @@ REQUESTS.jsonl is the corpus; its long log requests supply the states.
   2. Server with --prefix-cache-mb: the same requests under a key return the same bytes, and the
      log shows which reused an entry. A second key never reuses the first key's entry, although
      its requests are identical. A request without the header never touches an entry.
-  3. A budget smaller than one entry drops each entry after serving it; answers do not change.
+  3. A budget smaller than one entry never allocates one: the request is served uncached and the
+     projected size is logged; answers do not change. Every cached pass logs its projected and
+     retained size, and the retained size never exceeds the projection.
      A budget that holds a short entry but not a long one drops only the long entry: the other
      key's entry survives and keeps reusing.
   3b. Keyed requests too short to cache never take a table slot: 33 of them under new keys leave
@@ -39,6 +41,7 @@ A, B, LONG = logs[0], logs[1], logs[-1]
 SHORT = min(corpus, key=lambda r: len(json.dumps(r)))   # under the 128-token minimum prefix: bypasses the entry
 other_q = next(r["questions"] for r in corpus if r["questions"] != A["questions"])
 REUSED = re.compile(r"prefix cache: reused (\d+) of (\d+) tokens")
+SIZED = re.compile(r"prefix cache: projected (\d+) MB, holds (\d+) MB")
 
 
 def fail(msg: str) -> None:
@@ -87,6 +90,14 @@ class Server:
     def dropped(self) -> int:
         self.log.flush()
         return self.log_path.read_text().count("prefix cache: dropped")
+
+    def bypassed(self) -> int:
+        self.log.flush()
+        return self.log_path.read_text().count("would exceed the budget")
+
+    def sizes(self) -> list[tuple[int, int]]:
+        self.log.flush()
+        return [(int(m.group(1)), int(m.group(2))) for m in SIZED.finditer(self.log_path.read_text())]
 
     def stop(self) -> None:
         self.proc.terminate()
@@ -152,6 +163,12 @@ with tempfile.TemporaryDirectory() as t:
             fail("the first key lost its entry to uncacheable keyed requests")
         if srv.post(requests[2], "tenant-2") != want[2] or srv.reused()[-1] == 0:
             fail("the second key lost its entry to uncacheable keyed requests")
+        # the projection is an upper bound on the retained size, and not a loose one
+        sizes = srv.sizes()
+        if not sizes or any(held > projected for projected, held in sizes):
+            fail(f"a retained entry exceeded its projection: {sizes}")
+        if any(projected > 2 * held for projected, held in sizes if held):
+            fail(f"a projection was more than twice the retained size: {sizes}")
         for bad in ("has space", "semi;colon", "x" * 65, ""):
             st, _ = srv.post(A, bad)
             if st != 400:
@@ -160,15 +177,15 @@ with tempfile.TemporaryDirectory() as t:
     finally:
         srv.stop()
 
-    # a budget of 1 MB holds no entry: every keyed request is served, the entry dropped afterwards
+    # a budget of 1 MB holds no entry: every keyed request is served uncached without allocating one
     small = Server(["--prefix-cache-mb", "1"], tmp, "small")
     try:
         for r, w in zip(requests[:2], want[:2]):
             if small.post(r, "tenant-1") != w:
                 fail("an answer changed under a budget smaller than one entry")
-        if small.dropped() < 2 or any(small.reused()):
-            fail(f"budget not enforced: {small.dropped()} drops, reuse {small.reused()}")
-        print(f"server prefix cache over budget: {small.dropped()} entries dropped, answers unchanged")
+        if small.bypassed() != 2 or small.dropped() or any(small.reused()):
+            fail(f"budget not enforced before allocation: {small.bypassed()} bypasses, {small.dropped()} drops, reuse {small.reused()}")
+        print(f"server prefix cache over budget: {small.bypassed()} requests served uncached, nothing allocated, answers unchanged")
     finally:
         small.stop()
 
@@ -182,10 +199,10 @@ with tempfile.TemporaryDirectory() as t:
             fail("the short entry did not fit the 700 MiB budget; the scenario needs a larger budget")
         if mid.post(LONG, "tenant-2") != want_long:
             fail("the oversized request's answer changed")
-        if mid.dropped() != 1:
-            fail(f"an oversized entry evicted other keys' entries: {mid.dropped()} drops")
+        if mid.bypassed() != 1 or mid.dropped():
+            fail(f"an oversized request was not bypassed before allocation: {mid.bypassed()} bypasses, {mid.dropped()} drops")
         if mid.post(requests[1], "tenant-1") != want[1] or mid.reused()[-1] == 0:
             fail("the short entry was evicted by an oversized entry under another key")
-        print(f"server prefix cache oversized entry: 1 drop, other key kept reusing ({mid.reused()})")
+        print(f"server prefix cache oversized entry: served uncached without allocation, other key kept reusing ({mid.reused()})")
     finally:
         mid.stop()

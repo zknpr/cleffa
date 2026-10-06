@@ -33,7 +33,9 @@ The archive is deterministic for a given tree: sorted entries, source mtimes, a 
 timestamp and default label taken from the newest source file, no owner names, gzip header
 without a timestamp, and a label restricted to one safe path component. It refuses to overwrite an existing output. A final
 scan over every archived text file fails the build if a FORBIDDEN pattern survives, so the
-rewrite rules are checked rather than trusted.
+rewrite rules are checked rather than trusted. JSON text (documents, JSONL lines and
+safetensors headers) is scanned both as written and as decoded strings, since an escaped
+form such as \u002f survives a textual match and json.loads reassembles it.
 """
 from __future__ import annotations
 
@@ -138,6 +140,46 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     return True, 'included'
 
 
+def json_strings(text: str) -> str | None:
+    """Every string (keys and values) of a JSON document or JSONL file, joined, or None when
+    the text is not JSON. A scan over the serialized text misses escaped forms such as
+    \\u002f, which json.loads reassembles, so forbidden patterns are checked on the decoded
+    strings as well."""
+    found: list[str] = []
+
+    def walk(v):
+        if isinstance(v, str):
+            found.append(v)
+        elif isinstance(v, dict):
+            for k, x in v.items():
+                walk(k)
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+
+    try:
+        walk(json.loads(text))
+    except ValueError:
+        lines = [l for l in text.splitlines() if l.strip()]
+        if not lines:
+            return None
+        try:
+            for line in lines:
+                walk(json.loads(line))
+        except ValueError:
+            return None
+    return '\n'.join(found)
+
+
+def forbidden_in(text: str) -> bool:
+    """FORBIDDEN over the text and, when it is JSON, over its decoded strings."""
+    if FORBIDDEN.search(text):
+        return True
+    decoded = json_strings(text)
+    return decoded is not None and FORBIDDEN.search(decoded) is not None
+
+
 def safetensors_header(raw: bytes) -> str | None:
     """The JSON header of a safetensors file as text, or None if the container is malformed.
     The header is the only place such a file can carry strings (tensor names, dtypes,
@@ -163,7 +205,7 @@ def prepare(path: Path) -> tuple[bytes | None, bool, str]:
         header = safetensors_header(raw)
         if header is None:
             return None, False, 'malformed safetensors'
-        if FORBIDDEN.search(header):
+        if forbidden_in(header):
             return None, False, 'forbidden content'
         return raw, False, 'included'
     try:
@@ -175,7 +217,7 @@ def prepare(path: Path) -> tuple[bytes | None, bool, str]:
     new = text
     for pat, repl in REWRITES:
         new = pat.sub(repl, new)
-    if FORBIDDEN.search(new):
+    if forbidden_in(new):
         return None, False, 'forbidden content'
     return new.encode('utf-8'), new != text, 'included'
 
@@ -235,7 +277,7 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     # Final control: the archived bytes must not contain any forbidden pattern.
     for rel, path, data, _ in included:
         text = safetensors_header(data) if path.suffix == '.safetensors' else data.decode('utf-8', 'replace')
-        if text is None or FORBIDDEN.search(text):
+        if text is None or forbidden_in(text):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'wb') as fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \

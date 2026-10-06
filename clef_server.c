@@ -176,6 +176,16 @@ static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
         fprintf(stderr, "clef-server: prefix cache: cannot allocate an entry, serving uncached\n");
         return clef_run(S.e, &j->rec, 1, probs, err, errlen);
     }
+    /* The budget bounds what the table retains, and the pass allocates the entry: project its
+       size first and serve a request whose entry would exceed the budget uncached, so no entry
+       larger than the budget is ever allocated. An existing entry that would grow past it is
+       dropped the same way (review #27). */
+    const size_t projected = clef_prefix_estimate(S.e, p, &j->rec);
+    if (projected > S.cache_bytes) {
+        fprintf(stderr, "clef-server: prefix cache: an entry for this request would hold %.0f MB and would exceed the budget; serving uncached\n", projected / 1e6);
+        if (i >= 0) cache_drop(i, "would exceed the budget"); else clef_prefix_free(p);
+        return clef_run(S.e, &j->rec, 1, probs, err, errlen);
+    }
     int reused = 0;
     bool ok = clef_run_prefix(S.e, p, &j->rec, probs, false, &reused, err, errlen);
     if (!ok) {
@@ -184,6 +194,7 @@ static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
         return clef_run(S.e, &j->rec, 1, probs, err, errlen);
     }
     fprintf(stderr, "clef-server: prefix cache: reused %d of %zu tokens\n", reused, j->rec.ids.len);
+    fprintf(stderr, "clef-server: prefix cache: projected %.0f MB, holds %.0f MB\n", projected / 1e6, clef_prefix_bytes(p) / 1e6);
     if (i < 0) {
         /* Nothing cached (bypassed) or more than the whole budget: the entry is never retained, so
            it must not enter the table and displace another key's entry (reviews #15, #19). */

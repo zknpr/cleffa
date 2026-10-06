@@ -517,6 +517,29 @@ size_t clef_gpu_prefix_bytes(const clef_gpu_prefix *px) {
     return n;
 }
 
+/* What the entry would hold after a pass over `rows` tokens that stores `new_ckpts` checkpoints:
+ * the K/V and memory planes at the capacity prefix_reserve would choose, the checkpoint slots
+ * already allocated, and one state plus tail per new checkpoint (ck_reserve). An upper bound:
+ * a planned checkpoint that lands in an allocated slot costs nothing. The server compares it
+ * with its budget before the pass allocates anything (review #27). Capacity growth copies the
+ * planes, so a growing entry transiently needs its old planes as well. */
+size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts) {
+    size_t cap = (size_t)px->cap;
+    if ((size_t)rows > cap) {
+        size_t want = (size_t)rows;
+        if (want < cap + cap / 4) want = cap + cap / 4;
+        cap = (want + 1023) / 1024 * 1024;
+    }
+    const size_t kvb = ((size_t)c->nkv * cap + 64) * c->hd * 4, memb = cap * 2 * c->W * 4;
+    int n_attn = 0, n_gdn = 0;
+    for (int l = 0; l < c->n_layer; l++) { if (c->layer_full[l]) n_attn++; else n_gdn++; }
+    const size_t C = 2 * (size_t)c->Hk * c->dk + (size_t)c->Hv * c->dv;
+    const size_t ckpt = (size_t)n_gdn * c->Hv * c->dk * c->dv * 4 + (size_t)n_gdn * (c->ssm_kernel - 1) * C * 4;
+    size_t n = (size_t)n_attn * 2 * kvb + (size_t)g->n_kv * memb;
+    for (int i = 0; i < CLEF_PREFIX_CKPT; i++) n += px->ck_state[i].length + px->ck_tail[i].length;
+    return n + (size_t)new_ckpts * ckpt;
+}
+
 // Keep-warm for an entry's buffers, as clef_gpu_keepalive does for the engine's: without it a hit
 // that follows an idle gap started 20 to 30 ms late (27B, 3.1 GB entry). Same rules: it only
 // reads, and must not run concurrently with a forward.
