@@ -410,6 +410,67 @@ class EvidenceArchive(unittest.TestCase):
             with patch.object(ea.Path, 'read_bytes', refuse), patch('builtins.open', refuse):
                 self.assertTrue(ea.classify(self.root, self.root / 'gemm-probe-20261004' / name)[0], name)
 
+    def test_credential_values_with_punctuation_are_caught(self):
+        # The value class once stopped at punctuation, so a password with symbols or a base64
+        # bearer token never reached sixteen matching characters.
+        exp = self.root / 'gemm-probe-20261004'
+        cases = {'punct.log': 'PASSWORD=Abc!Def@Ghi#Jkl$Mno%\n',
+                 'bearer64.log': 'Authorization: Bearer abcd.efgh/ijkl+mnop=qrst\n',
+                 'punct.json': '{"api_key": "Abc!Def@Ghi#Jkl$Mno%"}',
+                 'spaced.json': '{"password": "correct horse battery staple!"}'}
+        for name, text in cases.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'cred.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in cases:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_hard_linked_files_are_excluded(self):
+        # A hard link is a regular file whose descriptor and name agree, so the symlink checks
+        # pass. Linking needs no read access to the target, so the build would publish what
+        # the linker could not read.
+        from unittest.mock import patch
+        secret = Path(self.tmp.name) / 'jev.api'
+        secret.write_text('k9f3q8z1x7v2b6n4m0c5l8p3w1e9r7t2\n')
+        exp = self.root / 'gemm-probe-20261004'
+        os.link(secret, exp / 'linked.log')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'linked.tar.gz', 'ev')
+        self.assertNotIn('gemm-probe-20261004/linked.log', {e['path'] for e in manifest['files']})
+        self.assertIn('hard link', manifest['excluded_counts'])
+        target = exp / 'late-link.log'   # linked after classification: the descriptor's link count catches it
+        target.write_text('benign\n')
+        real = ea.classify
+
+        def link_after(golden, path):
+            verdict = real(golden, path)
+            if path == target:
+                path.unlink()
+                os.link(secret, path)
+            return verdict
+        with patch.object(ea, 'classify', link_after), self.assertRaises(SystemExit):
+            ea.build(self.root, Path(self.tmp.name) / 'late-link.tar.gz', 'ev')
+
+    def test_fifo_does_not_block_the_build(self):
+        # A FIFO under a text name has zero size and is not a link; a blocking open would wait
+        # for a writer forever.
+        import signal
+        fifo = self.root / 'gemm-probe-20261004' / 'pipe.log'
+        os.mkfifo(fifo)
+
+        def expired(signum, frame):
+            raise TimeoutError('the build blocked on the FIFO')
+        previous = signal.signal(signal.SIGALRM, expired)
+        signal.alarm(10)
+        try:
+            manifest = ea.build(self.root, Path(self.tmp.name) / 'fifo.tar.gz', 'ev')
+            with self.assertRaises(SystemExit):
+                ea.read_snapshot(fifo, ea.MAX_TEXT)   # refused on the descriptor, without blocking
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        self.assertNotIn('gemm-probe-20261004/pipe.log', {e['path'] for e in manifest['files']})
+        self.assertIn('not a regular file', manifest['excluded_counts'])
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

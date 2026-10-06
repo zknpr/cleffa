@@ -28,7 +28,7 @@ Excluded
     `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
   - dotfiles and extensionless files other than Makefile and LICENSE, key=value assignments
-    that look like credentials,
+    that look like credentials, hard-linked files and anything that is not a regular file
   - any file with "private" in any component of its path, and any text file that still matches a
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
     including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
@@ -97,12 +97,14 @@ REWRITES = [
 ]
 # Anything matching after rewriting excludes the file, and a match in the final scan fails
 # the build. Case-insensitive: bearer schemes and variable names vary in case. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
+# A credential value is any run of sixteen or more characters that are not whitespace or a quote:
+# passwords carry punctuation and base64 tokens carry + / = (review #59).
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'Bearer\s+[A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
+                       r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}', re.IGNORECASE)
+                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*["\']?[^\s"\']{16,}', re.IGNORECASE)
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
 CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)$', re.IGNORECASE)
 
@@ -170,14 +172,22 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'account bookkeeping'
     if AGENT_STATE.match(path.name):
         return False, 'agent checkpoint'
+    st = path.lstat()
+    if not stat.S_ISREG(st.st_mode):
+        return False, 'not a regular file'   # a FIFO would block the open; a device is not evidence (review #61)
+    if st.st_nlink != 1:
+        # A hard link is a regular file whose descriptor and name agree; it can be made without
+        # read access to its target, so publishing it would publish what the linker could not
+        # read (review #60).
+        return False, 'hard link'
     ext = path.suffix.lower()
     if ext in EXCLUDE_EXT:
         return False, f'excluded extension {ext}'
     if ext == '.safetensors':
-        return path.stat().st_size <= SMALL_TENSOR, 'tensor size'
+        return st.st_size <= SMALL_TENSOR, 'tensor size'
     if not is_text(path):
         return False, 'binary'
-    if path.stat().st_size > MAX_TEXT:
+    if st.st_size > MAX_TEXT:
         return False, 'oversized text'
     return True, 'included'
 
@@ -195,7 +205,10 @@ def json_strings(text: str) -> str | None:
         elif isinstance(v, dict):
             for k, x in v.items():
                 if isinstance(k, str) and isinstance(x, str) and CREDENTIAL_KEY.search(k) and len(x) >= 16:
-                    found.append(f'{k}={x}')   # rejoined so the credential pattern sees key and value together
+                    # Rejoined so the credential pattern sees key and value together; whitespace
+                    # inside the value becomes '_' so a passphrase counts as one value. This is
+                    # a scanning view, never archived.
+                    found.append(f'{k}={re.sub(r"\s", "_", x)}')
                 walk(k)
                 walk(x)
         elif isinstance(v, list):
@@ -338,15 +351,20 @@ def read_snapshot(path: Path, limit: int) -> tuple[bytes | None, os.stat_result]
     `limit` by the time it is read returns None: the stat-time size check does not bind the
     bytes actually read (review #54). The open does not follow a symlink, the descriptor must
     be a regular file, and the path must still name that inode after the read: classify()
-    rejected links by name, and the name can be replaced by one in between (review #55)."""
+    rejected links by name, and the name can be replaced by one in between (review #55). The
+    open is non-blocking so a FIFO cannot stall it before the type check (review #61); reads of
+    a regular file ignore that flag. A link count above one is refused here as in classify()
+    (review #60)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError as e:   # ELOOP for a link; a vanished or unreadable file is an error too
         raise SystemExit(f'{path}: cannot open: {e.strerror}')
     with os.fdopen(fd, 'rb') as fh:
         before = os.fstat(fh.fileno())
         if not stat.S_ISREG(before.st_mode):
             raise SystemExit(f'{path} is not a regular file')
+        if before.st_nlink != 1:
+            raise SystemExit(f'{path} has {before.st_nlink} links')
         raw = fh.read(limit + 1)   # never more than the limit allows into memory
         after = os.fstat(fh.fileno())
     named = os.lstat(path)
