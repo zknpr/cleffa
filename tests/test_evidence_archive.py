@@ -60,6 +60,9 @@ def make_tree(root: Path):
     (exp / 'notes').write_text('API_KEY=abcdefghijklmnopqrstuvwxyz0123\n')   # extensionless, not allowlisted
     (exp / 'dump.log').write_text('export MY_SECRET=abcdefghijklmnopqrstuvwxyz0123\n')   # key assignment in a log
     (exp / 'Makefile').write_text('all:\n\ttrue\n')
+    (exp / 'creds.json').write_text('{"OPENAI_API_KEY": "abcdefghijklmnopqrst", "n": 1}\n')   # credential as a JSON field
+    (exp / 'nested.json').write_text('{"env": {"password": "abcdefghijklmnopqrst"}}\n')
+    (exp / 'counts.json').write_text('{"input_tokens": 4510, "token_env": "CLOUDFLARE_API_TOKEN"}\n')   # benign neighbours
     (exp / 'LICENSE').write_text('MIT\n')
     secret = b'Bearer abcdefghijklmnopqrstuvwxyz0123'
     (exp / 'late.log').write_bytes(b'ok line\n' * 700 + secret.decode().encode('utf-16-le') + b'\n')   # NULs past the 4 KiB probe
@@ -123,6 +126,7 @@ class EvidenceArchive(unittest.TestCase):
             'gemm-probe-20261004/result.json', 'gemm-probe-20261004/run.py',
             'gemm-probe-20261004/journal.jsonl', 'gemm-probe-20261004/small.safetensors',
             'gemm-probe-20261004/Makefile', 'gemm-probe-20261004/LICENSE',
+            'gemm-probe-20261004/counts.json',
             'ds4-qwen-perf-20261004/groups-summary.json',
             'clef-flash-f32/logits.safetensors', 'clef-flash-f32/requests.jsonl', 'clef-flash-f32/latency.json',
             'engine_logits.jsonl',
@@ -158,6 +162,9 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/notes', names)  # extensionless only when allowlisted
         self.assertNotIn('gemm-probe-20261004/dump.log', names)  # key=value credential shape
         self.assertIn('gemm-probe-20261004/Makefile', names)
+        self.assertNotIn('gemm-probe-20261004/creds.json', names)  # quoted credential key
+        self.assertNotIn('gemm-probe-20261004/nested.json', names)
+        self.assertIn('gemm-probe-20261004/counts.json', names)
         self.assertIn('gemm-probe-20261004/LICENSE', names)
         self.assertNotIn('gemm-probe-20261004/upper.SAFETENSORS', names)  # suffix case must not skip the checks
         self.assertFalse([n for n in names if 'Bearer' in n], 'forbidden string in a path component')

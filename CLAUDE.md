@@ -414,8 +414,9 @@ the full context and the arithmetic of their engine's uncached attention mode.
 The server's `--prefix-cache-mb N` defaults to zero. Its worker alone owns the
 32-entry table. `X-Clef-Prefix-Cache` selects an entry; keyed jobs run alone and
 unkeyed jobs retain normal batching. The table has a retained-buffer budget with LRU
-eviction; `clef_prefix_estimate` projects an entry's size (exact for a fresh entry, an
-upper bound otherwise) and the server serves a request uncached when its entry would exceed
+eviction; `clef_prefix_estimate` projects an entry's size by replaying the planner's rows and slot
+choices and charging only slots without buffers (exact for a fresh entry and for slot reuse;
+a checkpoint read for resume is not charged) and the server serves a request uncached when its entry would exceed
 the budget, so no entry larger than the budget is allocated. Growth still copies the planes,
 so the transient peak can reach twice an entry. Keys must be assigned by the
 authenticating deployment per isolation boundary because hits are visible in

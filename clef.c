@@ -493,10 +493,14 @@ size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const cl
         while (same < n && p->ids[same] == rec->ids.ids[same]) same++;
     }
     const bool left = p->len > 0 && p->cls == cls && same < p->len && same < Ls;
-    int L = 0;
-    for (int i = 0; i < CLEF_PREFIX_CKPT; i++)
-        if (p->ck_row[i] <= same && p->ck_row[i] > L) L = p->ck_row[i];
-    /* The rows the pass would store, counted as run_entry enumerates them. */
+    /* Checkpoints past the shared tokens are invalid for this pass, as run_entry zeroes them. */
+    int row[CLEF_PREFIX_CKPT];
+    int L = 0, load = -1;
+    for (int i = 0; i < CLEF_PREFIX_CKPT; i++) {
+        row[i] = p->ck_row[i] <= same ? p->ck_row[i] : 0;
+        if (row[i] > L) { L = row[i]; load = i; }
+    }
+    /* The rows the pass would store, enumerated as run_entry does. */
     int period = CLEF_PREFIX_PERIOD, n = 0, last = 0;
     while ((Ls - 1) / period > CLEF_PREFIX_CKPT - 3) period *= 2;
     const int at = same / 32 * 32;
@@ -507,7 +511,22 @@ size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const cl
     }
     if (anchor && at < Ls && (n == 0 || last < at)) n++;
     if (Ls > L) n++;
-    return clef_gpu_prefix_estimate(e->gpu, &e->cfg, p->gpu, T, n);
+    /* The slot each store takes, chosen as run_entry does (a free slot first, else the least
+       recently used valid one); only a slot without buffers costs an allocation (review #44). */
+    bool taken[CLEF_PREFIX_CKPT] = { false };
+    int fresh = 0;
+    for (int i = 0; i < n; i++) {
+        int s = -1;
+        for (int j = 0; j < CLEF_PREFIX_CKPT; j++) {
+            if (j == load || taken[j]) continue;
+            if (row[j] == 0) { s = j; break; }
+            if (s < 0 || p->ck_use[j] < p->ck_use[s]) s = j;
+        }
+        if (s < 0) break;   /* run_entry reports this as an error; nothing more is allocated */
+        taken[s] = true;
+        if (!clef_gpu_prefix_slot_allocated(p->gpu, s)) fresh++;
+    }
+    return clef_gpu_prefix_estimate(e->gpu, &e->cfg, p->gpu, T, fresh);
 }
 
 bool clef_run_prefix(clef_engine *e, clef_prefix *p, const clef_record *rec, float ****out, bool raw,

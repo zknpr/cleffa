@@ -523,10 +523,15 @@ size_t clef_gpu_prefix_bytes(const clef_gpu_prefix *px) {
 
 /* What the entry would hold after a pass over `rows` tokens that stores `new_ckpts` checkpoints:
  * the K/V and memory planes at the capacity prefix_reserve would choose, the checkpoint slots
- * already allocated, and one state plus tail per new checkpoint (ck_reserve). An upper bound:
- * a planned checkpoint that lands in an allocated slot costs nothing. The server compares it
+ * already allocated, and one state plus tail per checkpoint that needs a new slot (ck_reserve
+ * returns early for an allocated one; the caller counts those with
+ * clef_gpu_prefix_slot_allocated, review #44). The server compares it
  * with its budget before the pass allocates anything (review #27). Capacity growth copies the
  * planes, so a growing entry transiently needs its old planes as well. */
+bool clef_gpu_prefix_slot_allocated(const clef_gpu_prefix *px, int slot) {
+    return slot >= 0 && slot < CLEF_PREFIX_CKPT && px->ck_state[slot] && px->ck_tail[slot];
+}
+
 size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts) {
     size_t cap = (size_t)px->cap;
     if ((size_t)rows > cap) {

@@ -133,6 +133,7 @@ clef_gpu_prefix *clef_gpu_prefix_new(void);
 void clef_gpu_prefix_free(clef_gpu_prefix *px);
 size_t clef_gpu_prefix_bytes(const clef_gpu_prefix *px);
 size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts);
+bool clef_gpu_prefix_slot_allocated(const clef_gpu_prefix *px, int slot);   /* ck_reserve would allocate otherwise */
 bool clef_gpu_prefix_supported(const clef_gpu *g);
 bool clef_gpu_prefix_keepalive(clef_gpu *g, const clef_gpu_prefix *px, char *err, size_t errlen);
 int clef_gpu_prefix_class(const clef_engine *e, int length);

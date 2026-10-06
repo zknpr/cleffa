@@ -17,6 +17,9 @@ REQUESTS.jsonl is the corpus; its long log requests supply the states.
      key's entry survives and keeps reusing.
   3b. Keyed requests too short to cache never take a table slot: 33 of them under new keys leave
      the populated entries in place.
+  3c. The projection charges only checkpoints that need new buffers: after an 8K entry has
+     allocated its slots, a different request under the same key reuses them, so it is cached under
+     a budget that holds the entry but not an over-charged projection.
   4. A key with a character outside [A-Za-z0-9._-], or longer than 64, is HTTP 400.
 """
 
@@ -206,3 +209,20 @@ with tempfile.TemporaryDirectory() as t:
         print(f"server prefix cache oversized entry: served uncached without allocation, other key kept reusing ({mid.reused()})")
     finally:
         mid.stop()
+
+    # 1,120 MiB (1,174 MB) holds the 8,072-token entry (1,151 MB with its five checkpoints) but not a
+    # projection that charges one more checkpoint (1,204 MB). A then replaces it under the same key: its
+    # stores land in already-allocated slots, so the entry does not grow and the request must be cached.
+    tight = Server(["--prefix-cache-mb", "1120"], tmp, "tight")
+    try:
+        if tight.post(requests[2], "tenant-1") != want[2] or tight.bypassed():
+            fail(f"the 8K entry did not fit the 1,120 MiB budget ({tight.sizes()}); the scenario needs a larger budget")
+        if tight.post(requests[0], "tenant-1") != want[0]:
+            fail("an answer changed under the tight budget")
+        if tight.bypassed():
+            fail(f"a request whose stores reuse allocated slots was bypassed: projections {tight.sizes()}")
+        if tight.post(requests[1], "tenant-1") != want[1] or tight.reused()[-1] == 0:
+            fail("the replaced entry was not reused")
+        print(f"server prefix cache slot reuse: projections {tight.sizes()}, no bypass")
+    finally:
+        tight.stop()

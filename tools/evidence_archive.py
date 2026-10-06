@@ -93,7 +93,9 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'Bearer [A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)\s*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}', re.IGNORECASE)
+                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}', re.IGNORECASE)
+# A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
+CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)$', re.IGNORECASE)
 
 
 def is_text(path: Path) -> bool:
@@ -173,6 +175,8 @@ def json_strings(text: str) -> str | None:
             found.append(v)
         elif isinstance(v, dict):
             for k, x in v.items():
+                if isinstance(k, str) and isinstance(x, str) and CREDENTIAL_KEY.search(k) and len(x) >= 16:
+                    found.append(f'{k}={x}')   # rejoined so the credential pattern sees key and value together
                 walk(k)
                 walk(x)
         elif isinstance(v, list):
