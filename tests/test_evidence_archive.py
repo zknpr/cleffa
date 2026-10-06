@@ -46,6 +46,8 @@ def make_tree(root: Path):
     (exp / 'broken.safetensors').write_bytes(b'\0' * 100)   # not a safetensors header
     (exp / 'misshaped.safetensors').write_bytes(safetensors({'l': {'dtype': 'F32', 'shape': [1000], 'data_offsets': [0, 16]}}))   # 1000 floats in 16 bytes
     (exp / 'badshape.safetensors').write_bytes(safetensors({'l': {'dtype': 'F32', 'shape': [-4], 'data_offsets': [0, 16]}}))
+    (exp / 'badmeta.safetensors').write_bytes(safetensors({'__metadata__': 7, 'l': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
+    (exp / 'badmeta2.safetensors').write_bytes(safetensors({'__metadata__': {'format': 1}, 'l': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (exp / 'escaped.safetensors').write_bytes(len(b'{"__metadata__": {"source": "\\u002froot\\u002fsecret.txt"}, "l": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}').to_bytes(8, 'little')
                                              + b'{"__metadata__": {"source": "\\u002froot\\u002fsecret.txt"}, "l": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}' + b'\0' * 16)
     (exp / 'escaped.json').write_text('{"cli": "\\u002fUsers\\u002fsomeone\\u002fclef"}\n')   # escaped home path in JSON text
@@ -161,6 +163,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/broken.safetensors', names)  # unparseable safetensors header
         self.assertNotIn('gemm-probe-20261004/misshaped.safetensors', names)  # shape x dtype size != span
         self.assertNotIn('gemm-probe-20261004/badshape.safetensors', names)  # negative dimension
+        self.assertNotIn('gemm-probe-20261004/badmeta.safetensors', names)  # __metadata__ not a map
+        self.assertNotIn('gemm-probe-20261004/badmeta2.safetensors', names)  # __metadata__ values not strings
         self.assertNotIn('gemm-probe-20261004/payload.safetensors', names)  # a U8 tensor carrying text
         self.assertNotIn('gemm-probe-20261004/utf16.safetensors', names)  # text as UTF-16 inside an F32 payload
         self.assertNotIn('gemm-probe-20261004/late.log', names)  # UTF-16 text after a clean 4 KiB prefix
@@ -206,6 +210,27 @@ class EvidenceArchive(unittest.TestCase):
         with patch.object(Path, 'exists', return_value=False), self.assertRaises(SystemExit):
             ea.build(self.root, out, 'ev')
         self.assertEqual(out.read_bytes(), b'another build')
+
+    def test_source_changing_during_the_read_aborts(self):
+        # The archive and its manifest must describe one consistent snapshot: a file whose
+        # metadata differs between the stat before and the stat after the read stops the build.
+        import os
+        from unittest.mock import patch
+        target = self.root / 'gemm-probe-20261004' / 'result.json'
+        real_fstat = os.fstat
+        calls = {'n': 0}
+
+        def fstat_mutating_between(fd):
+            st = real_fstat(fd)
+            if st.st_ino == target.stat().st_ino:
+                calls['n'] += 1
+                if calls['n'] == 1:   # after the first stat, before the second: the file changes
+                    target.write_bytes(target.read_bytes() + b'\n')
+                    os.utime(target, (FIXED_MTIME + 5, FIXED_MTIME + 5))
+            return st
+
+        with patch.object(ea.os, 'fstat', fstat_mutating_between), self.assertRaises(SystemExit):
+            ea.build(self.root, Path(self.tmp.name) / 'changing.tar.gz', 'ev')
 
     def test_manifest_describes_the_bytes_archived(self):
         # If a source changes after it was read, the manifest must still describe the bytes that

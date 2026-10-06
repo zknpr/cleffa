@@ -226,6 +226,8 @@ def safetensors_payload_ok(raw: bytes, header: str) -> bool:
     spans = []
     for name, spec in json.loads(header).items():
         if name == '__metadata__':
+            if not (isinstance(spec, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in spec.items())):
+                return False   # the format allows only a string-to-string map here
             continue
         if not isinstance(spec, dict) or spec.get('dtype') not in FLOAT_DTYPES:
             return False
@@ -297,6 +299,20 @@ def prepare(path: Path, raw: bytes | None = None) -> tuple[bytes | None, bool, s
     return new.encode('utf-8'), new != text, 'included'
 
 
+def read_snapshot(path: Path) -> tuple[bytes, os.stat_result]:
+    """The file's bytes and metadata from one descriptor; a file whose size, inode or mtime
+    differ between the stat before and the stat after the read is being changed, and the build
+    stops rather than describe a snapshot that never existed (review #50)."""
+    with open(path, 'rb') as fh:
+        before = os.fstat(fh.fileno())
+        raw = fh.read()
+        after = os.fstat(fh.fileno())
+    same = (before.st_size, before.st_ino, before.st_dev, before.st_mtime_ns) == (after.st_size, after.st_ino, after.st_dev, after.st_mtime_ns)
+    if not same or len(raw) != before.st_size:
+        raise SystemExit(f'{path} changed while it was being archived')
+    return raw, before
+
+
 def collect(golden: Path):
     included, excluded = [], {}
     for dirpath, dirnames, filenames in os.walk(golden):
@@ -307,8 +323,7 @@ def collect(golden: Path):
             if not ok:
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
-            st = path.stat()
-            raw = path.read_bytes()
+            raw, st = read_snapshot(path)
             data, rewritten, reason = prepare(path, raw)
             if data is None:
                 excluded[reason] = excluded.get(reason, 0) + 1
