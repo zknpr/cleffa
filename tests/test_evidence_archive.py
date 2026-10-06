@@ -48,6 +48,14 @@ def make_tree(root: Path):
                                              + b'{"__metadata__": {"source": "\\u002froot\\u002fsecret.txt"}, "l": {"dtype": "F32", "shape": [4], "data_offsets": [0, 16]}}' + b'\0' * 16)
     (exp / 'escaped.json').write_text('{"cli": "\\u002fUsers\\u002fsomeone\\u002fclef"}\n')   # escaped home path in JSON text
     (exp / 'escaped.jsonl').write_text('{"ok": 1}\n{"log": "\\u002froot\\u002fx.log"}\n')   # escaped path on one JSONL line
+    secret = b'Bearer abcdefghijklmnopqrstuvwxyz0123'
+    hdr = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
+    (exp / 'payload.safetensors').write_bytes(len(hdr).to_bytes(8, 'little') + hdr + secret)   # text as tensor bytes
+    (exp / 'usage-20261004.json').write_text('{"used_neurons": 1}')
+    (exp / 'usage-model-27b.json').write_text('{"used_neurons": 1}')
+    acme = root / 'customer-acme'
+    acme.mkdir()
+    (acme / 'requests.jsonl').write_text('{"state": "confidential"}\n')   # undated, oracle-shaped, not an oracle
     for name, home in (('root.safetensors', '/root/run/x.pt'), ('varroot.safetensors', '/var/root/x.pt'),
                        ('thishome.safetensors', f'{HOME}/x.pt')):
         (exp / name).write_bytes(safetensors({'__metadata__': {'source': home}, 'l': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
@@ -124,6 +132,10 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('engine_logits-private.jsonl', names)  # private top-level file, ahead of the allowlist
         self.assertNotIn('gemm-probe-20261004/leaky.safetensors', names)  # forbidden string in the safetensors header
         self.assertNotIn('gemm-probe-20261004/broken.safetensors', names)  # unparseable safetensors header
+        self.assertNotIn('gemm-probe-20261004/payload.safetensors', names)  # a U8 tensor carrying text
+        self.assertNotIn('gemm-probe-20261004/usage-20261004.json', names)  # dated usage dump
+        self.assertNotIn('gemm-probe-20261004/usage-model-27b.json', names)
+        self.assertNotIn('customer-acme/requests.jsonl', names)  # only recognized oracle directories
         for name in ('escaped.safetensors', 'escaped.json', 'escaped.jsonl'):
             self.assertNotIn(f'gemm-probe-20261004/{name}', names)  # JSON-escaped paths decode to forbidden strings
         for name in ('root.safetensors', 'varroot.safetensors', 'thishome.safetensors'):

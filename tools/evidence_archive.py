@@ -11,16 +11,19 @@ checkable, under rules that are deliberately conservative:
 Included
   - result, manifest, sample and log files (.json, .jsonl, .log, .txt, .md, .csv, .patch, ...)
   - experiment sources (.py, .m, .metal, .c, .h, .sh, Makefile)
-  - .safetensors files up to SMALL_TENSOR bytes (saved logits; never layer dumps), after their
-    JSON header, the only place such a file carries strings, passes the FORBIDDEN scan
-  - for the oracle directories (no date suffix): requests.jsonl, encoded.jsonl,
+  - .safetensors files up to SMALL_TENSOR bytes (saved logits; never layer dumps) whose JSON
+    header passes the FORBIDDEN scan and whose data section holds only floating-point tensors
+    that tile it exactly and do not read as forbidden text
+  - for the oracle directories ref/oracle.py writes (clef, clef-flash and their documented
+    variants, no date suffix): requests.jsonl, encoded.jsonl,
     logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump
 Excluded
   - Mach-O binaries, objects, dSYMs, .inc, Instruments .trace bundles and their exported
     counter tables (.xml, .npz), .bin/.npy tensors, archives, PDFs, .git clones, virtualenvs
   - the ds4 upstream `source/` tree, every `article-*` directory (private workload), and the
     text extracts of Apple's Metal Shading Language specification
-  - Cloudflare subscription and usage dumps (`subscriptions.json`, `usage-*.json`) and agents'
+  - every other undated directory, Cloudflare subscription and usage dumps (`subscriptions.json`,
+    `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
   - any file with "private" in any component of its path, and any text file that still matches a
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
@@ -59,13 +62,14 @@ TEXT_EXT = {'.json', '.jsonl', '.log', '.txt', '.md', '.csv', '.patch', '.diff',
 TEXT_NAMES = {'Makefile'}
 ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latency.json'}
 EXPERIMENT = re.compile(r'^[a-z0-9-]+-20\d{6}$')
+ORACLE_DIR = re.compile(r'^clef(-flash)?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
 
 EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
 # Text extracts of Apple's Metal Shading Language specification kept beside some experiments.
 THIRD_PARTY_DOC = re.compile(r'^(msl|metal-spec|Metal-Shading-Language-Specification)\.(txt|pdf)$')
 # Cloudflare account subscription and usage dumps: budget bookkeeping, not evidence.
-ACCOUNT_BOOKKEEPING = re.compile(r'^(subscriptions|usage(-[a-z-]+)?)\.json$')
+ACCOUNT_BOOKKEEPING = re.compile(r'^(subscriptions|usage([-_.].*)?)\.json$')
 # Agents' own working-state files (goal, sessions, next action), not experiment evidence.
 AGENT_STATE = re.compile(r'^checkpoint[-.a-zA-Z0-9]*\.json$')
 EXCLUDE_EXT = {'.o', '.a', '.dylib', '.inc', '.bin', '.npy', '.npz', '.pt', '.xml', '.pdf',
@@ -125,9 +129,13 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'account bookkeeping'
     if AGENT_STATE.match(path.name):
         return False, 'agent checkpoint'
-    if len(parts) > 1 and not EXPERIMENT.match(top) and not (len(parts) == 2 and path.name in ORACLE_FILES):
-        # Oracle golden directory: the small files only, never layers/ or dumps (size-checked below).
-        return False, 'oracle directory'
+    if len(parts) > 1 and not EXPERIMENT.match(top):
+        # Only the oracle directories ref/oracle.py writes, and of those the small files, never
+        # layers/ or dumps (size-checked below). Any other undated directory is not evidence.
+        if not ORACLE_DIR.match(top):
+            return False, 'unrecognized directory'
+        if not (len(parts) == 2 and path.name in ORACLE_FILES):
+            return False, 'oracle directory'
     ext = path.suffix.lower()
     if ext in EXCLUDE_EXT:
         return False, f'excluded extension {ext}'
@@ -180,6 +188,33 @@ def forbidden_in(text: str) -> bool:
     return decoded is not None and FORBIDDEN.search(decoded) is not None
 
 
+FLOAT_DTYPES = {'F64', 'F32', 'F16', 'BF16'}
+
+
+def safetensors_payload_ok(raw: bytes, header: str) -> bool:
+    """The data section must hold only floating-point tensors whose offsets tile it exactly,
+    and must not read as forbidden text: a U8 tensor can carry arbitrary bytes."""
+    n = int.from_bytes(raw[:8], 'little')
+    payload = raw[8 + n:]
+    spans = []
+    for name, spec in json.loads(header).items():
+        if name == '__metadata__':
+            continue
+        if not isinstance(spec, dict) or spec.get('dtype') not in FLOAT_DTYPES:
+            return False
+        off = spec.get('data_offsets')
+        if not (isinstance(off, list) and len(off) == 2 and all(isinstance(x, int) for x in off) and 0 <= off[0] <= off[1] <= len(payload)):
+            return False
+        spans.append((off[0], off[1]))
+    spans.sort()
+    end = 0
+    for a, b in spans:
+        if a != end:
+            return False
+        end = b
+    return end == len(payload) and not FORBIDDEN.search(payload.decode('latin-1'))
+
+
 def safetensors_header(raw: bytes) -> str | None:
     """The JSON header of a safetensors file as text, or None if the container is malformed.
     The header is the only place such a file can carry strings (tensor names, dtypes,
@@ -207,6 +242,8 @@ def prepare(path: Path) -> tuple[bytes | None, bool, str]:
             return None, False, 'malformed safetensors'
         if forbidden_in(header):
             return None, False, 'forbidden content'
+        if not safetensors_payload_ok(raw, header):
+            return None, False, 'safetensors payload'
         return raw, False, 'included'
     try:
         text = raw.decode('utf-8')
@@ -277,7 +314,7 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     # Final control: the archived bytes must not contain any forbidden pattern.
     for rel, path, data, _ in included:
         text = safetensors_header(data) if path.suffix == '.safetensors' else data.decode('utf-8', 'replace')
-        if text is None or forbidden_in(text):
+        if text is None or forbidden_in(text) or (path.suffix == '.safetensors' and not safetensors_payload_ok(data, text)):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'wb') as fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
