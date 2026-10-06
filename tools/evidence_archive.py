@@ -91,7 +91,7 @@ REWRITES = [
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'Bearer [A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
+                       r'Bearer\s+[A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*["\']?[A-Za-z0-9_\-]{16,}', re.IGNORECASE)
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
@@ -267,9 +267,11 @@ def safetensors_header(raw: bytes) -> str | None:
     return text
 
 
-def prepare(path: Path) -> tuple[bytes | None, bool, str]:
-    """Return (archived bytes, rewritten?, reason). None means exclude."""
-    raw = path.read_bytes()
+def prepare(path: Path, raw: bytes | None = None) -> tuple[bytes | None, bool, str]:
+    """Return (archived bytes, rewritten?, reason). None means exclude. `raw` is the file's
+    content when the caller has already read it, so one read serves the archive and the manifest."""
+    if raw is None:
+        raw = path.read_bytes()
     if path.suffix.lower() == '.safetensors':
         header = safetensors_header(raw)
         if header is None:
@@ -305,11 +307,18 @@ def collect(golden: Path):
             if not ok:
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
-            data, rewritten, reason = prepare(path)
+            st = path.stat()
+            raw = path.read_bytes()
+            data, rewritten, reason = prepare(path, raw)
             if data is None:
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
-            included.append((path.relative_to(golden).as_posix(), path, data, rewritten))
+            # Provenance comes from this one read and stat, not from a later look at a file that
+            # may have changed meanwhile (review #48).
+            source = {'source_bytes': len(raw), 'source_sha256': hashlib.sha256(raw).hexdigest(),
+                      'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
+                      'mtime_s': st.st_mtime}
+            included.append((path.relative_to(golden).as_posix(), path, data, rewritten, source))
     return included, excluded
 
 
@@ -325,12 +334,11 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
         raise SystemExit(f'{out} exists; evidence archives are never overwritten')
     included, excluded = collect(golden)
     entries = []
-    for rel, path, data, rewritten in included:
-        st = path.stat()
+    for rel, path, data, rewritten, source in included:
         entries.append({
             'path': rel, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
-            'source_bytes': st.st_size, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
-            'rewritten': rewritten, 'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
+            'source_bytes': source['source_bytes'], 'source_sha256': source['source_sha256'],
+            'rewritten': rewritten, 'mtime': source['mtime'],
         })
     if label is None:
         # Derived from the tree, like the manifest timestamp, so the default stays reproducible.
@@ -348,7 +356,7 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     readme = README.format(label=label, n=len(entries), rewritten=sum(e['rewritten'] for e in entries),
                            excluded=json.dumps(manifest['excluded_counts'], indent=2))
     # Final control: the archived bytes must not contain any forbidden pattern.
-    for rel, path, data, _ in included:
+    for rel, path, data, _, _ in included:
         if FORBIDDEN.search(rel):
             raise SystemExit(f'forbidden pattern in the path {rel}')
         tensor = path.suffix.lower() == '.safetensors'
@@ -358,7 +366,11 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
         if text is None or forbidden_in(text) or (tensor and not safetensors_payload_ok(data, text)):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
     out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, 'wb') as fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
+    try:
+        fh = open(out, 'xb')   # exclusive: the check above is not atomic with the create (review #47)
+    except FileExistsError:
+        raise SystemExit(f'{out} exists; evidence archives are never overwritten') from None
+    with fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
             tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tar:
         def add(name: str, data: bytes, mtime: float):
             info = tarfile.TarInfo(f'{label}/{name}')
@@ -370,8 +382,8 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
             tar.addfile(info, io.BytesIO(data))
         add('README.md', readme.encode(), 0)
         add('manifest.json', json.dumps(manifest, indent=1).encode(), 0)
-        for rel, path, data, _ in included:
-            add(rel, data, path.stat().st_mtime)
+        for rel, path, data, _, source in included:
+            add(rel, data, source['mtime_s'])
     return manifest
 
 
@@ -415,9 +427,9 @@ def main(argv=None) -> int:
         raise SystemExit(f'{golden} is not a directory')
     if args.list:
         included, excluded = collect(golden)
-        total = sum(len(d) for _, _, d, _ in included)
-        rewritten = sum(1 for *_, r in included if r)
-        for rel, _, data, r in included:
+        total = sum(len(d) for _, _, d, _, _ in included)
+        rewritten = sum(1 for _, _, _, r, _ in included if r)
+        for rel, _, data, r, _ in included:
             print(f'{len(data):10d}  {"R" if r else " "}  {rel}')
         print(f'\n{len(included)} files, {total/1e6:.1f} MB, {rewritten} rewritten', file=sys.stderr)
         for reason, n in sorted(excluded.items()):

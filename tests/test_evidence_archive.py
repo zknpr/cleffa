@@ -54,6 +54,8 @@ def make_tree(root: Path):
     named.mkdir()
     (named / 'result.json').write_text('{"ok": 1}')   # forbidden string in a path component
     (exp / 'lower.log').write_text('authorization: bearer abcdefghijklmnopqrstuvwxyz0123\n')
+    (exp / 'spaced.log').write_text('Authorization: Bearer   abcdefghijklmnopqrstuvwxyz0123\n')   # several spaces
+    (exp / 'tabbed.log').write_text('Authorization: Bearer\tabcdefghijklmnopqrstuvwxyz0123\n')
     (exp / 'env.log').write_text('cloudflare_api_token=abcdefghijklmnopqrstuvwxyz0123\n')
     nested = exp / 'article-customer'
     nested.mkdir()
@@ -173,6 +175,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/upper.SAFETENSORS', names)  # suffix case must not skip the checks
         self.assertFalse([n for n in names if 'Bearer' in n], 'forbidden string in a path component')
         self.assertNotIn('gemm-probe-20261004/lower.log', names)  # lowercase bearer
+        self.assertNotIn('gemm-probe-20261004/spaced.log', names)  # whitespace run after the scheme
+        self.assertNotIn('gemm-probe-20261004/tabbed.log', names)
         self.assertNotIn('gemm-probe-20261004/env.log', names)  # lowercase token variable
         self.assertNotIn('gemm-probe-20261004/article-customer/requests.jsonl', names)  # nested article dir
         self.assertNotIn('gemm-probe-20261004/usage-20261004.json', names)  # dated usage dump
@@ -193,6 +197,38 @@ class EvidenceArchive(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ea.build(self.root, out, 'ev')
 
+    def test_creation_is_exclusive(self):
+        # A file that appears between the existence check and the open must not be truncated:
+        # the check is simulated as having passed, and the open itself must refuse.
+        from unittest.mock import patch
+        out = Path(self.tmp.name) / 'race.tar.gz'
+        out.write_bytes(b'another build')
+        with patch.object(Path, 'exists', return_value=False), self.assertRaises(SystemExit):
+            ea.build(self.root, out, 'ev')
+        self.assertEqual(out.read_bytes(), b'another build')
+
+    def test_manifest_describes_the_bytes_archived(self):
+        # If a source changes after it was read, the manifest must still describe the bytes that
+        # were archived, not the current file.
+        target = self.root / 'gemm-probe-20261004' / 'run.py'
+        original = target.read_bytes()
+        real = ea.prepare
+
+        def prepare_then_mutate(path, *args, **kwargs):
+            result = real(path, *args, **kwargs)
+            if path == target:
+                target.write_bytes(original + b'# changed after the read\n')
+            return result
+
+        ea.prepare = prepare_then_mutate
+        try:
+            manifest = ea.build(self.root, Path(self.tmp.name) / 'prov.tar.gz', 'ev')
+        finally:
+            ea.prepare = real
+        entry = next(e for e in manifest['files'] if e['path'] == 'gemm-probe-20261004/run.py')
+        self.assertEqual(entry['source_sha256'], hashlib.sha256(original).hexdigest())
+        self.assertEqual(entry['source_bytes'], len(original))
+
     def test_final_scan_fails_closed(self):
         # A token-like line is excluded by the pre-filter; if the pre-filter is bypassed, the
         # final scan over archived bytes must stop the build instead of publishing it.
@@ -203,7 +239,7 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/token.log', {e['path'] for e in manifest['files']})
         self.assertIn('forbidden content', manifest['excluded_counts'])
         orig = ea.prepare
-        ea.prepare = lambda p: (p.read_bytes(), False, 'included') if p.name == 'token.log' else orig(p)
+        ea.prepare = lambda p, raw=None: (p.read_bytes(), False, 'included') if p.name == 'token.log' else orig(p, raw)
         try:
             out2 = Path(self.tmp.name) / 'ev3.tar.gz'
             with self.assertRaises(SystemExit):
