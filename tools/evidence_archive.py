@@ -40,7 +40,8 @@ without a timestamp, and a label restricted to one safe path component. It refus
 scan over every archived text file fails the build if a FORBIDDEN pattern survives, so the
 rewrite rules are checked rather than trusted. JSON text (documents, JSONL lines and
 safetensors headers) is scanned both as written and as decoded strings, since an escaped
-form such as \u002f survives a textual match and json.loads reassembles it.
+form such as \u002f survives a textual match and json.loads reassembles it. Text files may not contain a NUL byte
+anywhere, which is what UTF-16 text would need to hide in them.
 """
 from __future__ import annotations
 
@@ -93,13 +94,15 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
 
 
 def is_text(path: Path) -> bool:
-    """Text by extension or, without one, by content; a NUL byte in the first 4 KiB disqualifies
-    either, so binary data under a text name is excluded rather than archived."""
+    """Text by extension or, without one, by content; a NUL byte anywhere disqualifies either,
+    so binary or NUL-padded (UTF-16) data under a text name is excluded rather than archived.
+    Files are bounded by MAX_TEXT, so reading them whole here is affordable."""
     if not (path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES or path.suffix == ''):
         return False
-    with open(path, 'rb') as f:
-        head = f.read(4096)
-    return head[:4] not in MACHO and b'\0' not in head
+    if path.stat().st_size > MAX_TEXT:
+        return True   # classify() excludes it as oversized without reading it
+    raw = path.read_bytes()
+    return raw[:4] not in MACHO and b'\0' not in raw
 
 
 def classify(golden: Path, path: Path) -> tuple[bool, str]:
@@ -259,6 +262,8 @@ def prepare(path: Path) -> tuple[bytes | None, bool, str]:
         if not safetensors_payload_ok(raw, header):
             return None, False, 'safetensors payload'
         return raw, False, 'included'
+    if b'\0' in raw:
+        return None, False, 'binary'   # NUL-padded (UTF-16) or binary data under a text name (review #40)
     try:
         text = raw.decode('utf-8')
     except UnicodeDecodeError:
@@ -330,6 +335,8 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
         if FORBIDDEN.search(rel):
             raise SystemExit(f'forbidden pattern in the path {rel}')
         tensor = path.suffix.lower() == '.safetensors'
+        if not tensor and b'\0' in data:
+            raise SystemExit(f'NUL byte survived in {rel}')
         text = safetensors_header(data) if tensor else data.decode('utf-8', 'replace')
         if text is None or forbidden_in(text) or (tensor and not safetensors_payload_ok(data, text)):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
