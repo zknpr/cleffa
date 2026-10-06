@@ -21,15 +21,16 @@ Excluded
     text extracts of Apple's Metal Shading Language specification
   - Cloudflare subscription and usage dumps (`subscriptions.json`, `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
-  - any file whose name contains "private", and any text file that still matches a
+  - any file with "private" in any component of its path, and any text file that still matches a
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
     including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
 Rewritten (text files only, recorded per file in the manifest)
   - the local checkout path and home directory become <repo> and <home>
   - the Cloudflare account name becomes <cf-account>
 
-The archive is deterministic for a given tree: sorted entries, source mtimes, no owner
-names, gzip header without a timestamp. It refuses to overwrite an existing output. A final
+The archive is deterministic for a given tree: sorted entries, source mtimes, a manifest
+timestamp taken from the newest source file, no owner names, gzip header without a
+timestamp, and a label restricted to one safe path component. It refuses to overwrite an existing output. A final
 scan over every archived text file fails the build if a FORBIDDEN pattern survives, so the
 rewrite rules are checked rather than trusted.
 """
@@ -108,8 +109,8 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'private workload directory'
     if top.startswith('ds4-') and len(parts) > 2 and parts[1] == 'source':
         return False, 'upstream clone'
-    if 'private' in path.name.lower():
-        return False, 'private-named file'
+    if any('private' in part.lower() for part in parts):
+        return False, 'private-named path'
     if path.name.startswith('cleffa-evidence-'):
         return False, 'archive output'
     if THIRD_PARTY_DOC.match(path.name):
@@ -170,7 +171,14 @@ def collect(golden: Path):
     return included, excluded
 
 
+LABEL = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+
+
 def build(golden: Path, out: Path, label: str) -> dict:
+    # The label is every member's leading path component; keep it a single safe name so
+    # an extractor that honours '..' or '/' cannot be steered outside its directory.
+    if not LABEL.match(label) or '..' in label:
+        raise SystemExit(f'label {label!r} must be a single path component [A-Za-z0-9._-]')
     if out.exists():
         raise SystemExit(f'{out} exists; evidence archives are never overwritten')
     included, excluded = collect(golden)
@@ -184,7 +192,8 @@ def build(golden: Path, out: Path, label: str) -> dict:
         })
     manifest = {
         'label': label,
-        'built': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        # Derived from the tree, not the wall clock, so rebuilding the same tree gives the same bytes.
+        'built': max((e['mtime'] for e in entries), default='1970-01-01T00:00:00+00:00'),
         'rules': (__doc__ or '').split('\n', 2)[2].strip(),
         'rewrites': ['<repo>', '<home>', '<cf-account>'],
         'files': entries,

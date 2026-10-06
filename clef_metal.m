@@ -264,7 +264,10 @@ static id<MTLBuffer> buf(clef_gpu *g, size_t bytes) {
 static bool gdn_chunked(const clef_config *c, int length) {
     // Choose per record, never by the packed token count: these FP32 algorithms
     // have different reduction orders. Restrict the change to measured long 27B work.
-    return c->Hv == 48 && length >= 4096;
+    // gdn_chunk_prep/scan address the V and O heads at a fixed 128 columns (dk is already
+    // 128 by load_config), while load_config admits any dv divisible by 16: a crafted GGUF
+    // with Hv=48 and another dv must stay on the sequential scan, which reads a.dv (review #12).
+    return c->Hv == 48 && c->dv == 128 && length >= 4096;
 }
 
 static bool ensure_gdn_capacity(clef_gpu *g, const clef_config *c, int T, char *err, size_t errlen) {

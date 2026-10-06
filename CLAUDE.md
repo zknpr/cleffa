@@ -273,7 +273,8 @@ split only. See `docs/performance-history.md` for timing and qualification limit
 - **No read-before-write.** `CLEF_DEBUG_POISON=1` fills every activation buffer with NaN before each
   forward; outputs must not change (`tests/test_poison.sh`). Masked attention must never multiply
   into unwritten rows (`0 * NaN = NaN`).
-- **Chunked DeltaNet.** Records with Hv=48 and at least 4,096 tokens use 32-token FP32 blocks,
+- **Chunked DeltaNet.** Records with Hv=48, dv=128 and at least 4,096 tokens use 32-token FP32 blocks
+  (the chunk kernels address V/O at a fixed 128 columns; other dv values stay on the sequential scan),
   with 16 value columns below 8,192 tokens and 32 thereafter. Flash retains the sequential scan.
   Dispatch and block boundaries are per record; selecting by packed T would change logits when
   records are batched. Scratch is sized to the longest selected record, allocated atomically,

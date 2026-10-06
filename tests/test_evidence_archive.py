@@ -1,5 +1,7 @@
 """The evidence archive must drop binaries, traces, tensors and private files, rewrite local
 paths, and fail closed when a forbidden pattern survives."""
+import datetime
+import hashlib
 import json
 import os
 import sys
@@ -12,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import evidence_archive as ea  # noqa: E402
 
 HOME = str(Path.home())
+FIXED_MTIME = 1_759_700_000  # every fixture file gets this mtime; the manifest must derive from it
 REPO = str(Path(__file__).resolve().parents[1])
 
 
@@ -50,6 +53,14 @@ def make_tree(root: Path):
     (root / 'engine_logits.jsonl').write_text('{}\n')
     (root / 'engine_dump.bin').write_bytes(b'\0' * 4)
     (root / '.gpu.lock').write_text('')
+    priv = exp / 'private-customer'
+    priv.mkdir()
+    (priv / 'requests.jsonl').write_text('{"state": "customer text"}\n')   # private ancestor directory
+    undated = root / 'customer-private'
+    undated.mkdir()
+    (undated / 'requests.jsonl').write_text('{"state": "customer text"}\n')  # undated, oracle-shaped
+    for p in root.rglob('*'):
+        os.utime(p, (FIXED_MTIME, FIXED_MTIME))
 
 
 class EvidenceArchive(unittest.TestCase):
@@ -92,8 +103,10 @@ class EvidenceArchive(unittest.TestCase):
         ex = manifest['excluded_counts']
         self.assertNotIn('gemm-probe-20261004/calls.jsonl', names)  # account ID inside a recorded URL
         self.assertNotIn('gemm-probe-20261004/latin.log', names)  # undecodable text is never archived raw
+        self.assertNotIn('gemm-probe-20261004/private-customer/requests.jsonl', names)  # private ancestor
+        self.assertNotIn('customer-private/requests.jsonl', names)  # private undated directory
         self.assertIn('undecodable text', manifest['excluded_counts'])
-        for reason in ('binary', 'private-named file', 'forbidden content', 'private workload directory',
+        for reason in ('binary', 'private-named path', 'forbidden content', 'private workload directory',
                        'upstream clone', 'trace or dSYM bundle', 'tensor size', 'oracle directory'):
             self.assertIn(reason, ex, reason)
 
@@ -125,13 +138,19 @@ class EvidenceArchive(unittest.TestCase):
     def test_deterministic(self):
         a = Path(self.tmp.name) / 'a.tar.gz'
         b = Path(self.tmp.name) / 'b.tar.gz'
-        ea.build(self.root, a, 'ev')
+        ma = ea.build(self.root, a, 'ev')
         ea.build(self.root, b, 'ev')
-        with tarfile.open(a) as ta, tarfile.open(b) as tb:
-            ma = [(m.name, m.size, m.mtime) for m in ta.getmembers() if m.name != 'ev/manifest.json']
-            mb = [(m.name, m.size, m.mtime) for m in tb.getmembers() if m.name != 'ev/manifest.json']
-        self.assertEqual(ma, mb)
-        self.assertEqual(os.path.getsize(a), os.path.getsize(b))
+        # Byte-identical archives for the same tree: the manifest timestamp must come from the
+        # tree, not the wall clock.
+        self.assertEqual(hashlib.sha256(a.read_bytes()).hexdigest(), hashlib.sha256(b.read_bytes()).hexdigest())
+        self.assertEqual(ma['built'], datetime.datetime.fromtimestamp(FIXED_MTIME, datetime.timezone.utc).isoformat())
+
+    def test_rejects_unsafe_label(self):
+        # The label becomes every tar member's leading path component.
+        for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
+            with self.subTest(label=label), self.assertRaises(SystemExit):
+                ea.build(self.root, Path(self.tmp.name) / f'l{abs(hash(label))}.tar.gz', label)
+        self.assertFalse(list(Path(self.tmp.name).glob('l*.tar.gz')))
 
 
 if __name__ == '__main__':

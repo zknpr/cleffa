@@ -23,7 +23,7 @@ int main(void) {
         FailBufferDevice *dev = [FailBufferDevice new];
         dev.inner = MTLCreateSystemDefaultDevice(); require(dev.inner != nil, "no GPU");
         g->dev = (id<MTLDevice>)dev;
-        clef_config c = {0}; c.Hv = 48;
+        clef_config c = {0}; c.Hv = 48; c.dv = 128;
         char err[256];
         require(ensure_gdn_capacity(g, &c, 0, err, sizeof(err)) && !g->gdn_cap && !dev.calls, "empty capacity allocates");
         require(ensure_gdn_capacity(g, &c, 31, err, sizeof(err)) && g->gdn_cap == 32, "initial capacity");
@@ -46,6 +46,10 @@ int main(void) {
         require(!ensure_gdn_capacity(g, &c, INT_MAX, err, sizeof(err)) && dev.calls == calls, "rounded length overflow");
         require(!gdn_chunked(&c, 4095) && gdn_chunked(&c, 4096) && gdn_chunked(&c, 8192), "27B dispatch boundary");
         c.Hv = 32; require(!gdn_chunked(&c, 16347), "unqualified Flash dispatch");
+        /* gdn_chunk_prep/scan address V and O at a fixed 128 columns; load_config admits any dv
+           divisible by 16, so a crafted model with Hv=48 and dv!=128 must stay on the sequential scan. */
+        c.Hv = 48; c.dv = 64; require(!gdn_chunked(&c, 4096) && !gdn_chunked(&c, 16347), "dv != 128 keeps the sequential scan");
+        c.dv = 144; require(!gdn_chunked(&c, 8192), "dv > 128 keeps the sequential scan");
         clef_gpu_close(g);
         puts("gdn buffers: 5 allocation failures, recovery, overflow and dispatch PASS");
     }
