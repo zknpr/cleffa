@@ -16,18 +16,34 @@ __pycache__/
 /clef-server
 /clef-tool
 /tests/test-head-attend
+/tests/test-head-linear
+/tests/test-head-parallel
+/tests/test-head-parallel-tsan
 /tests/test-record-errors
 /tests/test-metal-errors
 /tests/test-server-writes
 /tests/test-cli-alloc
+/tests/test-prefix-owner
+/tests/test-prefix-planner
+/tests/test-prefix-owner-model
+/tests/test-prefix-attention
 /clef_metal_src.inc
 /compile-check
 /edge-test
 /gemm-bench
 /tile-bench
 /mixed-bench
+/attention-bench
+/gemm-tiles
+/gdn-bench
+/tests/test-gdn-buffers
 
 .DS_Store
 *.dSYM/
 *.d
 /jev.api
+docs/handoff-2026-10-03-throughput.md
+
+# Claude Code local settings and agent worktrees
+/.claude/settings.local.json
+/.claude/worktrees/

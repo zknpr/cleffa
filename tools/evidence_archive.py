@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Pack the evidence behind docs/ into a curated, publishable archive.
+
+  .venv/bin/python -B tools/evidence_archive.py OUT.tar.gz [--golden golden] [--list]
+
+`golden/` is git-ignored because it holds oracle tensors, Instruments traces, copied binaries
+and an upstream clone (tens of GB). The reports in docs/ cite its `<experiment>-<date>/`
+directories by name. This tool copies the parts of those directories that make the reports
+checkable, under rules that are deliberately conservative:
+
+Included
+  - result, manifest, sample and log files (.json, .jsonl, .log, .txt, .md, .csv, .patch, ...)
+  - experiment sources (.py, .m, .metal, .c, .h, .sh, Makefile)
+  - .safetensors files up to SMALL_TENSOR bytes (saved logits; never layer dumps)
+  - for the oracle directories (no date suffix): requests.jsonl, encoded.jsonl,
+    logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump
+Excluded
+  - Mach-O binaries, objects, dSYMs, .inc, Instruments .trace bundles and their exported
+    counter tables (.xml, .npz), .bin/.npy tensors, archives, PDFs, .git clones, virtualenvs
+  - the ds4 upstream `source/` tree, every `article-*` directory (private workload), and the
+    text extracts of Apple's Metal Shading Language specification
+  - Cloudflare subscription and usage dumps (`subscriptions.json`, `usage-*.json`) and agents'
+    `checkpoint*.json` working-state files
+  - any file whose name contains "private", and any text file that still matches a
+    FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
+    including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
+Rewritten (text files only, recorded per file in the manifest)
+  - the local checkout path and home directory become <repo> and <home>
+  - the Cloudflare account name becomes <cf-account>
+
+The archive is deterministic for a given tree: sorted entries, source mtimes, no owner
+names, gzip header without a timestamp. It refuses to overwrite an existing output. A final
+scan over every archived text file fails the build if a FORBIDDEN pattern survives, so the
+rewrite rules are checked rather than trusted.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import gzip
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import tarfile
+from pathlib import Path
+
+SMALL_TENSOR = 2 * 1024 * 1024
+MAX_TEXT = 64 * 1024 * 1024
+
+TEXT_EXT = {'.json', '.jsonl', '.log', '.txt', '.md', '.csv', '.patch', '.diff', '.yaml', '.yml',
+            '.toml', '.py', '.m', '.metal', '.c', '.h', '.sh', '.mk', '.cfg'}
+TEXT_NAMES = {'Makefile'}
+ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latency.json'}
+EXPERIMENT = re.compile(r'^[a-z0-9-]+-20\d{6}$')
+MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
+
+EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
+# Text extracts of Apple's Metal Shading Language specification kept beside some experiments.
+THIRD_PARTY_DOC = re.compile(r'^(msl|metal-spec|Metal-Shading-Language-Specification)\.(txt|pdf)$')
+# Cloudflare account subscription and usage dumps: budget bookkeeping, not evidence.
+ACCOUNT_BOOKKEEPING = re.compile(r'^(subscriptions|usage(-[a-z-]+)?)\.json$')
+# Agents' own working-state files (goal, sessions, next action), not experiment evidence.
+AGENT_STATE = re.compile(r'^checkpoint[-.a-zA-Z0-9]*\.json$')
+EXCLUDE_EXT = {'.o', '.a', '.dylib', '.inc', '.bin', '.npy', '.npz', '.pt', '.xml', '.pdf',
+               '.gz', '.zip', '.tar', '.zst', '.xz', '.bz2', '.7z', '.dmg', '.pkg'}
+
+# Rewrites run in order; the checkout path must precede the home directory.
+REWRITES = [
+    (re.compile(re.escape(str(Path(__file__).resolve().parent.parent))), '<repo>'),
+    (re.compile(re.escape(str(Path.home()))), '<home>'),
+    (re.compile(r'Zknpr'), '<cf-account>'),
+]
+# Anything matching after rewriting excludes the file, and a match in the final scan fails
+# the build. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
+FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|squid|\.personal|pop_v22|account_id|'
+                       r'Bearer [A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
+                       r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}')
+
+
+def is_text(path: Path) -> bool:
+    if path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES:
+        return True
+    if path.suffix == '':
+        with open(path, 'rb') as f:
+            head = f.read(4096)
+        return head[:4] not in MACHO and b'\0' not in head
+    return False
+
+
+def classify(golden: Path, path: Path) -> tuple[bool, str]:
+    """(include?, reason). Reasons are stable strings used for the --list summary."""
+    rel = path.relative_to(golden)
+    parts = rel.parts
+    top = parts[0]
+    if path.is_symlink():
+        return False, 'symlink'
+    if any(p in EXCLUDE_DIR_PARTS for p in parts):
+        return False, 'clone or environment'
+    if any(p.endswith('.trace') or p.endswith('.dSYM') for p in parts[:-1]):
+        return False, 'trace or dSYM bundle'
+    if len(parts) == 1:
+        # Top-level files: only the engine outputs the parity tests write.
+        return (path.suffix in {'.jsonl'} and path.name.startswith('engine_logits')), 'top-level file'
+    if top.startswith('article-'):
+        return False, 'private workload directory'
+    if top.startswith('ds4-') and len(parts) > 2 and parts[1] == 'source':
+        return False, 'upstream clone'
+    if 'private' in path.name.lower():
+        return False, 'private-named file'
+    if path.name.startswith('cleffa-evidence-'):
+        return False, 'archive output'
+    if THIRD_PARTY_DOC.match(path.name):
+        return False, 'third-party document'
+    if ACCOUNT_BOOKKEEPING.match(path.name):
+        return False, 'account bookkeeping'
+    if AGENT_STATE.match(path.name):
+        return False, 'agent checkpoint'
+    if not EXPERIMENT.match(top):
+        # Oracle golden directory: the small files only, never layers/ or dumps.
+        return (len(parts) == 2 and path.name in ORACLE_FILES), 'oracle directory'
+    ext = path.suffix.lower()
+    if ext in EXCLUDE_EXT:
+        return False, f'excluded extension {ext}'
+    if ext == '.safetensors':
+        return path.stat().st_size <= SMALL_TENSOR, 'tensor size'
+    if not is_text(path):
+        return False, 'binary'
+    if path.stat().st_size > MAX_TEXT:
+        return False, 'oversized text'
+    return True, 'included'
+
+
+def prepare(path: Path) -> tuple[bytes | None, bool, str]:
+    """Return (archived bytes, rewritten?, reason). None means exclude."""
+    raw = path.read_bytes()
+    if path.suffix == '.safetensors':
+        return raw, False, 'included'
+    try:
+        text = raw.decode('utf-8')
+    except UnicodeDecodeError:
+        return (None, False, 'undecodable text') if FORBIDDEN.search(raw.decode('latin-1')) else (raw, False, 'included')
+    new = text
+    for pat, repl in REWRITES:
+        new = pat.sub(repl, new)
+    if FORBIDDEN.search(new):
+        return None, False, 'forbidden content'
+    return new.encode('utf-8'), new != text, 'included'
+
+
+def collect(golden: Path):
+    included, excluded = [], {}
+    for dirpath, dirnames, filenames in os.walk(golden):
+        dirnames.sort()
+        for name in sorted(filenames):
+            path = Path(dirpath) / name
+            ok, reason = classify(golden, path)
+            if not ok:
+                excluded[reason] = excluded.get(reason, 0) + 1
+                continue
+            data, rewritten, reason = prepare(path)
+            if data is None:
+                excluded[reason] = excluded.get(reason, 0) + 1
+                continue
+            included.append((path.relative_to(golden).as_posix(), path, data, rewritten))
+    return included, excluded
+
+
+def build(golden: Path, out: Path, label: str) -> dict:
+    if out.exists():
+        raise SystemExit(f'{out} exists; evidence archives are never overwritten')
+    included, excluded = collect(golden)
+    entries = []
+    for rel, path, data, rewritten in included:
+        st = path.stat()
+        entries.append({
+            'path': rel, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
+            'source_bytes': st.st_size, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
+            'rewritten': rewritten, 'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
+        })
+    manifest = {
+        'label': label,
+        'built': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
+        'rules': (__doc__ or '').split('\n', 2)[2].strip(),
+        'rewrites': ['<repo>', '<home>', '<cf-account>'],
+        'files': entries,
+        'excluded_counts': dict(sorted(excluded.items())),
+    }
+    readme = README.format(label=label, n=len(entries), rewritten=sum(e['rewritten'] for e in entries),
+                           excluded=json.dumps(manifest['excluded_counts'], indent=2))
+    # Final control: the archived bytes must not contain any forbidden pattern.
+    for rel, path, data, _ in included:
+        if path.suffix != '.safetensors' and FORBIDDEN.search(data.decode('utf-8', 'replace')):
+            raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, 'wb') as fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
+            tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tar:
+        def add(name: str, data: bytes, mtime: float):
+            info = tarfile.TarInfo(f'{label}/{name}')
+            info.size = len(data)
+            info.mtime = int(mtime)
+            info.mode = 0o644
+            info.uid = info.gid = 0
+            info.uname = info.gname = ''
+            tar.addfile(info, io.BytesIO(data))
+        add('README.md', readme.encode(), 0)
+        add('manifest.json', json.dumps(manifest, indent=1).encode(), 0)
+        for rel, path, data, _ in included:
+            add(rel, data, path.stat().st_mtime)
+    return manifest
+
+
+README = '''# {label}
+
+Curated evidence for the reports in `docs/` of the cleffa repository: {n} files copied from
+the local `golden/` tree by `tools/evidence_archive.py`, with their SHA-256 before and after
+copying in `manifest.json`. {rewritten} text files were rewritten to replace the local
+checkout path, home directory and Cloudflare account name with `<repo>`, `<home>` and
+`<cf-account>`; nothing else was edited. Each report names the directories it relies on.
+
+Not included, by rule: engine binaries and objects, Instruments traces and their counter
+exports, model tensors and layer dumps, the MLX environment, the ds4 upstream clone, the
+ContractNLI dataset archive (its commit hash is in `contractnli-*/source.json`; the dataset is
+CC BY 4.0, Koreeda and Manning, Findings of EMNLP 2021), Cloudflare account and usage dumps,
+and every file from the private article-classification workload.
+
+Excluded file counts by reason:
+
+```
+{excluded}
+```
+
+The oracle directories (`clef-flash`, `clef-flash-f32`, `clef`, `clef-f32`, ...) contain only
+`requests.jsonl`, `encoded.jsonl`, `logits.safetensors` and `latency.json`, which is enough
+for `tests/test_parity.py` without `--dump`; regenerate `layers/` with `ref/oracle.py` when a
+per-layer comparison is needed.
+'''
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=(__doc__ or '').split('\n')[0])
+    ap.add_argument('out', type=Path, help='output .tar.gz (must not exist)')
+    ap.add_argument('--golden', type=Path, default=Path(__file__).resolve().parent.parent / 'golden')
+    ap.add_argument('--label', default=None, help='top-level directory name inside the archive')
+    ap.add_argument('--list', action='store_true', help='print the selection and exit without writing')
+    args = ap.parse_args(argv)
+    golden = args.golden.resolve()
+    if not golden.is_dir():
+        raise SystemExit(f'{golden} is not a directory')
+    label = args.label or f'cleffa-evidence-{datetime.date.today().isoformat()}'
+    if args.list:
+        included, excluded = collect(golden)
+        total = sum(len(d) for _, _, d, _ in included)
+        rewritten = sum(1 for *_, r in included if r)
+        for rel, _, data, r in included:
+            print(f'{len(data):10d}  {"R" if r else " "}  {rel}')
+        print(f'\n{len(included)} files, {total/1e6:.1f} MB, {rewritten} rewritten', file=sys.stderr)
+        for reason, n in sorted(excluded.items()):
+            print(f'  excluded {n:6d}  {reason}', file=sys.stderr)
+        return 0
+    manifest = build(golden, args.out, label)
+    total = sum(e['bytes'] for e in manifest['files'])
+    print(f'{args.out}: {len(manifest["files"])} files, {total/1e6:.1f} MB uncompressed, '
+          f'{args.out.stat().st_size/1e6:.1f} MB compressed, sha256 '
+          f'{hashlib.sha256(args.out.read_bytes()).hexdigest()}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -9,6 +9,8 @@
  * Matmuls go through Accelerate's cblas_sgemm. */
 
 #include <Accelerate/Accelerate.h>
+#include <dispatch/dispatch.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -16,7 +18,7 @@
 
 #include "clef_engine.h"
 
-typedef struct { float *w, *b; int out, in; } linear;
+typedef struct { float *w, *b; int out, in; float *packed; int packed_ld; } linear;
 typedef struct { float *w, *b; int n; } layernorm;
 typedef struct { linear in_q; float *in_bv; linear out; int E, heads; } mha;  /* in_q: rows [0,E) */
 
@@ -87,6 +89,29 @@ static bool load_linear(const gguf_file *f, const char *prefix, int out, int in,
     return true;
 }
 
+/* Accelerate's small multi-row GEMMs benefit from contiguous output columns. Pad the
+ * leading dimension to avoid power-of-two strides. Keep the original weights too:
+ * single-row GEMMs use a different reduction with the transposed layout, so those
+ * stay on the original path. Both copies contain exactly the same FP32 values. */
+static bool pack_linear(linear *l, char *err, size_t errlen) {
+    if (l->out <= 0 || l->out > INT_MAX - 32 || l->in <= 0 ||
+        (size_t)l->in > SIZE_MAX / sizeof(float) / ((size_t)l->out + 32)) {
+        snprintf(err, errlen, "head: invalid packed linear shape");
+        return false;
+    }
+    /* Ragged dimensions can select different BLAS tail reductions. The shipped
+     * head shapes are aligned; retain the original layout for other shapes. */
+    if (l->out % 32 || l->in % 32) return true;
+    int ld = l->out + 32;
+    float *packed = calloc((size_t)l->in * ld, sizeof(float));
+    if (!packed) { snprintf(err, errlen, "head: out of memory packing linear weights"); return false; }
+    for (int j = 0; j < l->out; j++) for (int k = 0; k < l->in; k++)
+        packed[(size_t)k * ld + j] = l->w[(size_t)j * l->in + k];
+    l->packed = packed;
+    l->packed_ld = ld;
+    return true;
+}
+
 static bool load_ln(const gguf_file *f, const char *prefix, int n, layernorm *l, char *err, size_t errlen) {
     char name[160];
     l->n = n;
@@ -105,7 +130,7 @@ static bool load_mha(const gguf_file *f, const char *prefix, int E, int heads, m
     LOAD(w, name, (int64_t)3 * E * E);
     snprintf(name, sizeof(name), "%s.in_proj_bias", prefix);
     LOAD(b, name, 3 * E);
-    m->in_q = (linear){ w, b, E, E };   /* rows [0,E): query projection; K/V rows used on the GPU */
+    m->in_q = (linear){ w, b, E, E, NULL, 0 };   /* rows [0,E): query projection; K/V rows used on the GPU */
     m->in_bv = b + 2 * E;
     snprintf(name, sizeof(name), "%s.out_proj", prefix);
     return load_linear(f, name, E, E, true, &m->out, err, errlen);
@@ -156,7 +181,7 @@ clef_head *clef_head_load(const gguf_file *f, const clef_config *cfg, char *err,
         snprintf(p, sizeof(p), "head.layers.%d.norm2", i); ok = ok && load_ln(f, p, W, &d->norm2, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.norm3", i); ok = ok && load_ln(f, p, W, &d->norm3, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.self_attn", i); ok = ok && load_mha(f, p, W, cfg->head_heads, &d->self_attn, err, errlen);
-        if (ok) d->self_in = (linear){ d->self_attn.in_q.w, d->self_attn.in_q.b, 3 * W, W };
+        if (ok) d->self_in = (linear){ d->self_attn.in_q.w, d->self_attn.in_q.b, 3 * W, W, NULL, 0 };
         snprintf(p, sizeof(p), "head.layers.%d.multihead_attn", i); ok = ok && load_mha(f, p, W, cfg->head_heads, &d->cross, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.linear1", i); ok = ok && load_linear(f, p, FF, W, true, &d->lin1, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.linear2", i); ok = ok && load_linear(f, p, W, FF, true, &d->lin2, err, errlen);
@@ -164,11 +189,28 @@ clef_head *clef_head_load(const gguf_file *f, const clef_config *cfg, char *err,
     if (ok) h->prior_logit_scale = scalar(f, "head.prior_logit_scale", &ok, err, errlen);
     if (ok) h->joint_logit_scale = scalar(f, "head.joint_logit_scale", &ok, err, errlen);
     if (ok) h->residual_gate = scalar(f, "head.residual_gate", &ok, err, errlen);
+    /* Only prepare projections used with multiple rows on the CPU. The GPU memory
+     * projection, single global vector and final scalar scorer need no extra copy. */
+    linear *projections[] = { &h->scorer0, &h->question_projection, &h->option_question_projection,
+                             &h->option_context_projection, &h->option_lexical_projection };
+    for (size_t i = 0; ok && i < sizeof(projections) / sizeof(projections[0]); i++)
+        ok = pack_linear(projections[i], err, errlen);
+    for (int i = 0; ok && i < h->n_ev; i++) {
+        evidence_layer *e = &h->ev[i];
+        ok = pack_linear(&e->attn.in_q, err, errlen) && pack_linear(&e->attn.out, err, errlen)
+            && pack_linear(&e->ff1, err, errlen) && pack_linear(&e->ff2, err, errlen);
+    }
+    for (int i = 0; ok && i < h->n_dec; i++) {
+        decoder_layer *d = &h->dec[i];
+        ok = pack_linear(&d->self_in, err, errlen) && pack_linear(&d->self_attn.out, err, errlen)
+            && pack_linear(&d->cross.in_q, err, errlen) && pack_linear(&d->cross.out, err, errlen)
+            && pack_linear(&d->lin1, err, errlen) && pack_linear(&d->lin2, err, errlen);
+    }
     if (!ok) { clef_head_free(h); return NULL; }
     return h;
 }
 
-static void free_linear(linear *l) { free(l->w); free(l->b); }
+static void free_linear(linear *l) { free(l->w); free(l->b); free(l->packed); }
 static void free_ln(layernorm *l) { free(l->w); free(l->b); }
 
 void clef_head_free(clef_head *h) {
@@ -182,14 +224,16 @@ void clef_head_free(clef_head *h) {
     for (int i = 0; i < h->n_ev; i++) {
         evidence_layer *e = &h->ev[i];
         free_ln(&e->query_norm); free_ln(&e->memory_norm); free_ln(&e->ff_norm);
-        free(e->attn.in_q.w); free(e->attn.in_q.b); free_linear(&e->attn.out);
+        free_linear(&e->attn.in_q); free_linear(&e->attn.out);
         free_linear(&e->ff1); free_linear(&e->ff2);
     }
     for (int i = 0; i < h->n_dec; i++) {
         decoder_layer *d = &h->dec[i];
         free_ln(&d->norm1); free_ln(&d->norm2); free_ln(&d->norm3);
-        free(d->self_attn.in_q.w); free(d->self_attn.in_q.b); free_linear(&d->self_attn.out);
-        free(d->cross.in_q.w); free(d->cross.in_q.b); free_linear(&d->cross.out);
+        free_linear(&d->self_attn.in_q); free_linear(&d->self_attn.out);
+        /* self_in aliases the original QKV weights/bias, but owns its packed copy. */
+        free(d->self_in.packed);
+        free_linear(&d->cross.in_q); free_linear(&d->cross.out);
         free_linear(&d->lin1); free_linear(&d->lin2);
     }
     free(h);
@@ -197,9 +241,39 @@ void clef_head_free(clef_head *h) {
 
 /* ---- primitives -------------------------------------------------------------- */
 
+/* One GEMM for output columns [j0, j0 + cnt) of Y[n][out] = X[n][in] . W^T. */
+static void lin_cols(const linear *l, const float *X, int n, float *Y, int j0, int cnt) {
+    if (n > 1 && l->packed)
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, cnt, l->in, 1.0f, X, l->in, l->packed + j0, l->packed_ld, 0.0f, Y + j0, l->out);
+    else
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, cnt, l->in, 1.0f, X, l->in, l->w + (size_t)j0 * l->in, l->in, 0.0f, Y + j0, l->out);
+}
+
+/* Large projections with few query rows benefit from two cores. Split output columns,
+ * leaving the input reduction intact. Two 32-column-aligned halves preserve the tested
+ * BLAS results; finer splits changed single-row results. Tests compare with unsplit BLAS.
+ * CLEF_DEBUG_HEAD_SPLIT_MIN=<elements> moves the minimum; 0 disables this split. */
+#define LIN_SPLIT_MIN (1u << 20)
+static size_t lin_split_min(void) {
+    static size_t min;
+    static dispatch_once_t once;
+    /* Separate engines may run their first head concurrently. */
+    dispatch_once(&once, ^{
+        const char *s = getenv("CLEF_DEBUG_HEAD_SPLIT_MIN");
+        min = s ? (size_t)strtoull(s, NULL, 10) : LIN_SPLIT_MIN;
+        if (s && min == 0) min = SIZE_MAX;
+    });
+    return min;
+}
+
 /* Y[n][out] = X[n][in] . W^T + b */
 static void lin(const linear *l, const float *X, int n, float *Y) {
-    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, l->out, l->in, 1.0f, X, l->in, l->w, l->in, 0.0f, Y, l->out);
+    if (l->out % 64 == 0 && (size_t)l->out * l->in >= lin_split_min()) {
+        const int half = l->out / 2;
+        dispatch_apply(2, DISPATCH_APPLY_AUTO, ^(size_t part) { lin_cols(l, X, n, Y, (int)part * half, half); });
+    } else {
+        lin_cols(l, X, n, Y, 0, l->out);
+    }
     if (l->b) for (int r = 0; r < n; r++) for (int j = 0; j < l->out; j++) Y[(size_t)r * l->out + j] += l->b[j];
 }
 
@@ -228,22 +302,31 @@ static void softmax_inplace(float *x, int n) {
     for (int i = 0; i < n; i++) x[i] *= inv;
 }
 
+#define ATTEND_SPLIT_MIN (1u << 16)   /* query rows x keys x heads below this are not worth a thread wake-up */
+
 /* Multi-head attention of nq query rows (already projected, bias included) over L
  * key/value rows. Q row stride ldq, K/V row stride ld; bv (may be NULL when V already carries its bias)
  * is added after the weighted sum, which is exact because the weights sum to 1. Out: [nq][E]. */
 static bool attend(const float *Qp, int ldq, int nq, const float *K, const float *V, int ld, int L,
                    const float *bv, int E, int heads, float *out) {
     const int hd = E / heads;
-    float *S = malloc((size_t)nq * L * sizeof(float));
+    /* Heads read shared K/V and write disjoint output columns. Each worker owns its
+     * score scratch and keeps the original BLAS calls and softmax order within a head.
+     * Small field self-attention stays serial to avoid a thread wake-up. */
+    const int parts = heads % 2 == 0 && (size_t)nq * L * heads >= ATTEND_SPLIT_MIN ? 2 : 1;
+    float *S = malloc((size_t)parts * nq * L * sizeof(float));
     if (!S) return false;
     const float scale = 1.0f / sqrtf((float)hd);
-    for (int h = 0; h < heads; h++) {
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nq, L, hd, scale,
-                    Qp + h * hd, ldq, K + h * hd, ld, 0.0f, S, L);
-        for (int r = 0; r < nq; r++) softmax_inplace(S + (size_t)r * L, L);
-        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, nq, hd, L, 1.0f,
-                    S, L, V + h * hd, ld, 0.0f, out + h * hd, E);
-    }
+    dispatch_apply((size_t)parts, DISPATCH_APPLY_AUTO, ^(size_t part) {
+        float *Sp = S + part * (size_t)nq * L;
+        for (int h = (int)part * heads / parts; h < ((int)part + 1) * heads / parts; h++) {
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nq, L, hd, scale,
+                        Qp + h * hd, ldq, K + h * hd, ld, 0.0f, Sp, L);
+            for (int r = 0; r < nq; r++) softmax_inplace(Sp + (size_t)r * L, L);
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, nq, hd, L, 1.0f,
+                        Sp, L, V + h * hd, ld, 0.0f, out + h * hd, E);
+        }
+    });
     if (bv) for (int r = 0; r < nq; r++) for (int j = 0; j < E; j++) out[(size_t)r * E + j] += bv[j];
     free(S);
     return true;
@@ -265,7 +348,10 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
                    const clef_head_inputs *in, int base, const clef_record *rec, float **logits) {
     const int H = h->H, W = h->W, heads = cfg->head_heads, nq = rec->nq;
     const int L = (int)rec->ids.len;
+    /* With a prefix cache the record's first tokens have no nh row. Everything read from nh
+     * below is a schema span or the last token, and the caller keeps those past the skip. */
     const float *nh = in->nh + (size_t)base * H;
+    const size_t skip = (size_t)in->nh_skip;
     int n_opt = 0;
     for (int q = 0; q < nq; q++) n_opt += rec->q[q].n_opt;
 
@@ -295,21 +381,21 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
     p += (size_t)nq * W * 6;
     float *ffbuf = p; p += (size_t)(n_opt > nq ? n_opt : nq) * cfg->head_ff;
     float *feat = p;
-    const float *global = nh + (size_t)(L - 1) * H;
+    const float *global = nh + ((size_t)(L - 1) - skip) * H;
 
     /* span means and lexical means */
     int o = 0;
     const uint16_t *lm = lm_head->data;
     for (int q = 0; q < nq; q++) {
         const clef_question *cq = &rec->q[q];
-        for (int t = cq->span[0]; t < cq->span[1]; t++) add_rows(qv + (size_t)q * H, nh + (size_t)t * H, H);
+        for (int t = cq->span[0]; t < cq->span[1]; t++) add_rows(qv + (size_t)q * H, nh + ((size_t)t - skip) * H, H);
         const float inv = 1.0f / (float)(cq->span[1] - cq->span[0]);
         for (int i = 0; i < H; i++) qv[(size_t)q * H + i] *= inv;
         for (int k = 0; k < cq->n_opt; k++, o++) {
             const int s0 = cq->opt_span[k][0], s1 = cq->opt_span[k][1];
             float *c = ctx + (size_t)o * H, *x = lex + (size_t)o * H;
             for (int t = s0; t < s1; t++) {
-                add_rows(c, nh + (size_t)t * H, H);
+                add_rows(c, nh + ((size_t)t - skip) * H, H);
                 const uint16_t *row = lm + (size_t)rec->ids.ids[t] * H;
                 for (int i = 0; i < H; i++) x[i] += bf16_to_f32(row[i]);
             }
@@ -402,6 +488,26 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
     const float joint_scale = expf(fminf(h->joint_logit_scale, logf(100.0f)));
     const float gate = 1.0f / (1.0f + expf(-h->residual_gate));
     ln_rows(&h->option_norm, routed, n_opt, opt_n);
+    /* Keep the reduction shape per record so packing cannot alter its logits.
+     * These scratch arrays are no longer live after field/option normalization.
+     * Very small records are faster on the existing single-option path. */
+    const bool batch_score = n_opt >= 4;
+    if (batch_score) {
+        o = 0;
+        for (int q = 0; q < nq; q++) for (int k = 0; k < rec->q[q].n_opt; k++, o++) {
+            const float *field = fn + (size_t)q * W;
+            const float *opt = opt_n + (size_t)o * W;
+            float *row = feat + (size_t)o * 4 * W;
+            for (int i = 0; i < W; i++) {
+                row[i] = field[i]; row[W+i] = opt[i];
+                row[2*W+i] = field[i] * opt[i];
+                row[3*W+i] = fabsf(field[i] - opt[i]);
+            }
+        }
+        lin(&h->scorer0, feat, n_opt, opt_q);
+        for (size_t i = 0; i < (size_t)n_opt * W; i++) opt_q[i] = gelu(opt_q[i]);
+        lin(&h->scorer3, opt_q, n_opt, tmp);
+    }
     o = 0;
     for (int q = 0; q < nq; q++) {
         const int n = rec->q[q].n_opt;
@@ -423,16 +529,19 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
             for (int i = 0; i < W; i++) { dot += (double)field[i] * opt[i]; onorm += (double)opt[i] * opt[i]; }
             const double denom = fnorm * sqrt(onorm);
             const double cosine = dot / (denom > 1e-8 ? denom : 1e-8);
-            for (int i = 0; i < W; i++) {
-                feat[i] = field[i];
-                feat[W + i] = opt[i];
-                feat[2 * W + i] = field[i] * opt[i];
-                feat[3 * W + i] = fabsf(field[i] - opt[i]);
-            }
-            lin(&h->scorer0, feat, 1, opt_q);
-            for (int i = 0; i < W; i++) opt_q[i] = gelu(opt_q[i]);
             float residual;
-            lin(&h->scorer3, opt_q, 1, &residual);
+            if (batch_score) residual = tmp[o];
+            else {
+                for (int i = 0; i < W; i++) {
+                    feat[i] = field[i];
+                    feat[W + i] = opt[i];
+                    feat[2 * W + i] = field[i] * opt[i];
+                    feat[3 * W + i] = fabsf(field[i] - opt[i]);
+                }
+                lin(&h->scorer0, feat, 1, opt_q);
+                for (int i = 0; i < W; i++) opt_q[i] = gelu(opt_q[i]);
+                lin(&h->scorer3, opt_q, 1, &residual);
+            }
             const double joint = joint_scale * cosine + residual;
             logits[q][k] = (float)(prior_scale * prior + gate * joint);
         }

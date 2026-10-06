@@ -1,7 +1,7 @@
 /* clef-server: Jev/SystemOne-compatible HTTP endpoint.
  *
  *   clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] [--batch-tokens 4096]
- *               [--max-body 8388608] [--max-conn 256]
+ *               [--max-body 8388608] [--max-conn 256] [--no-keep-warm] [--prefix-cache-mb 0]
  *
  *   POST /v1/systemone   SystemOne request body -> SystemOne response body
  *   GET  /health         {"status":"ok","model":...}
@@ -19,6 +19,15 @@
  * reference exactly, including that injection (README, Security notes).
  * Over-long state is rejected by default (HTTP 400 with token counts); --truncate keeps the
  * reference behaviour of silently dropping the end of the state.
+ * Keep-warm (default; --no-keep-warm turns it off): while idle, the worker submits one-thread
+ * GPU passes over the weights and activation buffers every KEEP_WARM_MS. Without them, a request
+ * that arrives more than about a second after the previous one starts 205-290 ms late on the 27B
+ * (clef_gpu_keepalive). They only read model and activation buffers; their writes target a
+ * separate sink. See docs/performance-history.md (keep-warm) for measurements and limitations.
+ * Prefix cache (--prefix-cache-mb N, default off): a request with the header
+ * X-Clef-Prefix-Cache: KEY reuses the backbone state of the tokens it shares with the previous
+ * request under that key, and its answer is bitwise the uncached one. The key is the isolation
+ * boundary, because a hit is visible in the latency (see the cache table below).
  */
 
 #include <arpa/inet.h>
@@ -42,10 +51,15 @@
 
 #define MAX_HEADER 16384
 #define IO_TIMEOUT_S 30
+#define KEEP_WARM_MS 500   /* keep-warm idle period; the idle start delay appears between 1 and 1.5 s on the 27B */
+
+#define CACHE_KEY_MAX 64
+#define CACHE_ENTRIES 32
 
 typedef struct job {
     clef_record rec;
     const jval *req;
+    char cache_key[CACHE_KEY_MAX + 1];   /* X-Clef-Prefix-Cache; "" = none */
     float **probs;           /* filled by the worker */
     char err[256];
     bool ok, done;
@@ -63,6 +77,9 @@ static struct {
     size_t max_body;
     int max_conn;
     double io_timeout;       /* seconds; request deadline and per-write timeout (IO_TIMEOUT_S) */
+    int keep_warm_ms;        /* idle period between keep-warm GPU passes (KEEP_WARM_MS); 0 = off (--no-keep-warm) */
+    size_t cache_bytes;      /* prefix cache budget (--prefix-cache-mb); 0 = off, the header is ignored */
+    bool template_cache;     /* --template-cache: single unkeyed requests reuse the template tokens' state */
     atomic_int conns;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -78,14 +95,117 @@ static double now_ms(void) {
 
 /* ---- GPU worker -------------------------------------------------------------- */
 
+/* Prefix cache (clef_run_prefix). One entry per client-chosen key, used only by the worker thread.
+ * A request names its entry with the X-Clef-Prefix-Cache header and runs alone through it. The
+ * key is the isolation boundary: whether a request hits an entry shows in its latency, so two
+ * parties that must not learn about each other's states must not share a key. The deployment in
+ * front of this server assigns keys (per tenant, per conversation); the server never shares an
+ * entry across keys and never uses one for a request without the header. Entries are dropped
+ * least recently used first when their GPU memory exceeds the budget. */
+static struct { char key[CACHE_KEY_MAX + 1]; clef_prefix *p; double used; } cache[CACHE_ENTRIES];
+
+static size_t cache_total(void) {
+    size_t n = 0;
+    for (int i = 0; i < CACHE_ENTRIES; i++) if (cache[i].p) n += clef_prefix_bytes(cache[i].p);
+    return n;
+}
+
+static void cache_drop(int i, const char *why) {
+    fprintf(stderr, "clef-server: prefix cache: dropped an entry of %.0f MB (%s)\n", clef_prefix_bytes(cache[i].p) / 1e6, why);
+    clef_prefix_free(cache[i].p);
+    cache[i].p = NULL;
+    cache[i].key[0] = '\0';
+}
+
+/* The entry for `key`, created empty if needed (evicting the least recently used when the table
+ * is full). -1 if it cannot be allocated: the caller then serves the request uncached. */
+static int cache_slot(const char *key) {
+    int free_slot = -1, lru = -1;
+    for (int i = 0; i < CACHE_ENTRIES; i++) {
+        if (cache[i].p && !strcmp(cache[i].key, key)) return i;
+        if (!cache[i].p) { if (free_slot < 0) free_slot = i; }
+        else if (lru < 0 || cache[i].used < cache[lru].used) lru = i;
+    }
+    if (free_slot < 0) { cache_drop(lru, "table full"); free_slot = lru; }
+    if (!(cache[free_slot].p = clef_prefix_new())) return -1;
+    snprintf(cache[free_slot].key, sizeof(cache[free_slot].key), "%s", key);
+    return free_slot;
+}
+
+/* Template reuse (clef_run_template): one entry for the 32 tokens every request starts with. It
+ * reuses only the fixed public prompt, so it needs no key. Its scratch suffix rows are
+ * request-dependent and overwritten before use; this entry is extra to the keyed budget.
+ * A failed pass falls back to the plain path like a keyed one. */
+static clef_prefix *template_entry;
+
+static bool run_template(job *j, float ****probs, char *err, size_t errlen) {
+    if (!template_entry && !(template_entry = clef_prefix_new())) {
+        fprintf(stderr, "clef-server: template cache: cannot allocate an entry, serving uncached\n");
+        return clef_run(S.e, &j->rec, 1, probs, err, errlen);
+    }
+    if (clef_run_template(S.e, template_entry, &j->rec, probs, false, NULL, err, errlen)) return true;
+    fprintf(stderr, "clef-server: template cache: %s; serving uncached\n", err);
+    clef_prefix_free(template_entry);
+    template_entry = NULL;
+    return clef_run(S.e, &j->rec, 1, probs, err, errlen);
+}
+
+/* A failed cached pass is recomputed uncached and its entry is dropped. */
+static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
+    const int i = cache_slot(j->cache_key);
+    if (i < 0) {
+        fprintf(stderr, "clef-server: prefix cache: cannot allocate an entry, serving uncached\n");
+        return clef_run(S.e, &j->rec, 1, probs, err, errlen);
+    }
+    int reused = 0;
+    cache[i].used = now_ms();
+    bool ok = clef_run_prefix(S.e, cache[i].p, &j->rec, probs, false, &reused, err, errlen);
+    if (!ok) {
+        fprintf(stderr, "clef-server: prefix cache: %s; serving uncached\n", err);
+        cache_drop(i, "failed pass");
+        return clef_run(S.e, &j->rec, 1, probs, err, errlen);
+    }
+    fprintf(stderr, "clef-server: prefix cache: reused %d of %zu tokens\n", reused, j->rec.ids.len);
+    /* over budget: least recently used first; an entry larger than the whole budget goes too */
+    while (cache_total() > S.cache_bytes) {
+        int lru = -1;
+        for (int k = 0; k < CACHE_ENTRIES; k++)
+            if (cache[k].p && k != i && (lru < 0 || cache[k].used < cache[lru].used)) lru = k;
+        cache_drop(lru < 0 ? i : lru, "over budget");
+        if (lru < 0) break;
+    }
+    return true;
+}
+
 static void *worker(void *arg) {
     (void)arg;
     job **batch = calloc((size_t)S.batch, sizeof(*batch));
     clef_record *recs = calloc((size_t)S.batch, sizeof(*recs));
     if (!batch || !recs) { fprintf(stderr, "clef-server: out of memory\n"); exit(1); }
+    bool warned_keep_warm = false;
     for (;;) {
         pthread_mutex_lock(&S.mu);
-        while (!S.head) pthread_cond_wait(&S.cv, &S.mu);
+        while (!S.head) {
+            if (S.keep_warm_ms <= 0) { pthread_cond_wait(&S.cv, &S.mu); continue; }
+            /* Keep-warm: while idle, submit the keep-warm passes every keep_warm_ms so the next
+             * request does not start late (clef_gpu_keepalive). They run on this thread, so they
+             * never overlap a forward; a request that arrives meanwhile is seen by the re-check
+             * of S.head and waits at most for those one-thread passes. */
+            struct timespec rel = { S.keep_warm_ms / 1000, (long)(S.keep_warm_ms % 1000) * 1000000L };
+            if (pthread_cond_timedwait_relative_np(&S.cv, &S.mu, &rel) != ETIMEDOUT || S.head) continue;
+            pthread_mutex_unlock(&S.mu);
+            char kerr[256] = "";
+            bool warm = clef_keep_warm(S.e, kerr, sizeof(kerr));
+            // Cache buffers need their own idle touches; only the worker accesses this table.
+            for (int i = 0; warm && i < CACHE_ENTRIES; i++)
+                if (cache[i].p) warm = clef_prefix_keep_warm(S.e, cache[i].p, kerr, sizeof(kerr));
+            if (warm && template_entry) warm = clef_prefix_keep_warm(S.e, template_entry, kerr, sizeof(kerr));
+            if (!warm && !warned_keep_warm) {
+                fprintf(stderr, "clef-server: keep-warm pass failed: %s\n", kerr);   /* once: latency only */
+                warned_keep_warm = true;
+            }
+            pthread_mutex_lock(&S.mu);
+        }
         /* FIFO; take jobs from the head while the batch stays within the token budget. A
          * request larger than the budget runs alone, so small requests are never packed into
          * a long request's forward pass (review #2, I1). The head is always admitted, so
@@ -93,8 +213,10 @@ static void *worker(void *arg) {
          * preemption). */
         int n = 0;
         size_t toks = 0;
+        /* a request with a prefix cache key runs alone, through its entry */
+        const bool keyed = S.cache_bytes && S.head->cache_key[0];
         while (S.head && n < S.batch &&
-               (n == 0 || toks + S.head->rec.ids.len <= S.batch_tokens)) {
+               (n == 0 || (!keyed && !(S.cache_bytes && S.head->cache_key[0]) && toks + S.head->rec.ids.len <= S.batch_tokens))) {
             toks += S.head->rec.ids.len;
             batch[n++] = S.head;
             S.head = S.head->next;
@@ -106,7 +228,9 @@ static void *worker(void *arg) {
         float ***probs = NULL;
         char err[256] = "";   /* clef_run only writes it on failure */
         double t0 = now_ms();
-        bool ok = clef_run(S.e, recs, n, &probs, err, sizeof(err));
+        bool ok = keyed ? run_keyed(batch[0], &probs, err, sizeof(err))
+                : n == 1 && S.template_cache ? run_template(batch[0], &probs, err, sizeof(err))
+                : clef_run(S.e, recs, n, &probs, err, sizeof(err));
         fprintf(stderr, "clef-server: batch %d (%zu tokens) %.1f ms%s%s\n", n, toks, now_ms() - t0,
                 ok ? "" : " error: ", ok ? "" : err);
         for (int i = 0; i < n; i++) {
@@ -192,8 +316,10 @@ static bool read_deadline(int fd, double deadline) {
  * connection that includes waiting for it). */
 typedef struct { char *p; size_t len, cap; } rbuf;
 
-static int read_request(int fd, rbuf *in, char **method, char **path, char **body, size_t *body_len, bool *keep_alive) {
+static int read_request(int fd, rbuf *in, char **method, char **path, char **body, size_t *body_len, bool *keep_alive,
+                        char *cache_key) {
     const double deadline = now_s() + S.io_timeout;
+    cache_key[0] = '\0';
     size_t hdr_end = 0;
     for (;;) {
         char *e = in->len >= 4 ? memmem(in->p, in->len, "\r\n\r\n", 4) : NULL;
@@ -255,6 +381,16 @@ static int read_request(int fd, rbuf *in, char **method, char **path, char **bod
                 have_len = true;
             } else if (nl == 17 && !strncasecmp(h, "Transfer-Encoding", 17)) {
                 return 400;   /* chunked bodies are not supported; refuse rather than misframe */
+            } else if (nl == 19 && !strncasecmp(h, "X-Clef-Prefix-Cache", 19)) {
+                /* an opaque token; anything else is refused, not silently served uncached */
+                if (vl == 0 || vl > CACHE_KEY_MAX || cache_key[0]) return 400;
+                for (size_t i = 0; i < vl; i++) {
+                    const char ch = v[i];
+                    if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.'))
+                        return 400;
+                }
+                memcpy(cache_key, v, vl);
+                cache_key[vl] = '\0';
             } else if (nl == 10 && !strncasecmp(h, "Connection", 10)) {
                 if (vl == 5 && !strncasecmp(v, "close", 5)) *keep_alive = false;
                 if (vl == 10 && !strncasecmp(v, "keep-alive", 10)) *keep_alive = true;
@@ -284,7 +420,7 @@ static int read_request(int fd, rbuf *in, char **method, char **path, char **bod
     return 0;
 }
 
-static bool handle_systemone(int fd, const char *body, size_t len, bool keep_alive) {
+static bool handle_systemone(int fd, const char *body, size_t len, bool keep_alive, const char *cache_key) {
     char err[256];
     jarena *a = jarena_new();
     if (!a) { respond_error(fd, 500, "out of memory", false); return false; }
@@ -300,6 +436,7 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
         return sent;
     }
     j.req = req;
+    snprintf(j.cache_key, sizeof(j.cache_key), "%s", cache_key);
     pthread_mutex_init(&j.mu, NULL);
     pthread_cond_init(&j.cv, NULL);
     pthread_mutex_lock(&S.mu);
@@ -386,7 +523,8 @@ static void *connection(void *arg) {
         char *method, *path, *body;
         size_t body_len;
         bool keep_alive;
-        int st = read_request(fd, &in, &method, &path, &body, &body_len, &keep_alive);
+        char cache_key[CACHE_KEY_MAX + 1];
+        int st = read_request(fd, &in, &method, &path, &body, &body_len, &keep_alive, cache_key);
         if (st < 0) break;
         if (st > 0) {
             respond_error(fd, st, st == 413 ? "request body too large" : st == 431 ? "headers too large"
@@ -398,7 +536,7 @@ static void *connection(void *arg) {
         bool sent;
         if (!strcmp(path, "/v1/systemone")) {
             if (strcmp(method, "POST")) sent = respond_error(fd, 405, "use POST", keep_alive);
-            else sent = handle_systemone(fd, body, body_len, keep_alive);
+            else sent = handle_systemone(fd, body, body_len, keep_alive, cache_key);
         } else if (!strcmp(path, "/health")) {
             jbuf b = {0};
             jbuf_puts(&b, "{\"status\":\"ok\",\"model\":");
@@ -431,6 +569,7 @@ int main(int argc, char **argv) {
     S.max_body = 8u << 20;
     S.max_conn = 256;
     S.io_timeout = IO_TIMEOUT_S;
+    S.keep_warm_ms = KEEP_WARM_MS;
     /* test hook (tests/test_server_slow.py): a short deadline instead of 30 s */
     if (getenv("CLEF_DEBUG_IO_TIMEOUT")) S.io_timeout = atof(getenv("CLEF_DEBUG_IO_TIMEOUT"));
     if (!(S.io_timeout > 0)) S.io_timeout = IO_TIMEOUT_S;
@@ -443,14 +582,21 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-strict")) S.strict = false;
         else if (!strcmp(argv[i], "--truncate")) S.truncate = true;
         else if (!strcmp(argv[i], "--no-warmup")) do_warmup = false;
+        else if (!strcmp(argv[i], "--keep-warm")) S.keep_warm_ms = KEEP_WARM_MS;   /* the default, accepted explicitly */
+        else if (!strcmp(argv[i], "--no-keep-warm")) S.keep_warm_ms = 0;
         else if (!strcmp(argv[i], "--batch-tokens") && i + 1 < argc) S.batch_tokens = (size_t)strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--prefix-cache-mb") && i + 1 < argc) S.cache_bytes = (size_t)strtoull(argv[++i], NULL, 10) << 20;
+        else if (!strcmp(argv[i], "--template-cache")) S.template_cache = true;
         else if (!strcmp(argv[i], "--max-conn") && i + 1 < argc) S.max_conn = atoi(argv[++i]);
         else {
             fprintf(stderr, "usage: clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] "
-                            "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--max-body BYTES] [--max-conn N]\n");
+                            "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N]\n");
             return 2;
         }
     }
+    /* experiment hook: another keep-warm period in ms (0 turns it off) */
+    if (getenv("CLEF_DEBUG_KEEPWARM_MS")) S.keep_warm_ms = atoi(getenv("CLEF_DEBUG_KEEPWARM_MS"));
+    if (S.keep_warm_ms < 0) S.keep_warm_ms = 0;
     if (!model || S.batch < 1 || port <= 0 || port > 65535 || S.max_conn < 1) { fprintf(stderr, "clef-server: bad arguments\n"); return 2; }
     signal(SIGPIPE, SIG_IGN);
 
@@ -478,6 +624,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "clef-server: %s on http://%s:%d (batch %d, %s)\n", model, host, port, S.batch,
             S.strict ? "strict: content cannot emit control tokens" : "no-strict: reference tokenization, injectable");
     fprintf(stderr, "clef-server: over-long state is %s\n", S.truncate ? "truncated silently (reference behaviour)" : "rejected");
+    if (S.keep_warm_ms) fprintf(stderr, "clef-server: keep-warm pass every %d ms while idle\n", S.keep_warm_ms);
+    else fprintf(stderr, "clef-server: keep-warm off\n");
+    if (S.cache_bytes) fprintf(stderr, "clef-server: prefix cache of %zu MB for requests with X-Clef-Prefix-Cache\n", S.cache_bytes >> 20);
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);

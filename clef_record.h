@@ -27,6 +27,7 @@ typedef struct {
 
 typedef struct {
     clef_tokens ids;
+    int32_t schema_start;    /* tokens before the schema: template prefix and state */
     clef_question *q;
     int nq;
     int q_alloc;             /* allocated question slots (freed even if encoding stopped early) */

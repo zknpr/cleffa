@@ -5,6 +5,7 @@ The HTTP arm starts its own localhost server and stops it before exiting.
 
 import http.client
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -19,6 +20,41 @@ REQUEST = {"model": "clef", "state": "test", "questions": {"q": {"type": "noul"}
 
 
 class CliErrors(unittest.TestCase):
+    def test_template_flags_are_rejected_before_model_open(self):
+        for flags in (["--prefix-cache", "--template-cache"],
+                      ["--template-cache", "--prefix-cache"],
+                      ["--template-cache", "--batch", "2"],
+                      ["--template-cache", "--dump", "/unused"]):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", "/nonexistent", *flags],
+                                   text=True, capture_output=True, timeout=10)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("--template-cache", p.stderr)
+                self.assertNotIn("cannot open", p.stderr)
+
+    def test_truncation_requires_explicit_opt_in(self):
+        request = {**REQUEST, "state": "alpha " * 20000}
+        # A failed first command buffer detects whether encoding reached inference,
+        # without spending GPU time on an input the default must reject intact.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+        env["CLEF_DEBUG_NIL_CMDBUF"] = "1"
+        for flags in ([], ["--no-truncate"], ["--truncate", "--no-truncate"]):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, "--time", *flags],
+                                   input=json.dumps(request) + "\n", text=True,
+                                   capture_output=True, timeout=60, env=env)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("the reference would silently drop the rest", json.loads(p.stdout)["error"])
+                self.assertNotIn("batch of", p.stderr)
+        for flags in (["--truncate"], ["--no-truncate", "--truncate"]):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, "--time", *flags],
+                                   input=json.dumps(request) + "\n", text=True,
+                                   capture_output=True, timeout=60, env=env)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("command buffer", json.loads(p.stdout)["error"])
+                self.assertIn("(16384 tokens)", p.stderr)
+
     def test_unwritable_stdout_is_an_error(self):
         # Small responses fail on fflush; the long model name also exercises a write
         # during printf. Both successful responses and validation errors must propagate it.
