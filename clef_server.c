@@ -174,12 +174,16 @@ static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
     }
     fprintf(stderr, "clef-server: prefix cache: reused %d of %zu tokens\n", reused, j->rec.ids.len);
     if (i < 0) {
-        if (clef_prefix_bytes(p) == 0) { clef_prefix_free(p); return true; }   /* bypassed: nothing to keep */
+        /* Nothing cached (bypassed) or more than the whole budget: the entry is never retained, so
+           it must not enter the table and displace another key's entry (reviews #15, #19). */
+        if (clef_prefix_bytes(p) > S.cache_bytes)
+            fprintf(stderr, "clef-server: prefix cache: dropped an entry of %.0f MB (larger than budget)\n", clef_prefix_bytes(p) / 1e6);
+        if (clef_prefix_bytes(p) == 0 || clef_prefix_bytes(p) > S.cache_bytes) { clef_prefix_free(p); return true; }
         i = cache_insert(j->cache_key, p);
     }
     cache[i].used = now_ms();
-    /* An entry larger than the whole budget can never be retained: drop it alone, before the
-       LRU pass below would evict every other key's entry on its behalf (review #6). */
+    /* An existing entry that grew past the whole budget can never be retained either: drop it
+       alone, before the LRU pass below would evict every other key's entry on its behalf (review #6). */
     if (clef_prefix_bytes(cache[i].p) > S.cache_bytes) {
         cache_drop(i, "larger than budget");
         return true;

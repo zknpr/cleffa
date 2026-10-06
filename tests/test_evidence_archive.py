@@ -18,6 +18,12 @@ FIXED_MTIME = 1_759_700_000  # every fixture file gets this mtime; the manifest 
 REPO = str(Path(__file__).resolve().parents[1])
 
 
+def safetensors(header: dict) -> bytes:
+    """Minimal safetensors container: 8-byte little-endian header length, JSON header, data."""
+    body = json.dumps(header).encode()
+    return len(body).to_bytes(8, 'little') + body + b'\0' * 16
+
+
 def make_tree(root: Path):
     exp = root / 'gemm-probe-20261004'
     (exp / 'engine').mkdir(parents=True)
@@ -35,7 +41,9 @@ def make_tree(root: Path):
     (exp / 'capture.trace' / 'data.bin').write_bytes(b'\0' * 8)
     (exp / 'gpu-values.xml').write_text('<x/>')
     (exp / 'latin.log').write_bytes(b'path /Volumes/scratch/x \xff\xfe not utf-8\n')
-    (exp / 'small.safetensors').write_bytes(b'\0' * 100)
+    (exp / 'small.safetensors').write_bytes(safetensors({'__metadata__': {'format': 'pt'}, 'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
+    (exp / 'leaky.safetensors').write_bytes(safetensors({'__metadata__': {'source': f'{HOME}/run/x.pt'}, 'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
+    (exp / 'broken.safetensors').write_bytes(b'\0' * 100)   # not a safetensors header
     (exp / 'big.safetensors').write_bytes(b'\0' * (ea.SMALL_TENSOR + 1))
     art = root / 'article-batch-20261005'
     art.mkdir()
@@ -47,7 +55,7 @@ def make_tree(root: Path):
     oracle = root / 'clef-flash-f32'
     (oracle / 'layers').mkdir(parents=True)
     (oracle / 'layers' / '0.safetensors').write_bytes(b'\0' * 10)
-    (oracle / 'logits.safetensors').write_bytes(b'\0' * 10)
+    (oracle / 'logits.safetensors').write_bytes(safetensors({'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (oracle / 'requests.jsonl').write_text('{"id":"r000"}\n')
     (oracle / 'latency.json').write_text('{}')
     (root / 'engine_logits.jsonl').write_text('{}\n')
@@ -107,6 +115,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/private-customer/requests.jsonl', names)  # private ancestor
         self.assertNotIn('customer-private/requests.jsonl', names)  # private undated directory
         self.assertNotIn('engine_logits-private.jsonl', names)  # private top-level file, ahead of the allowlist
+        self.assertNotIn('gemm-probe-20261004/leaky.safetensors', names)  # forbidden string in the safetensors header
+        self.assertNotIn('gemm-probe-20261004/broken.safetensors', names)  # unparseable safetensors header
         self.assertIn('undecodable text', manifest['excluded_counts'])
         for reason in ('binary', 'private-named path', 'forbidden content', 'private workload directory',
                        'upstream clone', 'trace or dSYM bundle', 'tensor size', 'oracle directory'):
@@ -146,6 +156,17 @@ class EvidenceArchive(unittest.TestCase):
         # tree, not the wall clock.
         self.assertEqual(hashlib.sha256(a.read_bytes()).hexdigest(), hashlib.sha256(b.read_bytes()).hexdigest())
         self.assertEqual(ma['built'], datetime.datetime.fromtimestamp(FIXED_MTIME, datetime.timezone.utc).isoformat())
+
+    def test_default_label_from_tree(self):
+        a = Path(self.tmp.name) / 'd1.tar.gz'
+        b = Path(self.tmp.name) / 'd2.tar.gz'
+        ma = ea.build(self.root, a, None)
+        ea.build(self.root, b, None)
+        day = datetime.datetime.fromtimestamp(FIXED_MTIME, datetime.timezone.utc).date().isoformat()
+        self.assertEqual(ma['label'], f'cleffa-evidence-{day}')
+        self.assertEqual(hashlib.sha256(a.read_bytes()).hexdigest(), hashlib.sha256(b.read_bytes()).hexdigest())
+        with tarfile.open(a) as tar:
+            self.assertTrue(all(m.name.startswith(f'cleffa-evidence-{day}/') for m in tar.getmembers()))
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

@@ -11,7 +11,8 @@ checkable, under rules that are deliberately conservative:
 Included
   - result, manifest, sample and log files (.json, .jsonl, .log, .txt, .md, .csv, .patch, ...)
   - experiment sources (.py, .m, .metal, .c, .h, .sh, Makefile)
-  - .safetensors files up to SMALL_TENSOR bytes (saved logits; never layer dumps)
+  - .safetensors files up to SMALL_TENSOR bytes (saved logits; never layer dumps), after their
+    JSON header, the only place such a file carries strings, passes the FORBIDDEN scan
   - for the oracle directories (no date suffix): requests.jsonl, encoded.jsonl,
     logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump
 Excluded
@@ -29,8 +30,8 @@ Rewritten (text files only, recorded per file in the manifest)
   - the Cloudflare account name becomes <cf-account>
 
 The archive is deterministic for a given tree: sorted entries, source mtimes, a manifest
-timestamp taken from the newest source file, no owner names, gzip header without a
-timestamp, and a label restricted to one safe path component. It refuses to overwrite an existing output. A final
+timestamp and default label taken from the newest source file, no owner names, gzip header
+without a timestamp, and a label restricted to one safe path component. It refuses to overwrite an existing output. A final
 scan over every archived text file fails the build if a FORBIDDEN pattern survives, so the
 rewrite rules are checked rather than trusted.
 """
@@ -135,10 +136,33 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     return True, 'included'
 
 
+def safetensors_header(raw: bytes) -> str | None:
+    """The JSON header of a safetensors file as text, or None if the container is malformed.
+    The header is the only place such a file can carry strings (tensor names, dtypes,
+    `__metadata__`), so it is what the forbidden-pattern scan reads."""
+    if len(raw) < 8:
+        return None
+    n = int.from_bytes(raw[:8], 'little')
+    if n == 0 or 8 + n > len(raw):
+        return None
+    try:
+        text = raw[8:8 + n].decode('utf-8')
+        if not isinstance(json.loads(text), dict):
+            return None
+    except (UnicodeDecodeError, ValueError):
+        return None
+    return text
+
+
 def prepare(path: Path) -> tuple[bytes | None, bool, str]:
     """Return (archived bytes, rewritten?, reason). None means exclude."""
     raw = path.read_bytes()
     if path.suffix == '.safetensors':
+        header = safetensors_header(raw)
+        if header is None:
+            return None, False, 'malformed safetensors'
+        if FORBIDDEN.search(header):
+            return None, False, 'forbidden content'
         return raw, False, 'included'
     try:
         text = raw.decode('utf-8')
@@ -175,10 +199,10 @@ def collect(golden: Path):
 LABEL = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
 
 
-def build(golden: Path, out: Path, label: str) -> dict:
-    # The label is every member's leading path component; keep it a single safe name so
-    # an extractor that honours '..' or '/' cannot be steered outside its directory.
-    if not LABEL.match(label) or '..' in label:
+def build(golden: Path, out: Path, label: str | None) -> dict:
+    if label is not None and (not LABEL.match(label) or '..' in label):
+        # The label is every member's leading path component; keep it a single safe name so
+        # an extractor that honours '..' or '/' cannot be steered outside its directory.
         raise SystemExit(f'label {label!r} must be a single path component [A-Za-z0-9._-]')
     if out.exists():
         raise SystemExit(f'{out} exists; evidence archives are never overwritten')
@@ -191,6 +215,10 @@ def build(golden: Path, out: Path, label: str) -> dict:
             'source_bytes': st.st_size, 'source_sha256': hashlib.sha256(path.read_bytes()).hexdigest(),
             'rewritten': rewritten, 'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
         })
+    if label is None:
+        # Derived from the tree, like the manifest timestamp, so the default stays reproducible.
+        newest = max((e['mtime'] for e in entries), default='1970-01-01T00:00:00+00:00')
+        label = f'cleffa-evidence-{newest[:10]}'
     manifest = {
         'label': label,
         # Derived from the tree, not the wall clock, so rebuilding the same tree gives the same bytes.
@@ -204,7 +232,8 @@ def build(golden: Path, out: Path, label: str) -> dict:
                            excluded=json.dumps(manifest['excluded_counts'], indent=2))
     # Final control: the archived bytes must not contain any forbidden pattern.
     for rel, path, data, _ in included:
-        if path.suffix != '.safetensors' and FORBIDDEN.search(data.decode('utf-8', 'replace')):
+        text = safetensors_header(data) if path.suffix == '.safetensors' else data.decode('utf-8', 'replace')
+        if text is None or FORBIDDEN.search(text):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, 'wb') as fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
@@ -255,13 +284,13 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=(__doc__ or '').split('\n')[0])
     ap.add_argument('out', type=Path, help='output .tar.gz (must not exist)')
     ap.add_argument('--golden', type=Path, default=Path(__file__).resolve().parent.parent / 'golden')
-    ap.add_argument('--label', default=None, help='top-level directory name inside the archive')
+    ap.add_argument('--label', default=None,
+                    help='top-level directory name inside the archive; default cleffa-evidence-<date of the newest included file>')
     ap.add_argument('--list', action='store_true', help='print the selection and exit without writing')
     args = ap.parse_args(argv)
     golden = args.golden.resolve()
     if not golden.is_dir():
         raise SystemExit(f'{golden} is not a directory')
-    label = args.label or f'cleffa-evidence-{datetime.date.today().isoformat()}'
     if args.list:
         included, excluded = collect(golden)
         total = sum(len(d) for _, _, d, _ in included)
@@ -272,7 +301,7 @@ def main(argv=None) -> int:
         for reason, n in sorted(excluded.items()):
             print(f'  excluded {n:6d}  {reason}', file=sys.stderr)
         return 0
-    manifest = build(golden, args.out, label)
+    manifest = build(golden, args.out, args.label)
     total = sum(e['bytes'] for e in manifest['files'])
     print(f'{args.out}: {len(manifest["files"])} files, {total/1e6:.1f} MB uncompressed, '
           f'{args.out.stat().st_size/1e6:.1f} MB compressed, sha256 '
