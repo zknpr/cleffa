@@ -198,8 +198,11 @@ class EvidenceArchive(unittest.TestCase):
         for name in ('root.safetensors', 'varroot.safetensors', 'thishome.safetensors'):
             self.assertNotIn(f'gemm-probe-20261004/{name}', names)  # home paths outside /Users and /home
         self.assertIn('undecodable text', manifest['excluded_counts'])
-        for reason in ('binary', 'private-named path', 'forbidden content', 'private workload directory',
-                       'upstream clone', 'trace or dSYM bundle', 'tensor size', 'oracle directory'):
+        for reason in ('binary', 'private-named path', 'forbidden content', 'tensor size',
+                       # subtrees excluded by their path are pruned whole, so they count as directories
+                       'private workload directory (directories)', 'upstream clone (directories)',
+                       'trace or dSYM bundle (directories)', 'oracle directory (directories)',
+                       'unrecognized directory (directories)', 'private-named path (directories)'):
             self.assertIn(reason, ex, reason)
 
     def test_refuses_to_overwrite(self):
@@ -340,6 +343,59 @@ class EvidenceArchive(unittest.TestCase):
             ea.MAX_TEXT = big
         self.assertNotIn('gemm-probe-20261004/grown.log', {e['path'] for e in manifest['files']})
         self.assertIn('oversized text', manifest['excluded_counts'])
+
+    def test_symlink_swapped_in_after_classification_is_refused(self):
+        # classify() rejects a symlink by name, but the name can be replaced by a link between
+        # that check and the open. The read must not follow it: the target here is a raw,
+        # unlabelled token that no FORBIDDEN pattern would catch.
+        from unittest.mock import patch
+        secret = Path(self.tmp.name) / 'jev.api'
+        secret.write_text('k9f3q8z1x7v2b6n4m0c5l8p3w1e9r7t2\n')
+        target = self.root / 'gemm-probe-20261004' / 'swap.log'
+        target.write_text('benign\n')
+        real = ea.classify
+
+        def swap_after(golden, path):
+            verdict = real(golden, path)
+            if path == target:
+                path.unlink()
+                path.symlink_to(secret)
+            return verdict
+        with patch.object(ea, 'classify', swap_after), self.assertRaises(SystemExit):
+            ea.build(self.root, Path(self.tmp.name) / 'swap.tar.gz', 'ev')
+        with self.assertRaises(SystemExit):
+            ea.read_snapshot(target, ea.MAX_TEXT)   # a link is refused by the read on its own
+
+    def test_unreadable_directory_fails_the_build(self):
+        # os.walk() skips a directory it cannot list unless told otherwise, and an archive that
+        # is complete by appearance only is worse than none. A directory excluded by its path
+        # is pruned before it is listed, so it may be unreadable.
+        if os.geteuid() == 0:
+            self.skipTest('root can list every directory')
+        locked = self.root / 'gemm-probe-20261004' / 'locked'
+        locked.mkdir()
+        (locked / 'result.json').write_text('{}')
+        pruned = self.root / 'gemm-probe-20261004' / 'private-locked'
+        pruned.mkdir()
+        (pruned / 'x.json').write_text('{}')
+        try:
+            pruned.chmod(0)
+            manifest = ea.build(self.root, Path(self.tmp.name) / 'pruned.tar.gz', 'ev')
+            self.assertNotIn('gemm-probe-20261004/private-locked/x.json', {e['path'] for e in manifest['files']})
+            self.assertIn('gemm-probe-20261004/locked/result.json', {e['path'] for e in manifest['files']})
+            locked.chmod(0)
+            with self.assertRaisesRegex(SystemExit, 'locked'):
+                ea.build(self.root, Path(self.tmp.name) / 'locked.tar.gz', 'ev')
+        finally:
+            locked.chmod(0o700)
+            pruned.chmod(0o700)
+
+    def test_aggregate_size_is_bounded(self):
+        # Every included payload is held until the tar is written, and the per-file limit alone
+        # does not bound that; the build fails explicitly instead of exhausting memory.
+        from unittest.mock import patch
+        with patch.object(ea, 'MAX_TOTAL', 64), self.assertRaisesRegex(SystemExit, 'MAX_TOTAL'):
+            ea.build(self.root, Path(self.tmp.name) / 'total.tar.gz', 'ev')
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

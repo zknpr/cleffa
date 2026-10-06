@@ -43,7 +43,11 @@ scan over every archived text file fails the build if a FORBIDDEN pattern surviv
 rewrite rules are checked rather than trusted. JSON text (documents, JSONL lines and
 safetensors headers) is scanned both as written and as decoded strings, since an escaped
 form such as \u002f survives a textual match and json.loads reassembles it. Text files may not contain a NUL byte
-anywhere, which is what UTF-16 text would need to hide in them.
+anywhere, which is what UTF-16 text would need to hide in them. Files are opened without
+following symlinks and must still be the regular file the path named once read; a directory
+the walk cannot list fails the build unless its path excludes it, in which case it is pruned
+unread; and the included payloads, held in memory until the archive is written, are bounded
+by MAX_TOTAL in total.
 """
 from __future__ import annotations
 
@@ -55,12 +59,17 @@ import io
 import json
 import os
 import re
+import stat
 import sys
 import tarfile
 from pathlib import Path
 
 SMALL_TENSOR = 2 * 1024 * 1024
 MAX_TEXT = 64 * 1024 * 1024
+# Included payloads stay in memory until the archive is written; the per-file limits do not
+# bound that sum, so the build fails explicitly past this total instead of exhausting memory
+# (review #57). The 2026-10-06 tree is 63 MB uncompressed.
+MAX_TOTAL = 1024 * 1024 * 1024
 
 TEXT_EXT = {'.json', '.jsonl', '.log', '.txt', '.md', '.csv', '.patch', '.diff', '.yaml', '.yml',
             '.toml', '.py', '.m', '.metal', '.c', '.h', '.sh', '.mk', '.cfg'}
@@ -110,32 +119,54 @@ def is_text(path: Path) -> bool:
     return raw[:4] not in MACHO and b'\0' not in raw
 
 
-def classify(golden: Path, path: Path) -> tuple[bool, str]:
-    """(include?, reason). Reasons are stable strings used for the --list summary."""
+def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
+    """The exclusion reason the relative path alone decides, for a file or for a directory. The
+    walk prunes a directory with a reason before listing it, so an excluded subtree is never
+    read and need not be readable (review #56); every file below it would get the same reason."""
     rel = path.relative_to(golden)
     parts = rel.parts
     top = parts[0]
+    ancestors = parts if directory else parts[:-1]   # a directory is itself a bundle or workload
     if path.is_symlink():
-        return False, 'symlink'
+        return 'symlink'
     # Before any allowlist: "private" anywhere in the relative path excludes the file, and so
     # does a forbidden pattern in the path itself, which becomes a tar member name.
     if any('private' in part.lower() for part in parts):
-        return False, 'private-named path'
+        return 'private-named path'
     if any(part.startswith('.') for part in parts):
-        return False, 'dotfile'   # .env, .gitignore, editor state: never evidence
+        return 'dotfile'   # .env, .gitignore, editor state: never evidence
     if FORBIDDEN.search(rel.as_posix()):
-        return False, 'forbidden path'
+        return 'forbidden path'
     if any(p in EXCLUDE_DIR_PARTS for p in parts):
-        return False, 'clone or environment'
-    if any(p.endswith('.trace') or p.endswith('.dSYM') for p in parts[:-1]):
-        return False, 'trace or dSYM bundle'
+        return 'clone or environment'
+    if any(p.endswith('.trace') or p.endswith('.dSYM') for p in ancestors):
+        return 'trace or dSYM bundle'
+    if any(part.startswith('article-') for part in ancestors):
+        return 'private workload directory'
+    if top.startswith('ds4-') and len(ancestors) >= 2 and parts[1] == 'source':
+        return 'upstream clone'
+    if ancestors and not EXPERIMENT.match(top):
+        # Only the oracle directories ref/oracle.py writes, and of those the small files, never
+        # layers/ or dumps (size-checked in classify). Any other undated directory is not evidence.
+        if not ORACLE_DIR.match(top):
+            return 'unrecognized directory'
+        if directory:
+            if len(parts) >= 2:   # layers/ and any other subdirectory; the oracle dir itself is walked
+                return 'oracle directory'
+        elif not (len(parts) == 2 and path.name in ORACLE_FILES):
+            return 'oracle directory'
+    return None
+
+
+def classify(golden: Path, path: Path) -> tuple[bool, str]:
+    """(include?, reason). Reasons are stable strings used for the --list summary."""
+    parts = path.relative_to(golden).parts
+    reason = path_reason(golden, path, directory=False)
+    if reason is not None:
+        return False, reason
     if len(parts) == 1 and not (path.suffix == '.jsonl' and path.name.startswith('engine_logits')):
         # Top-level files: only the engine outputs the parity tests write (size-checked below).
         return False, 'top-level file'
-    if any(part.startswith('article-') for part in parts[:-1]):
-        return False, 'private workload directory'
-    if top.startswith('ds4-') and len(parts) > 2 and parts[1] == 'source':
-        return False, 'upstream clone'
     if path.name.startswith('cleffa-evidence-'):
         return False, 'archive output'
     if THIRD_PARTY_DOC.match(path.name):
@@ -144,13 +175,6 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'account bookkeeping'
     if AGENT_STATE.match(path.name):
         return False, 'agent checkpoint'
-    if len(parts) > 1 and not EXPERIMENT.match(top):
-        # Only the oracle directories ref/oracle.py writes, and of those the small files, never
-        # layers/ or dumps (size-checked below). Any other undated directory is not evidence.
-        if not ORACLE_DIR.match(top):
-            return False, 'unrecognized directory'
-        if not (len(parts) == 2 and path.name in ORACLE_FILES):
-            return False, 'oracle directory'
     ext = path.suffix.lower()
     if ext in EXCLUDE_EXT:
         return False, f'excluded extension {ext}'
@@ -318,11 +342,22 @@ def read_snapshot(path: Path, limit: int) -> tuple[bytes | None, os.stat_result]
     differ between the stat before and the stat after the read is being changed, and the build
     stops rather than describe a snapshot that never existed (review #50). A file longer than
     `limit` by the time it is read returns None: the stat-time size check does not bind the
-    bytes actually read (review #54)."""
-    with open(path, 'rb') as fh:
+    bytes actually read (review #54). The open does not follow a symlink, the descriptor must
+    be a regular file, and the path must still name that inode after the read: classify()
+    rejected links by name, and the name can be replaced by one in between (review #55)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:   # ELOOP for a link; a vanished or unreadable file is an error too
+        raise SystemExit(f'{path}: cannot open: {e.strerror}')
+    with os.fdopen(fd, 'rb') as fh:
         before = os.fstat(fh.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise SystemExit(f'{path} is not a regular file')
         raw = fh.read(limit + 1)   # never more than the limit allows into memory
         after = os.fstat(fh.fileno())
+    named = os.lstat(path)
+    if (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino):
+        raise SystemExit(f'{path} was replaced while it was being archived')
     if len(raw) > limit:
         return None, before
     same = (before.st_size, before.st_ino, before.st_dev, before.st_mtime_ns) == (after.st_size, after.st_ino, after.st_dev, after.st_mtime_ns)
@@ -331,10 +366,22 @@ def read_snapshot(path: Path, limit: int) -> tuple[bytes | None, os.stat_result]
     return raw, before
 
 
+def walk_error(error: OSError):
+    # os.walk() would otherwise skip the directory and the archive would be complete by
+    # appearance only (review #56).
+    raise SystemExit(f'{error.filename}: cannot scan: {error.strerror}')
+
+
 def collect(golden: Path):
     included, excluded = [], {}
-    for dirpath, dirnames, filenames in os.walk(golden):
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(golden, onerror=walk_error):
         dirnames.sort()
+        for name in list(dirnames):
+            reason = path_reason(golden, Path(dirpath) / name, directory=True)
+            if reason is not None:
+                dirnames.remove(name)
+                excluded[f'{reason} (directories)'] = excluded.get(f'{reason} (directories)', 0) + 1
         for name in sorted(filenames):
             path = Path(dirpath) / name
             ok, reason = classify(golden, path)
@@ -356,6 +403,9 @@ def collect(golden: Path):
             source = {'source_bytes': len(raw), 'source_sha256': hashlib.sha256(raw).hexdigest(),
                       'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
                       'mtime_s': st.st_mtime}
+            total += len(data)
+            if total > MAX_TOTAL:
+                raise SystemExit(f'included evidence exceeds MAX_TOTAL ({MAX_TOTAL} bytes) at {path}')
             included.append((path.relative_to(golden).as_posix(), path, data, rewritten, source))
     return included, excluded
 
@@ -443,7 +493,7 @@ ContractNLI dataset archive (its commit hash is in `contractnli-*/source.json`; 
 CC BY 4.0, Koreeda and Manning, Findings of EMNLP 2021), Cloudflare account and usage dumps,
 and every file from the private article-classification workload.
 
-Excluded file counts by reason:
+Excluded counts by reason (files, or whole directories pruned before being listed):
 
 ```
 {excluded}
