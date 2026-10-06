@@ -407,7 +407,8 @@ hit can therefore cross a GEMM performance boundary despite retaining exact logi
 An entry binds to a monotonic engine instance ID before model-dependent storage
 is allocated. It cannot be used by another engine, including a new one allocated
 at a recycled address. A failed or overflowing cached pass invalidates the
-checkpoints; FP16 overflow returns the ordinary full BF16 fallback. Cache hits retain
+checkpoints; FP16 overflow returns the ordinary full BF16 fallback, and the server drops such an
+entry instead of retaining its buffers or inserting it (`clef_prefix_usable`). Cache hits retain
 the full context and the arithmetic of their engine's uncached attention mode.
 
 The server's `--prefix-cache-mb N` defaults to zero. Its worker alone owns the

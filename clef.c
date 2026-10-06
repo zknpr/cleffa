@@ -332,6 +332,8 @@ void clef_prefix_free(clef_prefix *p) {
 }
 
 size_t clef_prefix_bytes(const clef_prefix *p) { return p ? clef_gpu_prefix_bytes(p->gpu) : 0; }
+/* False after a failed or overflowing pass: the buffers may be allocated, but len is 0. */
+bool clef_prefix_usable(const clef_prefix *p) { return p && p->len > 0; }
 
 static bool prefix_owner_ok(const clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
     if (!e || !p || !e->instance_id) {

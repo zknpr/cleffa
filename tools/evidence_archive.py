@@ -20,7 +20,8 @@ Included
 Excluded
   - Mach-O binaries, objects, dSYMs, .inc, Instruments .trace bundles and their exported
     counter tables (.xml, .npz), .bin/.npy tensors, archives, PDFs, .git clones, virtualenvs
-  - the ds4 upstream `source/` tree, every `article-*` directory (private workload), and the
+  - the ds4 upstream `source/` tree, every `article-*` directory at any depth (private
+    workload), any path that itself matches a FORBIDDEN pattern, and the
     text extracts of Apple's Metal Shading Language specification
   - every other undated directory, Cloudflare subscription and usage dumps (`subscriptions.json`,
     `usage-*.json`) and agents'
@@ -82,12 +83,12 @@ REWRITES = [
     (re.compile(r'Zknpr'), '<cf-account>'),
 ]
 # Anything matching after rewriting excludes the file, and a match in the final scan fails
-# the build. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
+# the build. Case-insensitive: bearer schemes and variable names vary in case. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
-                       r'squid|\.personal|pop_v22|account_id|'
+                       r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'Bearer [A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
-                       r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}')
+                       r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}', re.IGNORECASE)
 
 
 def is_text(path: Path) -> bool:
@@ -107,9 +108,12 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     top = parts[0]
     if path.is_symlink():
         return False, 'symlink'
-    # Before any allowlist: "private" anywhere in the relative path excludes the file.
+    # Before any allowlist: "private" anywhere in the relative path excludes the file, and so
+    # does a forbidden pattern in the path itself, which becomes a tar member name.
     if any('private' in part.lower() for part in parts):
         return False, 'private-named path'
+    if FORBIDDEN.search(rel.as_posix()):
+        return False, 'forbidden path'
     if any(p in EXCLUDE_DIR_PARTS for p in parts):
         return False, 'clone or environment'
     if any(p.endswith('.trace') or p.endswith('.dSYM') for p in parts[:-1]):
@@ -117,7 +121,7 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     if len(parts) == 1 and not (path.suffix == '.jsonl' and path.name.startswith('engine_logits')):
         # Top-level files: only the engine outputs the parity tests write (size-checked below).
         return False, 'top-level file'
-    if top.startswith('article-'):
+    if any(part.startswith('article-') for part in parts[:-1]):
         return False, 'private workload directory'
     if top.startswith('ds4-') and len(parts) > 2 and parts[1] == 'source':
         return False, 'upstream clone'
@@ -313,6 +317,8 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
                            excluded=json.dumps(manifest['excluded_counts'], indent=2))
     # Final control: the archived bytes must not contain any forbidden pattern.
     for rel, path, data, _ in included:
+        if FORBIDDEN.search(rel):
+            raise SystemExit(f'forbidden pattern in the path {rel}')
         text = safetensors_header(data) if path.suffix == '.safetensors' else data.decode('utf-8', 'replace')
         if text is None or forbidden_in(text) or (path.suffix == '.safetensors' and not safetensors_payload_ok(data, text)):
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')

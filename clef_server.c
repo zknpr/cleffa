@@ -196,12 +196,20 @@ static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
     fprintf(stderr, "clef-server: prefix cache: reused %d of %zu tokens\n", reused, j->rec.ids.len);
     fprintf(stderr, "clef-server: prefix cache: projected %.0f MB, holds %.0f MB\n", projected / 1e6, clef_prefix_bytes(p) / 1e6);
     if (i < 0) {
-        /* Nothing cached (bypassed) or more than the whole budget: the entry is never retained, so
-           it must not enter the table and displace another key's entry (reviews #15, #19). */
-        if (clef_prefix_bytes(p) > S.cache_bytes)
+        /* An entry with no usable state (a bypassed request, or an FP16 overflow answered by the
+           BF16 rerun, which leaves allocated buffers and no checkpoint) or one larger than the
+           whole budget is never retained: it must not enter the table and displace another
+           key's entry (reviews #15, #19, #33). */
+        if (!clef_prefix_usable(p)) { clef_prefix_free(p); return true; }
+        if (clef_prefix_bytes(p) > S.cache_bytes) {
             fprintf(stderr, "clef-server: prefix cache: dropped an entry of %.0f MB (larger than budget)\n", clef_prefix_bytes(p) / 1e6);
-        if (clef_prefix_bytes(p) == 0 || clef_prefix_bytes(p) > S.cache_bytes) { clef_prefix_free(p); return true; }
+            clef_prefix_free(p);
+            return true;
+        }
         i = cache_insert(j->cache_key, p);
+    } else if (!clef_prefix_usable(p)) {
+        cache_drop(i, "no usable state after the pass");   /* an overflowing pass: the buffers would only cost budget */
+        return true;
     }
     cache[i].used = now_ms();
     /* An existing entry that grew past the whole budget can never be retained either: drop it

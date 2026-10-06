@@ -76,6 +76,7 @@ void clef_free_probs(const clef_record *recs, int n, float ***probs);
 clef_prefix *clef_prefix_new(void);
 void clef_prefix_free(clef_prefix *p);
 size_t clef_prefix_bytes(const clef_prefix *p);   /* GPU memory the entry holds */
+bool clef_prefix_usable(const clef_prefix *p);    /* holds state a matching record can resume from */
 /* GPU memory the entry would hold after clef_run_prefix on this record (an upper bound; 0 when the
  * pass would take the plain path), for a caller that enforces a budget before anything is allocated. */
 size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const clef_record *rec);

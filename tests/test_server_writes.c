@@ -24,12 +24,34 @@ static ssize_t test_write(int fd, const void *data, size_t size) {
  * enqueues a job, as a request arriving mid-round would. */
 #define clef_keep_warm test_keep_warm
 #define clef_prefix_keep_warm test_prefix_keep_warm
+/* Keyed-request mocks: the pass succeeds (an FP16 overflow is answered by the BF16 rerun) but
+ * leaves the entry with allocated buffers and no usable state. */
+#define clef_run_prefix test_run_prefix
+#define clef_run test_run
+#define clef_prefix_new test_prefix_new
+#define clef_prefix_free test_prefix_free
+#define clef_prefix_bytes test_prefix_bytes
+#define clef_prefix_usable test_prefix_usable
+#define clef_prefix_estimate test_prefix_estimate
 #define main clef_server_main
 #define write test_write
 #include "../clef_server.c"
 #undef write
 #undef main
 static int warm_calls;
+static char fresh[4];                /* the entry a new key gets */
+static int uncached_runs, freed_fresh;
+clef_prefix *test_prefix_new(void) { return (clef_prefix *)fresh; }
+void test_prefix_free(clef_prefix *p) { if (p == (clef_prefix *)fresh) freed_fresh++; }
+size_t test_prefix_bytes(const clef_prefix *p) { (void)p; return 100; }   /* buffers were allocated */
+bool test_prefix_usable(const clef_prefix *p) { return p != (clef_prefix *)fresh; }   /* the overflowing pass stored nothing */
+size_t test_prefix_estimate(const clef_engine *e, const clef_prefix *p, const clef_record *rec) { (void)e; (void)p; (void)rec; return 100; }
+bool test_run_prefix(clef_engine *e, clef_prefix *p, const clef_record *rec, float ****out, bool raw, int *reused, char *err, size_t errlen) {
+    (void)e; (void)p; (void)rec; (void)raw; (void)err; (void)errlen; if (reused) *reused = 0; *out = NULL; return true;
+}
+bool test_run(clef_engine *e, const clef_record *recs, int n, float ****probs, char *err, size_t errlen) {
+    (void)e; (void)recs; (void)n; (void)err; (void)errlen; uncached_runs++; *probs = NULL; return true;
+}
 static job arriving;
 bool test_keep_warm(clef_engine *e, char *err, size_t errlen) { (void)e; (void)err; (void)errlen; return true; }
 bool test_prefix_keep_warm(clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
@@ -90,5 +112,21 @@ int main(void) {
     template_entry = NULL;
     S.head = S.tail = NULL;
     printf("server keep-warm: an arriving request stops the idle round after one entry\n");
+
+    /* A full table of populated entries; a new key whose pass overflowed must not take a slot
+       (it would evict a populated entry for nothing), and an existing key's overflowing pass
+       must drop its now-useless buffers (review #33). */
+    static char populated[CACHE_ENTRIES];
+    for (int i = 0; i < CACHE_ENTRIES; i++) { cache[i].p = (clef_prefix *)(populated + i); snprintf(cache[i].key, sizeof(cache[i].key), "k%d", i); cache[i].used = i; }
+    S.cache_bytes = (size_t)CACHE_ENTRIES * 100 + 100;
+    job keyed = {0};
+    snprintf(keyed.cache_key, sizeof(keyed.cache_key), "new-key");
+    float ***probs = NULL;
+    assert(run_keyed(&keyed, &probs, kerr, sizeof(kerr)));
+    int intact = 0;
+    for (int i = 0; i < CACHE_ENTRIES; i++) intact += cache[i].p == (clef_prefix *)(populated + i);
+    if (intact != CACHE_ENTRIES || !freed_fresh) { fprintf(stderr, "an overflowing pass under a new key took a slot: %d of %d populated entries intact, fresh entry freed %d times\n", intact, CACHE_ENTRIES, freed_fresh); return 1; }
+    for (int i = 0; i < CACHE_ENTRIES; i++) { cache[i].p = NULL; cache[i].key[0] = '\0'; }
+    printf("server prefix cache: an overflowing pass under a new key takes no slot\n");
     return 0;
 }
