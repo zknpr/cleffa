@@ -51,6 +51,7 @@ def make_tree(root: Path):
     (oracle / 'requests.jsonl').write_text('{"id":"r000"}\n')
     (oracle / 'latency.json').write_text('{}')
     (root / 'engine_logits.jsonl').write_text('{}\n')
+    (root / 'engine_logits-private.jsonl').write_text('{"state": "customer text"}\n')  # top-level, private-named
     (root / 'engine_dump.bin').write_bytes(b'\0' * 4)
     (root / '.gpu.lock').write_text('')
     priv = exp / 'private-customer'
@@ -105,6 +106,7 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/latin.log', names)  # undecodable text is never archived raw
         self.assertNotIn('gemm-probe-20261004/private-customer/requests.jsonl', names)  # private ancestor
         self.assertNotIn('customer-private/requests.jsonl', names)  # private undated directory
+        self.assertNotIn('engine_logits-private.jsonl', names)  # private top-level file, ahead of the allowlist
         self.assertIn('undecodable text', manifest['excluded_counts'])
         for reason in ('binary', 'private-named path', 'forbidden content', 'private workload directory',
                        'upstream clone', 'trace or dSYM bundle', 'tensor size', 'oracle directory'):

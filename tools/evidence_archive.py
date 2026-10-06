@@ -98,6 +98,9 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     top = parts[0]
     if path.is_symlink():
         return False, 'symlink'
+    # Before any allowlist: "private" anywhere in the relative path excludes the file.
+    if any('private' in part.lower() for part in parts):
+        return False, 'private-named path'
     if any(p in EXCLUDE_DIR_PARTS for p in parts):
         return False, 'clone or environment'
     if any(p.endswith('.trace') or p.endswith('.dSYM') for p in parts[:-1]):
@@ -109,8 +112,6 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'private workload directory'
     if top.startswith('ds4-') and len(parts) > 2 and parts[1] == 'source':
         return False, 'upstream clone'
-    if any('private' in part.lower() for part in parts):
-        return False, 'private-named path'
     if path.name.startswith('cleffa-evidence-'):
         return False, 'archive output'
     if THIRD_PARTY_DOC.match(path.name):

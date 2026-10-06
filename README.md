@@ -149,7 +149,8 @@ curl -s localhost:8080/v1/systemone \
 
 The server cache is off by default. Keyed requests run individually; requests
 without a key continue through ordinary micro-batching. A key has 1–64 ASCII
-letters, digits, dots, underscores or hyphens. An authenticating proxy should
+letters, digits, dots, underscores or hyphens; the server validates the header whether or
+not caching is enabled, so a malformed key is HTTP 400 either way. An authenticating proxy should
 assign keys per tenant and conversation: callers sharing a key can observe one
 another's cache hits through latency. Keys are not authentication credentials.
 

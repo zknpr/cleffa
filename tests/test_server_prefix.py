@@ -5,13 +5,16 @@ Usage: test_server_prefix.py MODEL.gguf REQUESTS.jsonl   (starts its own ./clef-
 
 REQUESTS.jsonl is the corpus; its long log requests supply the states.
 
-  1. Reference server without the option: every body, and that the header is ignored there.
+  1. Reference server without the option: every body, that a valid key changes nothing there, and
+     that a malformed key is still HTTP 400 (the header is validated whether or not caching is on).
   2. Server with --prefix-cache-mb: the same requests under a key return the same bytes, and the
      log shows which reused an entry. A second key never reuses the first key's entry, although
      its requests are identical. A request without the header never touches an entry.
   3. A budget smaller than one entry drops each entry after serving it; answers do not change.
      A budget that holds a short entry but not a long one drops only the long entry: the other
      key's entry survives and keeps reusing.
+  3b. Keyed requests too short to cache never take a table slot: 33 of them under new keys leave
+     the populated entries in place.
   4. A key with a character outside [A-Za-z0-9._-], or longer than 64, is HTTP 400.
 """
 
@@ -33,6 +36,7 @@ model, corpus_path = sys.argv[1], sys.argv[2]
 corpus = [json.loads(line) for line in open(corpus_path)]
 logs = sorted((r for r in corpus if isinstance(r["state"], str) and len(r["state"]) > 2000), key=lambda r: len(r["state"]))
 A, B, LONG = logs[0], logs[1], logs[-1]
+SHORT = min(corpus, key=lambda r: len(json.dumps(r)))   # under the 128-token minimum prefix: bypasses the entry
 other_q = next(r["questions"] for r in corpus if r["questions"] != A["questions"])
 REUSED = re.compile(r"prefix cache: reused (\d+) of (\d+) tokens")
 
@@ -101,10 +105,13 @@ with tempfile.TemporaryDirectory() as t:
     try:
         want = [ref.post(r) for r in requests]
         want_long = ref.post(LONG)
-        if any(st != 200 for st, _ in want + [want_long]):
+        want_short = ref.post(SHORT)
+        if any(st != 200 for st, _ in want + [want_long, want_short]):
             fail("reference server returned an error")
         if ref.post(A, "tenant-1") != want[0] or ref.reused():
             fail("the header changed an answer on a server without --prefix-cache-mb")
+        if ref.post(A, "has space")[0] != 400:
+            fail("a malformed key was accepted on a server without --prefix-cache-mb")
     finally:
         ref.stop()
 
@@ -131,6 +138,20 @@ with tempfile.TemporaryDirectory() as t:
             fail("the first key lost its entry")
         if srv.post(requests[2], "tenant-2") != want[2] or srv.reused()[-1] == 0:
             fail("the second key lost its entry")
+        # 33 new keys with a request too short to cache: no slot is taken, so the two populated
+        # entries survive and keep reusing (before the fix, the table filled and evicted them)
+        drops = srv.dropped()
+        for k in range(33):
+            if srv.post(SHORT, f"flush-{k}") != want_short:
+                fail("a short keyed request's answer differs")
+        if srv.reused()[-1] != 0:
+            fail("the short request was cached; pick a shorter one for this scenario")
+        if srv.dropped() != drops:
+            fail(f"short keyed requests evicted populated entries: {srv.dropped() - drops} drops")
+        if srv.post(requests[2], "tenant-1") != want[2] or srv.reused()[-1] == 0:
+            fail("the first key lost its entry to uncacheable keyed requests")
+        if srv.post(requests[2], "tenant-2") != want[2] or srv.reused()[-1] == 0:
+            fail("the second key lost its entry to uncacheable keyed requests")
         for bad in ("has space", "semi;colon", "x" * 65, ""):
             st, _ = srv.post(A, bad)
             if st != 400:

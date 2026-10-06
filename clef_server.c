@@ -117,19 +117,26 @@ static void cache_drop(int i, const char *why) {
     cache[i].key[0] = '\0';
 }
 
-/* The entry for `key`, created empty if needed (evicting the least recently used when the table
- * is full). -1 if it cannot be allocated: the caller then serves the request uncached. */
-static int cache_slot(const char *key) {
-    int free_slot = -1, lru = -1;
-    for (int i = 0; i < CACHE_ENTRIES; i++) {
+/* The populated entry for `key`, or -1. */
+static int cache_find(const char *key) {
+    for (int i = 0; i < CACHE_ENTRIES; i++)
         if (cache[i].p && !strcmp(cache[i].key, key)) return i;
-        if (!cache[i].p) { if (free_slot < 0) free_slot = i; }
+    return -1;
+}
+
+/* Store an entry that a pass has just populated, evicting the least recently used entry when
+ * the table is full. Only populated entries go in: a keyed request too short to cache, or an
+ * unsupported one, bypasses its entry and must not displace another key's state (review #15). */
+static int cache_insert(const char *key, clef_prefix *p) {
+    int slot = -1, lru = -1;
+    for (int i = 0; i < CACHE_ENTRIES; i++) {
+        if (!cache[i].p) { if (slot < 0) slot = i; }
         else if (lru < 0 || cache[i].used < cache[lru].used) lru = i;
     }
-    if (free_slot < 0) { cache_drop(lru, "table full"); free_slot = lru; }
-    if (!(cache[free_slot].p = clef_prefix_new())) return -1;
-    snprintf(cache[free_slot].key, sizeof(cache[free_slot].key), "%s", key);
-    return free_slot;
+    if (slot < 0) { cache_drop(lru, "table full"); slot = lru; }
+    cache[slot].p = p;
+    snprintf(cache[slot].key, sizeof(cache[slot].key), "%s", key);
+    return slot;
 }
 
 /* Template reuse (clef_run_template): one entry for the 32 tokens every request starts with. It
@@ -152,20 +159,25 @@ static bool run_template(job *j, float ****probs, char *err, size_t errlen) {
 
 /* A failed cached pass is recomputed uncached and its entry is dropped. */
 static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
-    const int i = cache_slot(j->cache_key);
-    if (i < 0) {
+    int i = cache_find(j->cache_key);
+    clef_prefix *p = i >= 0 ? cache[i].p : clef_prefix_new();
+    if (!p) {
         fprintf(stderr, "clef-server: prefix cache: cannot allocate an entry, serving uncached\n");
         return clef_run(S.e, &j->rec, 1, probs, err, errlen);
     }
     int reused = 0;
-    cache[i].used = now_ms();
-    bool ok = clef_run_prefix(S.e, cache[i].p, &j->rec, probs, false, &reused, err, errlen);
+    bool ok = clef_run_prefix(S.e, p, &j->rec, probs, false, &reused, err, errlen);
     if (!ok) {
         fprintf(stderr, "clef-server: prefix cache: %s; serving uncached\n", err);
-        cache_drop(i, "failed pass");
+        if (i >= 0) cache_drop(i, "failed pass"); else clef_prefix_free(p);
         return clef_run(S.e, &j->rec, 1, probs, err, errlen);
     }
     fprintf(stderr, "clef-server: prefix cache: reused %d of %zu tokens\n", reused, j->rec.ids.len);
+    if (i < 0) {
+        if (clef_prefix_bytes(p) == 0) { clef_prefix_free(p); return true; }   /* bypassed: nothing to keep */
+        i = cache_insert(j->cache_key, p);
+    }
+    cache[i].used = now_ms();
     /* An entry larger than the whole budget can never be retained: drop it alone, before the
        LRU pass below would evict every other key's entry on its behalf (review #6). */
     if (clef_prefix_bytes(cache[i].p) > S.cache_bytes) {
