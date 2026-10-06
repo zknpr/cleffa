@@ -337,7 +337,9 @@ monotonic deadline, not just a per-read timeout), `CLEF_DEBUG_KEEPWARM_MS=N` (id
 0 disables), `CLEF_DEBUG_KEEPWARM_NOWEIGHTS=1` (idle passes omit the weights, a diagnostic control).
 
 The server enables keep-warm by default; `--no-keep-warm` disables it. The worker calls
-`clef_keep_warm` while idle, so it never overlaps a forward on that engine. The function reads
+`clef_keep_warm` while idle, so it never overlaps a forward on that engine. Its idle round then touches
+each cache entry and the template entry, rechecking the queue between entries so an arriving
+request waits for at most one entry's pass (`tests/test_server_writes.c`). The function reads
 model/activation buffers and writes only its separate sink; it is not thread-safe against a
 forward. Its nullable command-buffer/encoder and execution errors are checked separately from
 `new_cb`. `tests/test_metal_errors.m` checks error propagation, recovery and exact activation-byte

@@ -104,6 +104,17 @@ static double now_ms(void) {
  * least recently used first when their GPU memory exceeds the budget. */
 static struct { char key[CACHE_KEY_MAX + 1]; clef_prefix *p; double used; } cache[CACHE_ENTRIES];
 
+/* A size flag is a whole decimal number that fits after scaling: strtoull alone accepts "-1"
+ * (wrapping to ULLONG_MAX), trailing junk, and values whose MiB shift overflows (review #22). */
+static bool parse_size(const char *s, size_t max, size_t *out) {
+    if (!*s || strspn(s, "0123456789") != strlen(s)) return false;
+    errno = 0;
+    unsigned long long v = strtoull(s, NULL, 10);
+    if (errno || v > max) return false;
+    *out = (size_t)v;
+    return true;
+}
+
 static size_t cache_total(void) {
     size_t n = 0;
     for (int i = 0; i < CACHE_ENTRIES; i++) if (cache[i].p) n += clef_prefix_bytes(cache[i].p);
@@ -199,6 +210,28 @@ static bool run_keyed(job *j, float ****probs, char *err, size_t errlen) {
     return true;
 }
 
+static bool queue_pending(void) {
+    pthread_mutex_lock(&S.mu);
+    const bool pending = S.head != NULL;
+    pthread_mutex_unlock(&S.mu);
+    return pending;
+}
+
+/* One idle keep-warm round: the engine's buffers, then each cache entry's, then the template
+ * entry's. Cache buffers need their own idle touches; only the worker accesses this table.
+ * The queue is rechecked between entries, so a request that arrives mid-round waits for at
+ * most one entry's pass rather than the whole table's (review #24); the round resumes at the
+ * next idle period. */
+static bool keep_warm_round(char *err, size_t errlen) {
+    if (!clef_keep_warm(S.e, err, errlen)) return false;
+    for (int i = 0; i < CACHE_ENTRIES; i++) {
+        if (queue_pending()) return true;
+        if (cache[i].p && !clef_prefix_keep_warm(S.e, cache[i].p, err, errlen)) return false;
+    }
+    if (queue_pending()) return true;
+    return !template_entry || clef_prefix_keep_warm(S.e, template_entry, err, errlen);
+}
+
 static void *worker(void *arg) {
     (void)arg;
     job **batch = calloc((size_t)S.batch, sizeof(*batch));
@@ -217,11 +250,7 @@ static void *worker(void *arg) {
             if (pthread_cond_timedwait_relative_np(&S.cv, &S.mu, &rel) != ETIMEDOUT || S.head) continue;
             pthread_mutex_unlock(&S.mu);
             char kerr[256] = "";
-            bool warm = clef_keep_warm(S.e, kerr, sizeof(kerr));
-            // Cache buffers need their own idle touches; only the worker accesses this table.
-            for (int i = 0; warm && i < CACHE_ENTRIES; i++)
-                if (cache[i].p) warm = clef_prefix_keep_warm(S.e, cache[i].p, kerr, sizeof(kerr));
-            if (warm && template_entry) warm = clef_prefix_keep_warm(S.e, template_entry, kerr, sizeof(kerr));
+            bool warm = keep_warm_round(kerr, sizeof(kerr));
             if (!warm && !warned_keep_warm) {
                 fprintf(stderr, "clef-server: keep-warm pass failed: %s\n", kerr);   /* once: latency only */
                 warned_keep_warm = true;
@@ -600,14 +629,21 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) S.batch = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-body") && i + 1 < argc) S.max_body = (size_t)strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--max-body") && i + 1 < argc) {
+            if (!parse_size(argv[++i], SIZE_MAX, &S.max_body)) { fprintf(stderr, "clef-server: --max-body must be a whole number of bytes\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--no-strict")) S.strict = false;
         else if (!strcmp(argv[i], "--truncate")) S.truncate = true;
         else if (!strcmp(argv[i], "--no-warmup")) do_warmup = false;
         else if (!strcmp(argv[i], "--keep-warm")) S.keep_warm_ms = KEEP_WARM_MS;   /* the default, accepted explicitly */
         else if (!strcmp(argv[i], "--no-keep-warm")) S.keep_warm_ms = 0;
-        else if (!strcmp(argv[i], "--batch-tokens") && i + 1 < argc) S.batch_tokens = (size_t)strtoull(argv[++i], NULL, 10);
-        else if (!strcmp(argv[i], "--prefix-cache-mb") && i + 1 < argc) S.cache_bytes = (size_t)strtoull(argv[++i], NULL, 10) << 20;
+        else if (!strcmp(argv[i], "--batch-tokens") && i + 1 < argc) {
+            if (!parse_size(argv[++i], SIZE_MAX, &S.batch_tokens)) { fprintf(stderr, "clef-server: --batch-tokens must be a whole number of tokens\n"); return 2; }
+        }
+        else if (!strcmp(argv[i], "--prefix-cache-mb") && i + 1 < argc) {
+            if (!parse_size(argv[++i], SIZE_MAX >> 20, &S.cache_bytes)) { fprintf(stderr, "clef-server: --prefix-cache-mb must be a whole number of MiB below %zu\n", (size_t)(SIZE_MAX >> 20)); return 2; }
+            S.cache_bytes <<= 20;
+        }
         else if (!strcmp(argv[i], "--template-cache")) S.template_cache = true;
         else if (!strcmp(argv[i], "--max-conn") && i + 1 < argc) S.max_conn = atoi(argv[++i]);
         else {

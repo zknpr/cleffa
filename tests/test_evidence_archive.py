@@ -44,6 +44,9 @@ def make_tree(root: Path):
     (exp / 'small.safetensors').write_bytes(safetensors({'__metadata__': {'format': 'pt'}, 'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (exp / 'leaky.safetensors').write_bytes(safetensors({'__metadata__': {'source': f'{HOME}/run/x.pt'}, 'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (exp / 'broken.safetensors').write_bytes(b'\0' * 100)   # not a safetensors header
+    for name, home in (('root.safetensors', '/root/run/x.pt'), ('varroot.safetensors', '/var/root/x.pt'),
+                       ('thishome.safetensors', f'{HOME}/x.pt')):
+        (exp / name).write_bytes(safetensors({'__metadata__': {'source': home}, 'l': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (exp / 'big.safetensors').write_bytes(b'\0' * (ea.SMALL_TENSOR + 1))
     art = root / 'article-batch-20261005'
     art.mkdir()
@@ -117,6 +120,8 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('engine_logits-private.jsonl', names)  # private top-level file, ahead of the allowlist
         self.assertNotIn('gemm-probe-20261004/leaky.safetensors', names)  # forbidden string in the safetensors header
         self.assertNotIn('gemm-probe-20261004/broken.safetensors', names)  # unparseable safetensors header
+        for name in ('root.safetensors', 'varroot.safetensors', 'thishome.safetensors'):
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names)  # home paths outside /Users and /home
         self.assertIn('undecodable text', manifest['excluded_counts'])
         for reason in ('binary', 'private-named path', 'forbidden content', 'private workload directory',
                        'upstream clone', 'trace or dSYM bundle', 'tensor size', 'oracle directory'):
@@ -156,6 +161,21 @@ class EvidenceArchive(unittest.TestCase):
         # tree, not the wall clock.
         self.assertEqual(hashlib.sha256(a.read_bytes()).hexdigest(), hashlib.sha256(b.read_bytes()).hexdigest())
         self.assertEqual(ma['built'], datetime.datetime.fromtimestamp(FIXED_MTIME, datetime.timezone.utc).isoformat())
+
+    def test_allowlisted_files_obey_size_and_text_checks(self):
+        (self.root / 'engine_logits_clef.jsonl').write_text('{}\n' * 2048)   # top-level, allowlisted, oversized
+        (self.root / 'clef-flash-f32' / 'encoded.jsonl').write_bytes(b'\0' * 64)   # oracle-shaped name, binary content
+        big = ea.MAX_TEXT
+        ea.MAX_TEXT = 1024
+        try:
+            manifest = ea.build(self.root, Path(self.tmp.name) / 'size.tar.gz', 'ev')
+        finally:
+            ea.MAX_TEXT = big
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('engine_logits_clef.jsonl', names)
+        self.assertNotIn('clef-flash-f32/encoded.jsonl', names)
+        self.assertIn('engine_logits.jsonl', names)
+        self.assertIn('oversized text', manifest['excluded_counts'])
 
     def test_default_label_from_tree(self):
         a = Path(self.tmp.name) / 'd1.tar.gz'

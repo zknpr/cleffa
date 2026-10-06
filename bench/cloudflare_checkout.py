@@ -70,6 +70,18 @@ def response_info(status: int, response: object, expected: dict) -> dict:
             "full_input_reported": None if tokens is None else tokens == expected["full_input_tokens"]}
 
 
+def redacted(value, token: str):
+    """Replace the token inside every string of a decoded JSON value. A textual replace on the
+    raw body misses a JSON-escaped token, which json.loads reassembles."""
+    if isinstance(value, str):
+        return value.replace(token, "[REDACTED]")
+    if isinstance(value, list):
+        return [redacted(v, token) for v in value]
+    if isinstance(value, dict):
+        return {redacted(k, token): redacted(v, token) for k, v in value.items()}
+    return value
+
+
 def collect(run_plan: dict, out, account: str, token: str) -> None:
     conn = http.client.HTTPSConnection("api.cloudflare.com", timeout=120)
     headers = {"Content-Type": "application/json", "Connection": "keep-alive",
@@ -102,12 +114,13 @@ def collect(run_plan: dict, out, account: str, token: str) -> None:
                     if len(raw) > 1024 * 1024:
                         raise ValueError("response exceeds 1 MiB")
                     # Do not persist credentials, even if an error body echoes a request header.
-                    clean = raw.decode("utf-8").replace(token, "[REDACTED]")
-                    record["response"] = json.loads(clean)
+                    # Redact after decoding: an escaped token survives a replace on the raw text.
+                    record["response"] = redacted(json.loads(raw.decode("utf-8")), token)
                     record.update(response_info(result.status, record["response"], row))
                 except Exception as exc:
                     record.setdefault("ms", (time.perf_counter() - start) * 1000)
                     record["error"] = str(exc).replace(token, "[REDACTED]")
+                    record = redacted(record, token)
                     out.write(json.dumps(record) + "\n")
                     out.flush()
                     raise RuntimeError(f"{model}/{row['id']}: collection failed; see output journal") from None

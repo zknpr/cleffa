@@ -55,6 +55,27 @@ class ResponseTests(unittest.TestCase):
         self.assertIn("[REDACTED]", record["error"])
         self.assertNotIn("full_input_reported", record)
 
+    def test_escaped_token_in_a_failed_body_is_redacted(self):
+        # A JSON-escaped token survives a textual replace on the raw body and is reassembled by
+        # json.loads; the failed-call path writes that decoded response to the journal.
+        import hashlib
+        payload = {"model": "clef", "state": "public fixture", "questions": {"urgent": {}}}
+        row = {"model": "clef", "id": "test", "request": payload, "full_input_tokens": 4510,
+               "request_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest()}
+        run_plan = {"requests": [row], "passes": 3}
+        out = io.StringIO()
+        escaped = "fake\\u002dsecret\\u002dtoken"   # "fake-secret-token" with the hyphens JSON-escaped
+        with patch("cloudflare_checkout.http.client.HTTPSConnection") as connection:
+            conn = connection.return_value
+            result = conn.getresponse.return_value
+            result.status = 429
+            result.read.return_value = ('{"errors": [{"message": "bad token ' + escaped + '"}]}').encode()
+            result.getheader.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "collection failed"):
+                collect(run_plan, out, "a" * 32, "fake-secret-token")
+        self.assertNotIn("fake-secret-token", out.getvalue())
+        self.assertIn("[REDACTED]", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

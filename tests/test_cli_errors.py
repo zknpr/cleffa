@@ -32,6 +32,21 @@ class CliErrors(unittest.TestCase):
                 self.assertIn("--template-cache", p.stderr)
                 self.assertNotIn("cannot open", p.stderr)
 
+    def test_server_size_flags_are_validated_before_model_open(self):
+        # strtoull accepts "-1" (wrapping to ULLONG_MAX) and trailing junk, and the MiB shift can
+        # overflow; each size flag must be a whole number that fits, or the server exits 2.
+        for flag, value in (("--prefix-cache-mb", "-1"), ("--prefix-cache-mb", "17592186044416"),
+                            ("--prefix-cache-mb", "12x"), ("--prefix-cache-mb", ""),
+                            ("--max-body", "-1"), ("--batch-tokens", "4096k")):
+            with self.subTest(flag=flag, value=value):
+                p = subprocess.run([ROOT / "clef-server", "-m", "/nonexistent", flag, value, "--port", "1"],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(flag, p.stderr)
+        p = subprocess.run([ROOT / "clef-server", "-m", "/nonexistent", "--prefix-cache-mb", "4096", "--port", "1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stderr)   # the flag is fine; opening the model is what fails
+
     def test_truncation_requires_explicit_opt_in(self):
         request = {**REQUEST, "state": "alpha " * 20000}
         # A failed first command buffer detects whether encoding reached inference,

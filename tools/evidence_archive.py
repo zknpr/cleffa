@@ -77,19 +77,21 @@ REWRITES = [
 ]
 # Anything matching after rewriting excludes the file, and a match in the final scan fails
 # the build. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
-FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|squid|\.personal|pop_v22|account_id|'
+FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
+                       re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
+                       r'squid|\.personal|pop_v22|account_id|'
                        r'Bearer [A-Za-z0-9_\-]{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}')
 
 
 def is_text(path: Path) -> bool:
-    if path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES:
-        return True
-    if path.suffix == '':
-        with open(path, 'rb') as f:
-            head = f.read(4096)
-        return head[:4] not in MACHO and b'\0' not in head
-    return False
+    """Text by extension or, without one, by content; a NUL byte in the first 4 KiB disqualifies
+    either, so binary data under a text name is excluded rather than archived."""
+    if not (path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES or path.suffix == ''):
+        return False
+    with open(path, 'rb') as f:
+        head = f.read(4096)
+    return head[:4] not in MACHO and b'\0' not in head
 
 
 def classify(golden: Path, path: Path) -> tuple[bool, str]:
@@ -106,9 +108,9 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'clone or environment'
     if any(p.endswith('.trace') or p.endswith('.dSYM') for p in parts[:-1]):
         return False, 'trace or dSYM bundle'
-    if len(parts) == 1:
-        # Top-level files: only the engine outputs the parity tests write.
-        return (path.suffix in {'.jsonl'} and path.name.startswith('engine_logits')), 'top-level file'
+    if len(parts) == 1 and not (path.suffix == '.jsonl' and path.name.startswith('engine_logits')):
+        # Top-level files: only the engine outputs the parity tests write (size-checked below).
+        return False, 'top-level file'
     if top.startswith('article-'):
         return False, 'private workload directory'
     if top.startswith('ds4-') and len(parts) > 2 and parts[1] == 'source':
@@ -121,9 +123,9 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'account bookkeeping'
     if AGENT_STATE.match(path.name):
         return False, 'agent checkpoint'
-    if not EXPERIMENT.match(top):
-        # Oracle golden directory: the small files only, never layers/ or dumps.
-        return (len(parts) == 2 and path.name in ORACLE_FILES), 'oracle directory'
+    if len(parts) > 1 and not EXPERIMENT.match(top) and not (len(parts) == 2 and path.name in ORACLE_FILES):
+        # Oracle golden directory: the small files only, never layers/ or dumps (size-checked below).
+        return False, 'oracle directory'
     ext = path.suffix.lower()
     if ext in EXCLUDE_EXT:
         return False, f'excluded extension {ext}'

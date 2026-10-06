@@ -20,11 +20,23 @@ static ssize_t test_write(int fd, const void *data, size_t size) {
     return size > 7 ? 7 : (ssize_t)size;
 }
 
+/* Keep-warm mocks: the engine pass is free; each entry pass is counted, and the first one
+ * enqueues a job, as a request arriving mid-round would. */
+#define clef_keep_warm test_keep_warm
+#define clef_prefix_keep_warm test_prefix_keep_warm
 #define main clef_server_main
 #define write test_write
 #include "../clef_server.c"
 #undef write
 #undef main
+static int warm_calls;
+static job arriving;
+bool test_keep_warm(clef_engine *e, char *err, size_t errlen) { (void)e; (void)err; (void)errlen; return true; }
+bool test_prefix_keep_warm(clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
+    (void)e; (void)p; (void)err; (void)errlen;
+    if (++warm_calls == 1) { pthread_mutex_lock(&S.mu); S.head = S.tail = &arriving; pthread_mutex_unlock(&S.mu); }
+    return true;
+}
 
 int main(void) {
     const char *requests[] = {
@@ -63,5 +75,20 @@ int main(void) {
         }
     }
     printf("server writes: %d partial-write, timeout, zero-write and keep-alive cases passed\n", cases);
+
+    /* A request that arrives during the idle round must wait for at most one more entry pass,
+       not for every populated entry and the template entry (review #24). */
+    static char fake[4];
+    for (int i = 0; i < 3; i++) cache[i].p = (clef_prefix *)(fake + i);
+    template_entry = (clef_prefix *)(fake + 3);
+    char kerr[64] = "";
+    warm_calls = 0;
+    assert(keep_warm_round(kerr, sizeof(kerr)));
+    assert(S.head == &arriving);
+    if (warm_calls != 1) { fprintf(stderr, "keep-warm round touched %d entries after a request arrived (expected 1)\n", warm_calls); return 1; }
+    for (int i = 0; i < 3; i++) cache[i].p = NULL;
+    template_entry = NULL;
+    S.head = S.tail = NULL;
+    printf("server keep-warm: an arriving request stops the idle round after one entry\n");
     return 0;
 }
