@@ -224,9 +224,10 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'Authorization["\']?[ \t]*[=:][ \t]*(?P<aq>["\'])(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
                        r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?P=aq))'
                        r'[^\s"\']+[ \t]*(?P=aq)|'
+                       # ... or a comment or annotation delimiter (`# staging`, `// prod`, `; note`)
                        r'Authorization[ \t]*[=:][ \t]*(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
-                       r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$))'
-                       r'[^\s"\']+[ \t]*(?:\r?\n|$)|'
+                       r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$|#|//|;))'
+                       r'[^\s"\'#;]+[ \t]*(?:\r?\n|$|#|//|;)|'
                        r'Authorization["\']?\s*[=:]\s*(?P<dq>["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!(?P=dq))[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
@@ -295,6 +296,10 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
     ancestors = parts if directory else parts[:-1]   # a directory is itself a bundle or workload
     if path.is_symlink():
         return 'symlink'
+    if any('\\' in part or part in ('.', '..') or any(ord(c) < 32 for c in part) for part in parts):
+        # The name becomes a tar member name. A backslash is legal on macOS but a path
+        # separator to a Windows extractor, which would read an embedded `..` as traversal.
+        return 'unsafe name'
     # Before any allowlist: "private" anywhere in the relative path excludes the file, and so
     # does a forbidden pattern in the path itself, which becomes a tar member name.
     if any('private' in part.lower() for part in parts):
@@ -788,6 +793,8 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     for rel, path, data, _, _ in included:
         if forbidden_in(rel):
             raise SystemExit(f'forbidden pattern in the path {rel}')
+        if rel.startswith('/') or any('\\' in part or part in ('.', '..') or any(ord(c) < 32 for c in part) for part in rel.split('/')):
+            raise SystemExit(f'unsafe member name {rel!r}')
         tensor = path.suffix.lower() == '.safetensors'
         if not tensor and b'\0' in data:
             raise SystemExit(f'NUL byte survived in {rel}')

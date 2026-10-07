@@ -1264,6 +1264,40 @@ class EvidenceArchive(unittest.TestCase):
         self.assertIn('gemm-probe-20261004/notes.md', names)
         self.assertIn('third-party document', manifest['excluded_counts'])
 
+    def test_annotated_short_authorization_values_are_caught(self):
+        # A comment after the value (`# staging`, `// prod`, `; note`) ends it as a line end does;
+        # prose after the colon still runs on into ordinary words.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'ann1.log': 'Authorization: Bearer hunter2 # staging\n', 'ann2.log': 'Authorization: token abc1 // prod\n',
+                  'ann3.log': 'authorization=xyz; note\n'}
+        kept = {'prose5.md': 'Authorization: required, see the deployment notes.\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'annotated.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_member_names_with_backslashes_or_traversal_are_refused(self):
+        # A backslash is legal in a macOS file name; a Windows extractor reads it as a path
+        # separator and the embedded `..` as traversal. Such a name is excluded on classification
+        # and, should one slip through, refused by the final control.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        bad = exp / 'x\\..\\..\\outside.json'
+        bad.write_text('{}')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'names.tar.gz', 'ev')
+        self.assertFalse(any('\\' in e['path'] for e in manifest['files']))
+        self.assertIn('unsafe name', manifest['excluded_counts'])
+        real = ea.classify
+
+        def admit(golden, path):
+            return (True, 'included') if path == bad else real(golden, path)
+        with patch.object(ea, 'classify', admit), self.assertRaisesRegex(SystemExit, 'unsafe'):
+            ea.build(self.root, Path(self.tmp.name) / 'names2.tar.gz', 'ev')
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
