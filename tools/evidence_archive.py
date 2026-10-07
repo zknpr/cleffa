@@ -93,12 +93,17 @@ AGENT_STATE = re.compile(r'^checkpoint[-.a-zA-Z0-9]*\.json$')
 EXCLUDE_EXT = {'.o', '.a', '.dylib', '.inc', '.bin', '.npy', '.npz', '.pt', '.xml', '.pdf',
                '.gz', '.zip', '.tar', '.zst', '.xz', '.bz2', '.7z', '.dmg', '.pkg'}
 
+def path_pattern(path: str) -> str:
+    """`path` where it is a path: not preceded by another slash (the `//root` of
+    `mysql://root:pw@db` is a URL authority, not a home directory) and not followed by a name
+    character (`/rooted/` is another directory). Shared by the rewrite and the forbidden
+    pattern, so a home of /root neither rewrites a connection string's userinfo nor excludes
+    a file for `/rooted/path` after the rewrite left it alone (reviews #94, #100)."""
+    return r'(?<!/)' + re.escape(path) + r'(?![A-Za-z0-9_.-])'
+
+
 def path_rewrite(path: str, placeholder: str) -> tuple[re.Pattern, str]:
-    """A rewrite of `path` that applies only where it is a path: not preceded by another
-    slash (the `//root` of `mysql://root:pw@db` is a URL authority, not a home directory)
-    and not followed by a name character (`/rooted/` is another directory). A home of
-    /root would otherwise rewrite the userinfo of a connection string (review #94)."""
-    return re.compile(r'(?<!/)' + re.escape(path) + r'(?![A-Za-z0-9_.-])'), placeholder
+    return re.compile(path_pattern(path)), placeholder
 
 
 # Rewrites run in order; the checkout path must precede the home directory.
@@ -152,7 +157,7 @@ PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\
 # surviving path is a leak) and credentials (scanned on the original text as well, since a
 # rewrite could alter the bytes around a secret before the pattern sees them; review #94).
 PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
-                 re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
+                 path_pattern(str(Path.home())) + '|' + path_pattern(str(Path(__file__).resolve().parent.parent)) + '|'
                  r'squid|\.personal|pop_v22|Zknpr|session_id|accounts/[0-9a-f]{32}|'
                  # a 32-hex value under any account label: account, account_id, accountId,
                  # accountTag, CLOUDFLARE_ACCOUNT_ID (review #99)

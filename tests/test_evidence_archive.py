@@ -858,7 +858,8 @@ class EvidenceArchive(unittest.TestCase):
         (exp / 'dsn-root.json').write_text('{"dsn": "mysql://root:pw@db:3306/x", "log": "/root/run/x.log"}')
         (exp / 'home-root.log').write_text('log=/root/x.log and /rooted/path\n')
         root_home = [ea.path_rewrite('/root', '<home>')]
-        with patch.object(ea, 'REWRITES', root_home):   # as if Path.home() were /root
+        root_forbidden = re.compile(ea.path_pattern('/root') + '|' + ea.CREDENTIAL_PATTERNS, re.IGNORECASE)
+        with patch.object(ea, 'REWRITES', root_home), patch.object(ea, 'FORBIDDEN', root_forbidden):   # as if Path.home() were /root
             manifest = ea.build(self.root, Path(self.tmp.name) / 'roothome.tar.gz', 'ev')
         names = {e['path'] for e in manifest['files']}
         self.assertNotIn('gemm-probe-20261004/dsn-root.json', names)
@@ -934,6 +935,17 @@ class EvidenceArchive(unittest.TestCase):
             self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_home_and_repo_patterns_stop_at_a_path_boundary(self):
+        # The forbidden pattern for the home directory is built from Path.home(); with a home of
+        # /root it must not match /rooted/path or the //root of a URL authority, which the
+        # rewrite already leaves alone, or the build drops legitimate evidence on that machine.
+        pat = re.compile(ea.path_pattern('/root'))
+        for text in ['log=/root/x.log', 'home: /root', '"/root"']:
+            self.assertTrue(pat.search(text), text)
+        for text in ['/rooted/path', 'mysql://root:pw@db', 'https://h//root/y', '/root.bak']:
+            self.assertFalse(pat.search(text), text)
+        self.assertEqual(ea.path_rewrite('/root', '<home>')[0].pattern, ea.path_pattern('/root'))
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
