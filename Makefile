@@ -11,7 +11,7 @@ FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
 HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o
 
-.PHONY: all clean test test-errors test-attention test-vision-attention test-vision-gemm test-gemm test-gdn test-head-tsan test-prefix-attention test-prefix-model unicode
+.PHONY: all clean test test-image-diff test-errors test-attention test-vision-attention test-vision-gemm test-gemm test-gdn test-head-tsan test-prefix-attention test-prefix-model unicode
 
 ENGINE_OBJS = clef.o clef_head.o clef_metal.o
 
@@ -107,12 +107,25 @@ tests/test-head-parallel-tsan: tests/test_head_parallel.c clef_head.c $(HOST_OBJ
 test-head-tsan: tests/test-head-parallel-tsan
 	tests/test-head-parallel-tsan --init-only
 
+# Decode files from cjpeg, sips, ffmpeg and Pillow with cleffa and with Pillow, pixel for pixel; encoders
+# that are not installed are skipped. Not part of make test (it depends on those tools).
+test-image-diff: clef-tool
+	.venv/bin/python -B tests/test_image_diff.py
+
 # libFuzzer target for the image decode and preprocessing path (tests/fuzz_image.c). Apple's clang
 # ships without libFuzzer, so this uses the newest Homebrew LLVM; not part of make test.
 FUZZ_CC ?= $(lastword $(sort $(wildcard /opt/homebrew/opt/llvm/bin/clang /opt/homebrew/Cellar/llvm*/*/bin/clang)))
 fuzz-image: tests/fuzz_image.c clef_image.c clef_image.h third_party/iris/jpeg.h third_party/iris/png.h
 	@test -n "$(FUZZ_CC)" || { echo "fuzz-image: no Homebrew LLVM clang found (brew install llvm, or set FUZZ_CC)"; exit 1; }
 	$(FUZZ_CC) -isysroot $$(xcrun --show-sdk-path) -O1 -g -std=c11 -D_DARWIN_C_SOURCE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -o $@ tests/fuzz_image.c -lz
+
+# Differential target: JPEGs the vendored decoder accepts are decoded with libjpeg-turbo too and must
+# match pixel for pixel when libjpeg reports no warning (tests/fuzz_jpeg_diff.c). Homebrew jpeg-turbo.
+JPEG_TURBO ?= /opt/homebrew/opt/jpeg-turbo
+fuzz-jpeg-diff: tests/fuzz_jpeg_diff.c clef_image.c clef_image.h third_party/iris/jpeg.h third_party/iris/png.h
+	@test -n "$(FUZZ_CC)" || { echo "fuzz-jpeg-diff: no Homebrew LLVM clang found (brew install llvm, or set FUZZ_CC)"; exit 1; }
+	@test -f "$(JPEG_TURBO)/lib/libjpeg.a" || { echo "fuzz-jpeg-diff: no libjpeg.a under $(JPEG_TURBO) (brew install jpeg-turbo, or set JPEG_TURBO)"; exit 1; }
+	$(FUZZ_CC) -isysroot $$(xcrun --show-sdk-path) -O1 -g -std=c11 -D_DARWIN_C_SOURCE -I$(JPEG_TURBO)/include -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -o $@ tests/fuzz_jpeg_diff.c $(JPEG_TURBO)/lib/libjpeg.a -lz
 
 # Includes clef_image.c; crafted JPEGs under UBSan and ASan (each aborted before the jpeg.h fixes).
 tests/test-jpeg-ub: tests/test_jpeg_ub.c clef_image.c clef_image.h third_party/iris/jpeg.h third_party/iris/png.h
@@ -165,7 +178,9 @@ test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/tes
 	tests/test-base64
 	tests/test-jpeg-ub
 	.venv/bin/python -B tests/vision_config_fixture.py gguf/clef-flash.gguf tests/vision-config
-	tests/test-vision-config tests/vision-config/vision-ok.gguf ok tests/vision-config/vision-patch-2p24.gguf "unsupported vision shape" tests/vision-config/vision-temporal-2p24.gguf "unsupported vision shape"
+	tests/test-vision-config tests/vision-config/vision-ok.gguf ok tests/vision-config/vision-patch-2p24.gguf "unsupported vision shape" tests/vision-config/vision-temporal-2p24.gguf "unsupported vision shape" \
+	    tests/vision-config/vision-mrope-16-8-8.gguf "unsupported M-RoPE layout" tests/vision-config/vision-mrope-missing.gguf "unsupported M-RoPE layout" \
+	    tests/vision-config/vision-image-id-vocab.gguf "below the vocabulary size" tests/vision-config/vision-video-id-2p31.gguf "below the vocabulary size"
 	rm -rf tests/vision-config
 	tests/test-prefix-owner
 	tests/test-prefix-planner
@@ -194,6 +209,6 @@ test-errors: all tests/test-metal-errors tests/test-cli-alloc
 	tests/test-metal-errors gguf/clef-flash.gguf
 
 clean:
-	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image fuzz-jpeg-diff clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
 
 -include $(wildcard *.d tests/*.d)

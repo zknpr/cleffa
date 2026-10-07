@@ -59,4 +59,8 @@ for h, w in ((1, 1), (3, 7), (17, 33), (40, 40)):
                 save(buf.getvalue(), f"{mode}-q{q}-s{sub}{'-prog' if prog else ''}-{w}x{h}.jpg")
 save(test_image.progressive_se255(arr(16, 16, 3)), "progressive-se255.jpg")
 save(base64.b64decode(test_image.LUMA_UNDER_CHROMA_JPEG), "luma-under-chroma.jpg")
+# progressive 4:2:0 with a DC scan per component: a layout PIL cannot write, which the fuzzer
+# otherwise never sees (review #3 found the decoder mishandled it)
+save(base64.b64decode(test_image.SEPARATE_DC_SCANS_37X21), "separate-dc-37x21.jpg")
+save(base64.b64decode(test_image.SEPARATE_DC_SCANS_32X32), "separate-dc-32x32.jpg")
 print(f"{n} seeds in {out}")

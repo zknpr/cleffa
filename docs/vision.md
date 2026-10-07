@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants) | 63/63 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and two progressive JPEGs with a DC scan per component) | 65/65 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -53,8 +53,10 @@ data URL whose media type is not `image/png` or `image/jpeg` or contradicts the 
 form's `content_type` is checked the same way; the reference's PIL decode ignores both labels); an
 image whose resized grid alone exceeds the 16,384-token context, refused before any resize (the
 reference builds the patches and then fails on length); PNGs that are 16-bit, sub-8-bit grayscale or
-interlaced; JPEGs that are CMYK, 12-bit or arithmetic-coded, or whose first component is
-sampled below another (Y 1x1 under Cb 2x2, which libjpeg accepts); images over 64 MiB encoded,
+interlaced; JPEGs that are CMYK, 12-bit, lossless or arithmetic-coded, whose first component is
+sampled below another (Y 1x1 under Cb 2x2, which libjpeg accepts), or progressive with scans that
+stop before full precision (libjpeg smooths those; the smoothing is not implemented), or whose
+entropy data has fill bytes before a stuffed zero (`FF FF 00`, not standard); images over 64 MiB encoded,
 16,384 pixels on a side or 64 megapixels decoded; a literal `<|image_pad|>` in request text in
 parity mode (the reference raises on the placeholder count); the server's per-request image
 and per-image token limits. EXIF orientation is ignored, as the reference ignores it.
@@ -159,6 +161,69 @@ round four, executed 48.7 million inputs in 30 minutes with 14 workers and reach
 no crash, out-of-memory or timeout. Both logs are in `golden/fuzz-image-2026-10-07/`. Two runs of
 this length bound what was searched, not what is there; the dependency-free PNG inflater, which
 cleffa builds never compile, was not fuzzed.
+
+A fifth round (Codex on `d4d7661`) found three correctness gaps, each reproduced first. (19) A
+progressive scan carrying one component's DC coefficients was walked as interleaved MCUs, so in a
+4:2:0 file with a DC scan per component (`cjpeg -scans`) the luma blocks were read in MCU order or
+past the scan: a 37x21 file was refused and a 32x32 one decoded with 1,534 values wrong by up to 49,
+where libjpeg decodes both. Single-component DC scans now walk the component's blocks in raster
+order, as AC scans already did, and both files are parity cases in `tests/test_image.py`. Fuzzing
+had not found this: the fuzzer saw no valid multi-scan layout to mutate, and a wrong-but-defined
+decode is not a sanitizer finding. (20) The rotary kernels pick each pair's position axis as
+`lane % 3`, which is interleaved M-RoPE with section [11, 11, 10] and nothing else, but the loader
+never read `clef.rope.mrope_section`; text hides a different layout because its three positions are
+equal. The loader now requires that section for a model with a vision tower, and the converter
+refuses any rope configuration but interleaved [11, 11, 10]. (21) Vision token ids were not
+compared with the vocabulary, so a GGUF with an out-of-range id loaded and then failed every image
+request after decoding it; `clef_vision_opts_load` now requires all four below `clef.vocab_size`.
+`tests/test_vision_config.c` covers both with crafted headers.
+
+Fuzzing cannot see a wrong but well-defined decode, so the decoders were then tested
+differentially. `tests/test_image_diff.py` (`make test-image-diff`) builds 1,421 files with cjpeg
+(eight sampling layouts, progressive scan scripts with spectral selection, successive
+approximation and DC scans per component, restart intervals, quantizer settings), macOS sips,
+ffmpeg and Pillow, decodes each with cleffa and with Pillow, and fails on any pixel difference or
+on a refusal that is not a documented divergence. Its first run found two more classes. Vertical-only
+chroma subsampling (4:4:0, `-sample 1x2,1x1,1x1`) was upsampled by row replication instead of
+libjpeg's h1v2 triangle filter: 38 files up to 69 levels off. SOF1 frames (extended sequential,
+8-bit), which libjpeg writes whenever a quantizer exceeds 255 (`-quality` below about 25), were
+refused: 26 files. Both are fixed, with one file of each in `tests/test_image.py` (now 67 images).
+After the fixes all 1,275 files Pillow decodes and cleffa should decode are identical; the rest are
+the documented refusals (arithmetic, lossless, luma under chroma, 16-bit PNG) or files both refuse.
+
+`tests/fuzz_jpeg_diff.c` (`make fuzz-jpeg-diff`, Homebrew LLVM and jpeg-turbo) carries the
+comparison into fuzzing: every JPEG the vendored decoder accepts is decoded again with libjpeg-turbo
+and must match pixel for pixel whenever libjpeg reports no warning, with ASan and UBSan on. Inputs
+whose coefficients or IDCT outputs leave the range encoders produce are excluded through a no-op
+hook in the IDCT: libjpeg masks such outputs with its range-limit table, wrapping where this
+decoder clamps. Replaying the earlier fuzz corpus found two more. A progressive refinement run
+that overshoots the band's end still writes its new coefficient in libjpeg, through the padding of
+its natural-order table, without a warning; the vendored decoder now writes it at the same
+position. And libjpeg reconstructs a progressive image whose scans stop before full precision with
+block smoothing (`do_block_smoothing`, on in Pillow); that is not implemented, so such images are
+refused under libjpeg's own `smoothing_ok()` condition. The first fuzz run then found the decoder
+reading past an EOI preceded by a fill byte: both marker loops stepped over `FF FF` as a pair, so
+in `FF FF D9` the EOI's own `FF` was consumed as fill, where libjpeg's `next_marker` skips fill bytes
+one at a time. Pillow-written JPEGs with a fill byte before every marker were refused outright by
+the old loops; two such files are now cases in `tests/test_image.py` (69 images). The second run
+found the decoder ending a scan at `FF FF` inside entropy data. libjpeg's source documents a run
+of FFs followed by `00` as one FF data byte, but Pillow decoded a file with `FF FF 00` in place of
+each stuffed byte differently from the original, silently: libjpeg-turbo's fast Huffman path, used
+once enough input is buffered, treats the second FF as a marker, fills zero bits and leaves that
+pass's coefficients behind when it redecodes the MCU on its slow path. Small files take the slow
+path and match the documented reading, larger ones do not, so the reference has no stable answer
+for this pattern, which the standard does not allow. Such scans are now refused; the fuzz finding
+and a padded Pillow file are expected refusals in `tests/test_image.py`. The third run found a
+one-component frame declaring 2x1 sampling decoded with its blocks misplaced: libjpeg ignores a
+one-component frame's factors (each block is its own MCU, in raster order), and the decoder now
+treats such frames as 1x1; a Pillow grayscale file patched to declare 2x2 is a parity case (70
+images). The encoder corpus also gained 260 jpegtran files (grayscale conversion and lossless
+rotations of cjpeg output), all identical: 1,535 comparable files of 1,681. A fourth run on the
+final decoder, 20 minutes with 14 workers, executed 63.5 million inputs with no pixel difference,
+sanitizer report, out-of-memory or timeout. Its comparison covers files libjpeg decodes without a
+warning and whose coefficients stay in the range encoders produce; refusals are classified by
+`tests/test_image_diff.py`, not by the fuzzer. Logs and every finding are in
+`golden/fuzz-image-2026-10-07/`.
 
 ## Numerical parity
 

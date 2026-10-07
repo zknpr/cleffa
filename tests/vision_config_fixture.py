@@ -28,10 +28,11 @@ def fields(path: str) -> list[tuple[str, object, GGUFValueType, GGUFValueType | 
     return out
 
 
-def write(path: Path, kvs, override: dict[str, int]) -> None:
+def write(path: Path, kvs, override: dict, drop: frozenset = frozenset()) -> None:
     w = GGUFWriter(str(path), "clef")
     for name, val, vt, sub in kvs:
-        w.add_key_value(name, override.get(name, val), vt, sub_type=sub)
+        if name not in drop:
+            w.add_key_value(name, override.get(name, val), vt, sub_type=sub)
     w.write_header_to_file()
     w.write_kv_data_to_file()
     w.write_tensors_to_file()
@@ -45,7 +46,14 @@ def main() -> None:
     write(out / "vision-ok.gguf", kvs, {})
     write(out / "vision-patch-2p24.gguf", kvs, {"clef.vision.patch_size": 1 << 24})
     write(out / "vision-temporal-2p24.gguf", kvs, {"clef.vision.temporal_patch_size": 1 << 24})
-    print(f"wrote 3 fixtures with {len(kvs)} clef.* keys to {out}")
+    # review #3: an M-RoPE layout the kernels do not implement, or none, and token ids outside the
+    # vocabulary, must be refused at load
+    vocab = next(v for n, v, _, _ in kvs if n == "clef.vocab_size")
+    write(out / "vision-mrope-16-8-8.gguf", kvs, {"clef.rope.mrope_section": [16, 8, 8]})
+    write(out / "vision-mrope-missing.gguf", kvs, {}, frozenset({"clef.rope.mrope_section"}))
+    write(out / "vision-image-id-vocab.gguf", kvs, {"clef.vision.image_token_id": vocab})
+    write(out / "vision-video-id-2p31.gguf", kvs, {"clef.vision.video_token_id": 1 << 31})
+    print(f"wrote 7 fixtures with {len(kvs)} clef.* keys to {out}")
 
 
 if __name__ == "__main__":

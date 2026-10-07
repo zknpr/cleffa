@@ -160,11 +160,12 @@ static bool header_dimensions(const uint8_t *d, size_t len, uint32_t *w, uint32_
         if (d[pos] != 0xff) { pos++; continue; }
         const uint8_t m = d[pos + 1];
         pos += 2;
-        if (m == 0x00 || m == 0xff || (m >= 0xd0 && m <= 0xd8)) continue;   /* fill, RSTn, SOI */
+        if (m == 0xff) { pos--; continue; }                                  /* fill byte */
+        if (m == 0x00 || (m >= 0xd0 && m <= 0xd8)) continue;                 /* RSTn, SOI */
         if (m == 0xd9 || pos + 2 > len) return false;                        /* EOI, truncated */
         const size_t seg = (size_t)d[pos] << 8 | d[pos + 1];
         if (pos + seg > len) return false;
-        if ((m == 0xc0 || m == 0xc2) && seg >= 7) {
+        if ((m == 0xc0 || m == 0xc1 || m == 0xc2) && seg >= 7) {
             *h = (uint32_t)d[pos + 3] << 8 | d[pos + 4];
             *w = (uint32_t)d[pos + 5] << 8 | d[pos + 6];
             return true;

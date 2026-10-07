@@ -1,4 +1,6 @@
-/* Vision geometry from an untrusted GGUF is validated before it is multiplied (review #3).
+/* Vision geometry from an untrusted GGUF is validated before it is multiplied, the M-RoPE
+ * layout must be the one the kernels implement, and vision token ids must be in the vocabulary
+ * (review #3; load_config, then clef_vision_opts_load).
  * cfg_u32 admits each field up to 2^24, and 3 * temporal * patch * patch overflowed int before
  * the fixed-shape check rejected the file. Built with UBSan and -fno-sanitize-recover, so a
  * signed overflow aborts instead of passing. No Metal device or tensor data is touched.
@@ -14,7 +16,9 @@ int main(int argc, char **argv) {
         if (!gguf_open(&f, argv[i], err, sizeof(err))) { fprintf(stderr, "%s: %s\n", argv[i], err); return 1; }
         clef_config c;
         memset(&c, 0, sizeof(c));
-        const bool ok = load_config(&f, &c, err, sizeof(err));
+        clef_vision_opts vo;
+        memset(&vo, 0, sizeof(vo));
+        const bool ok = load_config(&f, &c, err, sizeof(err)) && clef_vision_opts_load(&f, &vo, err, sizeof(err));
         gguf_close(&f);
         const bool want_ok = !strcmp(argv[i + 1], "ok");
         if (ok != want_ok || (!ok && !strstr(err, argv[i + 1]))) {

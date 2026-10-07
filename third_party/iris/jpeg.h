@@ -59,7 +59,25 @@
  *     progressive shift by Al;
  *   - the IDCT computes in 64-bit, as libjpeg's JLONG does on this platform: a legal
  *     DC difference of 2047 at quantizer 255 overflowed int in the second pass and
- *     wrapped a far-above-white block to black. In-range blocks compute identically. */
+ *     wrapped a far-above-white block to black. In-range blocks compute identically;
+ *   - a progressive DC scan of one component walks that component's blocks in raster
+ *     order, as AC scans already did: walked as MCUs, a 4:2:0 file with a DC scan per
+ *     component decoded wrong or was refused, where libjpeg decodes it;
+ * and, found by decoding files from other encoders against libjpeg (tests/test_image_diff.py):
+ *   - vertical-only 2:1 chroma (4:4:0) uses libjpeg's h1v2 triangle filter instead of row
+ *     replication, which was up to 69 levels off;
+ *   - SOF1 (extended sequential, 8-bit) decodes as baseline: libjpeg writes it whenever a
+ *     quantizer exceeds 255, and it was refused;
+ * and, found by tests/fuzz_jpeg_diff.c against libjpeg:
+ *   - a refinement run overshooting Se writes its new coefficient at Se + 1 (or 63), as
+ *     libjpeg does through its padded natural order;
+ *   - an incomplete progressive image, which libjpeg would reconstruct with block smoothing,
+ *     is refused (libjpeg's smoothing_ok() condition);
+ *   - a one-component frame decodes as 1x1 whatever sampling factors it declares, as libjpeg
+ *     does;
+ *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
+ *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
+ *     result for it depends on which Huffman path it takes. */
 #ifndef JPEG_MAX_INPUT_BYTES
 #define JPEG_MAX_INPUT_BYTES (64u * 1024u * 1024u)
 #endif
@@ -187,6 +205,7 @@ jpeg_image *jpeg_clone(const jpeg_image *img) {
 #define JPEG_SOI  0xD8  /* Start of image */
 #define JPEG_EOI  0xD9  /* End of image */
 #define JPEG_SOF0 0xC0  /* Baseline DCT */
+#define JPEG_SOF1 0xC1  /* Extended sequential DCT, Huffman (cleffa: 8-bit only, decoded as baseline) */
 #define JPEG_SOF2 0xC2  /* Progressive DCT */
 #define JPEG_DHT  0xC4  /* Define Huffman table */
 #define JPEG_DQT  0xDB  /* Define quantization table */
@@ -239,6 +258,7 @@ typedef struct {
     /* Huffman tables (DC: 0-1, AC: 2-3) */
     jpeg_huff_table huff[4];
     unsigned huff_defined;   /* cleffa: bit t set once a DHT defined huff[t] */
+    int8_t coef_bits[4][64]; /* cleffa: progressive precision per coefficient, -1 = never coded */
 
     /* DC prediction for each component */
     int dc_pred[4];
@@ -431,8 +451,19 @@ static int jpeg_extend(int v, int bits) {
  * Inverse DCT
  * ======================================================================== */
 
+/* cleffa: test hook, a no-op unless defined. tests/fuzz_jpeg_diff.c uses it to learn when a
+ * dequantized coefficient or an IDCT output leaves the range real encoders produce: libjpeg masks
+ * such IDCT outputs with its range-limit table (wrapping outside about [-512, 511]) where this
+ * decoder clamps, and its SIMD paths need not match its C path there, so those inputs are not
+ * compared pixel for pixel. */
+#ifndef JPEG_RANGE_HOOK
+#define JPEG_RANGE_HOOK(out_of_range) ((void)0)
+#endif
+#define JPEG_IDCT_OUT(v) (JPEG_RANGE_HOOK((v) < -384 || (v) > 383), (uint8_t)JPEG_CLAMP((v) + 128))
+
 /* Fast integer IDCT using AAN algorithm (Arai, Agui, Nakajima 1988) */
 static void jpeg_idct(int *block, uint8_t *out, int stride) {
+    for (int i = 0; i < 64; i++) JPEG_RANGE_HOOK(block[i] < -32768 || block[i] > 32767);
     /* cleffa: 64-bit like libjpeg's JLONG here; a dequantized coefficient may be near 2^31 */
     int64_t tmp0, tmp1, tmp2, tmp3;
     int64_t tmp10, tmp11, tmp12, tmp13;
@@ -573,14 +604,14 @@ static void jpeg_idct(int *block, uint8_t *out, int stride) {
         tmp2 += z2 + z3;
         tmp3 += z1 + z4;
 
-        outptr[0] = JPEG_CLAMP(((tmp10 + tmp3 + (1 << 17)) >> 18) + 128);
-        outptr[7] = JPEG_CLAMP(((tmp10 - tmp3 + (1 << 17)) >> 18) + 128);
-        outptr[1] = JPEG_CLAMP(((tmp11 + tmp2 + (1 << 17)) >> 18) + 128);
-        outptr[6] = JPEG_CLAMP(((tmp11 - tmp2 + (1 << 17)) >> 18) + 128);
-        outptr[2] = JPEG_CLAMP(((tmp12 + tmp1 + (1 << 17)) >> 18) + 128);
-        outptr[5] = JPEG_CLAMP(((tmp12 - tmp1 + (1 << 17)) >> 18) + 128);
-        outptr[3] = JPEG_CLAMP(((tmp13 + tmp0 + (1 << 17)) >> 18) + 128);
-        outptr[4] = JPEG_CLAMP(((tmp13 - tmp0 + (1 << 17)) >> 18) + 128);
+        outptr[0] = JPEG_IDCT_OUT((tmp10 + tmp3 + (1 << 17)) >> 18);
+        outptr[7] = JPEG_IDCT_OUT((tmp10 - tmp3 + (1 << 17)) >> 18);
+        outptr[1] = JPEG_IDCT_OUT((tmp11 + tmp2 + (1 << 17)) >> 18);
+        outptr[6] = JPEG_IDCT_OUT((tmp11 - tmp2 + (1 << 17)) >> 18);
+        outptr[2] = JPEG_IDCT_OUT((tmp12 + tmp1 + (1 << 17)) >> 18);
+        outptr[5] = JPEG_IDCT_OUT((tmp12 - tmp1 + (1 << 17)) >> 18);
+        outptr[3] = JPEG_IDCT_OUT((tmp13 + tmp0 + (1 << 17)) >> 18);
+        outptr[4] = JPEG_IDCT_OUT((tmp13 - tmp0 + (1 << 17)) >> 18);
 
         wsptr += 8;
         outptr += stride;
@@ -689,6 +720,16 @@ static uint8_t jpeg_sample_chroma(const jpeg_decoder *dec, int component,
     const int sy = y * vs / dec->max_v_samp;
     const int width = (dec->width * hs + dec->max_h_samp - 1) / dec->max_h_samp;
     const int height = (dec->height * vs + dec->max_v_samp - 1) / dec->max_v_samp;
+    /* cleffa: vertical-only 2:1 (4:4:0), libjpeg's h1v2_fancy_upsample, the transpose of the
+     * h2v1 case below: three parts the nearest row, one part the next nearest, bias 1 above and
+     * 2 below. Replicating rows here put 4:4:0 files up to 69 levels from libjpeg
+     * (tests/test_image_diff.py). */
+    if (dec->max_h_samp == hs && dec->max_v_samp == 2 * vs) {
+        int ny = sy + ((y & 1) ? 1 : -1);
+        if (ny < 0) ny = 0;
+        if (ny >= height) ny = height - 1;
+        return (uint8_t)((3 * plane[sy * stride + sx] + plane[ny * stride + sx] + ((y & 1) ? 2 : 1)) >> 2);
+    }
     if (dec->max_h_samp != 2 * hs || width <= 2 ||
         (dec->max_v_samp != vs && dec->max_v_samp != 2 * vs)) {
         return plane[sy * stride + sx];
@@ -988,6 +1029,7 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
 
             /* Skip 'run' zeros, refining non-zeros along the way, then
              * place new_val (0 for ZRL) at the next zero and stop. */
+            int placed = 0;
             while (k <= dec->se && k < 64) {
                 int zk = jpeg_zigzag[k];
                 if (coef[zk] != 0) {
@@ -1010,10 +1052,15 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                     k++;
                 } else {
                     coef[zk] = (int16_t)new_val;
+                    placed = 1;
                     k++;
                     break;
                 }
             }
+            /* cleffa: a run that overshoots Se still writes the new coefficient, at position
+             * Se + 1 (or 63), as libjpeg's decode_mcu_AC_refine does through its padded natural
+             * order, without a warning; skipping it left one coefficient different. */
+            if (new_val && !placed) coef[jpeg_zigzag[k < 64 ? k : 63]] = (int16_t)new_val;
 
             /* Huffman lookahead may have reached the next marker while valid
              * bits remain buffered. The new coefficient was already written
@@ -1058,8 +1105,11 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
     }
     dec->eobrun = 0;
 
-    /* DC scans process all components interleaved, AC scans process one component */
-    if (dec->ss == 0) {
+    /* Interleaved DC scans walk MCUs; a scan of one component, DC (cleffa) or AC, walks that
+     * component's own blocks in raster order (A.2.2/A.2.3). A single-component DC scan walked
+     * as MCUs read a subsampled luma's blocks out of order (silently wrong pixels) or past the
+     * end of the scan (refused), where libjpeg decodes the file. */
+    if (dec->ss == 0 && num_scan_comps > 1) {
         /* DC scan - interleaved MCUs */
         for (int mcu_y = 0; mcu_y < dec->mcus_y; mcu_y++) {
             for (int mcu_x = 0; mcu_x < dec->mcus_x; mcu_x++) {
@@ -1103,7 +1153,7 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
             }
         }
     } else {
-        /* AC scan - non-interleaved, single component.
+        /* One component (AC, or DC in its own scan) - non-interleaved.
          * Per JPEG spec section A.2.3, non-interleaved scans process data units
          * in raster order. For components with sampling factors > 1, the number
          * of data units is based on the COMPONENT dimensions (scaled from image
@@ -1145,7 +1195,13 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                 /* Map image-based block position to MCU-aligned storage index */
                 int16_t *coef = dec->comp[comp_idx].coefs + (by * store_blocks_x + bx) * 64;
 
-                if (dec->ah == 0) {
+                if (dec->ss == 0) {
+                    if (dec->ah == 0) {
+                        if (jpeg_prog_decode_dc_first(dec, comp_idx, coef) < 0) return -1;
+                    } else {
+                        if (jpeg_prog_decode_dc_refine(dec, coef) < 0) return -1;
+                    }
+                } else if (dec->ah == 0) {
                     if (jpeg_prog_decode_ac_first(dec, comp_idx, coef) < 0) return -1;
                 } else {
                     if (jpeg_prog_decode_ac_refine(dec, comp_idx, coef) < 0) return -1;
@@ -1216,6 +1272,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
     jpeg_decoder dec;
     memset(&dec, 0, sizeof(dec));
+    memset(dec.coef_bits, -1, sizeof(dec.coef_bits));
 
     size_t pos = 2;
     jpeg_image *img = NULL;
@@ -1230,7 +1287,11 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         uint8_t marker = file_data[pos + 1];
         pos += 2;
 
-        if (marker == 0x00 || marker == 0xFF) continue;
+        /* cleffa: 0xFF fill bytes may precede any marker; step over one at a time, as libjpeg's
+         * next_marker does. Skipping "FF FF" as a pair swallowed the real marker's FF in
+         * "FF FF D9", so the decoder read past an EOI that libjpeg stops at. */
+        if (marker == 0xFF) { pos -= 1; continue; }
+        if (marker == 0x00) continue;
         if (marker == JPEG_EOI) break;
 
         /* Markers without length */
@@ -1242,7 +1303,10 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         uint16_t seg_len = (file_data[pos] << 8) | file_data[pos + 1];
         if (pos + seg_len > file_size) break;
 
-        if (marker == JPEG_SOF0 || marker == JPEG_SOF2) {
+        /* cleffa: SOF1 is sequential like SOF0; libjpeg writes it when a quantizer exceeds 255
+         * (cjpeg -quality below about 25). 12-bit precision and Huffman tables 2-3, which it also
+         * allows, are still refused by the checks below and in DHT/SOS. */
+        if (marker == JPEG_SOF0 || marker == JPEG_SOF1 || marker == JPEG_SOF2) {
             /* Start of frame */
             dec.is_progressive = (marker == JPEG_SOF2);
 
@@ -1279,6 +1343,11 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.comp[i].h_samp > dec.max_h_samp) dec.max_h_samp = dec.comp[i].h_samp;
                 if (dec.comp[i].v_samp > dec.max_v_samp) dec.max_v_samp = dec.comp[i].v_samp;
             }
+            /* cleffa: a one-component frame's sampling factors have no effect: its scans are
+             * non-interleaved, one block per MCU in raster order over the component's real size,
+             * as libjpeg decodes them. Walked as h x v MCUs, a one-component frame declaring 2x1
+             * (found by tests/fuzz_jpeg_diff.c) put its blocks in the wrong places. */
+            if (dec.num_components == 1) dec.comp[0].h_samp = dec.comp[0].v_samp = dec.max_h_samp = dec.max_v_samp = 1;
 
             /* Calculate MCU dimensions */
             /* cleffa: the luma plane is sized from component 0's own factors but read at
@@ -1323,7 +1392,11 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         uint8_t marker = file_data[pos + 1];
         pos += 2;
 
-        if (marker == 0x00 || marker == 0xFF) continue;
+        /* cleffa: 0xFF fill bytes may precede any marker; step over one at a time, as libjpeg's
+         * next_marker does. Skipping "FF FF" as a pair swallowed the real marker's FF in
+         * "FF FF D9", so the decoder read past an EOI that libjpeg stops at. */
+        if (marker == 0xFF) { pos -= 1; continue; }
+        if (marker == 0x00) continue;
         if (marker == JPEG_EOI) break;
 
         if (marker >= JPEG_RST0 && marker <= JPEG_RST0 + 7) continue;
@@ -1465,11 +1538,24 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             dec.bs.bitcount = 0;
             dec.bs.eof = 0;
 
-            /* Find end of scan data (next marker) */
+            /* Find end of scan data (next marker). cleffa: fill FFs before a restart marker stay
+             * in the scan; after any other run of FFs the scan ends at the run's first FF (a marker
+             * with fill bytes). "FF FF 00", fill before a stuffed zero, is not standard JPEG and is
+             * refused: libjpeg documents it as one FF data byte, but libjpeg-turbo's fast Huffman
+             * path decodes it differently, without a warning, whenever enough input remains
+             * buffered, so the reference's result for it depends on file size. Stopping at "FF FF"
+             * had also ended such scans early (tests/fuzz_jpeg_diff.c, tests/test_image.py). */
             size_t scan_end = scan_data_start;
             while (scan_end < file_size - 1) {
-                if (file_data[scan_end] == 0xFF && file_data[scan_end + 1] != 0x00 &&
-                    !(file_data[scan_end + 1] >= JPEG_RST0 && file_data[scan_end + 1] <= JPEG_RST0 + 7)) {
+                if (file_data[scan_end] == 0xFF) {
+                    size_t q = scan_end + 1;
+                    while (q < file_size && file_data[q] == 0xFF) q++;
+                    if (q >= file_size) break;
+                    if (file_data[q] == 0x00 && q > scan_end + 1) goto fail;
+                    if (file_data[q] == 0x00 || (file_data[q] >= JPEG_RST0 && file_data[q] <= JPEG_RST0 + 7)) {
+                        scan_end = q + 1;
+                        continue;
+                    }
                     break;
                 }
                 scan_end++;
@@ -1478,6 +1564,8 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
             if (dec.is_progressive) {
                 /* Decode progressive scan */
+                for (int i = 0; i < ns; i++)
+                    for (int k = dec.ss; k <= dec.se; k++) dec.coef_bits[scan_comps[i]][k] = (int8_t)dec.al;
                 if (jpeg_decode_progressive_scan(&dec, scan_comps, ns) < 0) goto fail;
                 pos = scan_end;
                 continue;  /* Continue to next scan */
@@ -1575,6 +1663,24 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         }
 
         /* Convert coefficients to pixels */
+        /* cleffa: libjpeg smooths an incomplete progressive image (jdcoefct.c smoothing_ok):
+         * when every component's DC is known and its DC and first nine AC quantizers are
+         * nonzero, and some component's first nine AC coefficients are not at full precision.
+         * That reconstruction is not implemented here, so such files are refused rather than
+         * decoded differently from the reference. */
+        {
+            int smooth = 0, possible = 1;
+            for (int ci = 0; ci < dec.num_components && possible; ci++) {
+                const uint16_t *q = dec.qt[dec.comp[ci].qt_idx];
+                if (dec.coef_bits[ci][0] < 0) possible = 0;
+                for (int k = 0; k < 10 && possible; k++) if (q[k] == 0) possible = 0;
+                for (int k = 1; k < 10; k++) if (dec.coef_bits[ci][k] != 0) smooth = 1;
+            }
+            if (possible && smooth) {
+                for (int i = 0; i < dec.num_components; i++) free(planes[i]);
+                goto fail;
+            }
+        }
         jpeg_prog_finish(&dec, planes, strides);
 
         /* Create output image */
@@ -1655,6 +1761,7 @@ jpeg_image *jpeg_load(const char *path) {
 #undef JPEG_SOI
 #undef JPEG_EOI
 #undef JPEG_SOF0
+#undef JPEG_SOF1
 #undef JPEG_SOF2
 #undef JPEG_DHT
 #undef JPEG_DQT

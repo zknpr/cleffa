@@ -7,9 +7,11 @@
  *   4 dc-accumulation     1024x512, the same difference in every block: DC prediction times the
  *                         quantizer overflowed int long before the IDCT
  *   5 progressive-dc      128x128 DC-only progressive scan, Al = 13: prediction << Al overflowed
+ *                         (an incomplete progressive image, so now refused at the end, after its
+ *                         scan has been decoded under UBSan)
  *   6 duplicate-scan      a 3-component baseline SOS naming component 1 three times, only table 1
  *                         defined: components 2 and 3 decoded with undefined table 0 (values[-1])
- * Cases 1, 2 and 6 must be refused, 3-5 must decode (the content is out of range, the syntax is not).
+ * Cases 1, 2, 5 and 6 must be refused, 3-4 must decode (the content is out of range, the syntax is not).
  * Built with UBSan and ASan and -fno-sanitize-recover; includes clef_image.c so the decoders are
  * instrumented. Usage: test-jpeg-ub [CASE...]  (all cases without arguments) */
 #include "../clef_image.c"
@@ -127,7 +129,7 @@ static int run(int c) {
     char err[256] = "";
     const bool ok = clef_image_decode(j.p, j.n, &rgb, err, sizeof(err));
     free(j.p);
-    const bool want_ok = c >= 3 && c <= 5;
+    const bool want_ok = c == 3 || c == 4;
     if (ok != want_ok) {
         fprintf(stderr, "jpeg ub: case %d %s: %s\n", c, names[c], ok ? "decoded, expected refusal" : err);
         if (ok) clef_rgb_free(&rgb);

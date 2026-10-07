@@ -513,7 +513,7 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
 }
 
 bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, size_t errlen) {
-    uint32_t patch, merge, temporal, min_px, max_px, image_id, start_id, end_id, video_id;
+    uint32_t patch, merge, temporal, min_px, max_px, image_id, start_id, end_id, video_id, vocab;
     if (!gguf_find_kv(f, "clef.vision.image_token_id")) {
         /* a model file converted without the vision tower: text only */
         v->image_token_id = 0;
@@ -523,7 +523,8 @@ bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, s
         !gguf_get_u32(f, "clef.vision.temporal_patch_size", &temporal) ||
         !gguf_get_u32(f, "clef.vision.image.min_pixels", &min_px) || !gguf_get_u32(f, "clef.vision.image.max_pixels", &max_px) ||
         !gguf_get_u32(f, "clef.vision.image_token_id", &image_id) || !gguf_get_u32(f, "clef.vision.start_token_id", &start_id) ||
-        !gguf_get_u32(f, "clef.vision.end_token_id", &end_id) || !gguf_get_u32(f, "clef.vision.video_token_id", &video_id)) {
+        !gguf_get_u32(f, "clef.vision.end_token_id", &end_id) || !gguf_get_u32(f, "clef.vision.video_token_id", &video_id) ||
+        !gguf_get_u32(f, "clef.vocab_size", &vocab)) {
         snprintf(err, errlen, "model: incomplete clef.vision.* keys");
         return false;
     }
@@ -531,6 +532,12 @@ bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, s
     if (patch != 16 || merge != 2 || temporal != 2 || min_px == 0 || max_px < min_px || max_px > INT32_MAX ||
         !image_id || !start_id || !end_id || !video_id || image_id > INT32_MAX || start_id > INT32_MAX || end_id > INT32_MAX) {
         snprintf(err, errlen, "model: unsupported vision geometry (patch %u, merge %u, temporal %u)", patch, merge, temporal);
+        return false;
+    }
+    /* Every id the encoder emits indexes the embedding table. An id at or past the vocabulary
+     * loaded fine and failed each image request only after decoding it (review #3). */
+    if (vocab > INT32_MAX || image_id >= vocab || start_id >= vocab || end_id >= vocab || video_id >= vocab) {
+        snprintf(err, errlen, "model: vision token ids must be below the vocabulary size %u", vocab);
         return false;
     }
     v->image = (clef_image_params){ (long)min_px, (long)max_px, (int)patch, (int)merge, (int)temporal };

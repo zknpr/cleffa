@@ -55,15 +55,23 @@ make clean
   `THIRD_PARTY_NOTICES.md`); `clef_image.c` is their only includer and sets their decode limits.
   Local changes are the input checks and arithmetic listed in `jpeg.h`'s header comment (scan
   header bounds, luma must be the most sampled component, scans may only use defined Huffman
-  tables and name each component once, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT) and
+  tables and name each component once, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT,
+  single-component progressive DC scans in raster order, libjpeg's h1v2 (4:4:0) upsampling, SOF1
+  as baseline, libjpeg's write for an overshooting refinement run, refusal of progressive images
+  libjpeg would smooth, fill bytes before markers skipped one at a time, `FF FF 00` in entropy
+  data refused (libjpeg-turbo's result for it is not stable), one-component frames as 1x1, a no-op
+  `JPEG_RANGE_HOOK` for the differential fuzzer) and
   optional PNG inflate/CRC hooks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
   the original dependency-free PNG implementation remains the fallback. Decoder changes
   require `tests/test_image.py` against Pillow, including malformed streams and CRCs, and
-  `tests/test_jpeg_ub.c` (crafted JPEGs under UBSan and ASan, in `make test`), plus a fuzz run
-  on the result (`make fuzz-image`, below). Treat any undefined behavior the decoders can reach
-  from a file as a bug even when the output is clamped.
+  `tests/test_jpeg_ub.c` (crafted JPEGs under UBSan and ASan, in `make test`), plus
+  `make test-image-diff` (files from cjpeg, sips, ffmpeg and Pillow against Pillow) and fuzz runs on
+  the result (`make fuzz-image`, `make fuzz-jpeg-diff`, below). Treat any undefined behavior the
+  decoders can reach from a file as a bug even when the output is clamped, and any pixel that
+  differs from libjpeg on a file it decodes without warnings as a parity bug: sanitizers and plain
+  fuzzing never catch the second kind.
 - `tools/evidence_archive.py OUT.tar.gz` builds the publishable evidence archive from `golden/`
   (rules and placeholders in its docstring; `--list` previews). Publishing it as a release asset is
   a release step and needs explicit approval. `tests/test_evidence_archive.py` covers the rules.
@@ -174,6 +182,9 @@ tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.
 # The harness repairs PNG chunk CRCs and the zlib trailer, or mutations rarely pass them.
 make fuzz-image && .venv/bin/python -B tests/fuzz_image_seeds.py fuzz/seeds
 ./fuzz-image -dict=tests/fuzz_image.dict -fork=14 -ignore_crashes=1 -max_total_time=1800 -artifact_prefix=fuzz/artifacts/ fuzz/corpus fuzz/seeds
+# differential: decoder vs libjpeg-turbo, pixel for pixel (Homebrew jpeg-turbo), and the encoder corpus
+make fuzz-jpeg-diff && ./fuzz-jpeg-diff -dict=tests/fuzz_image.dict -fork=14 -ignore_crashes=1 -max_total_time=1200 -artifact_prefix=fuzz/artifacts-diff/ fuzz/corpus-diff fuzz/seeds
+make test-image-diff
 
 # invariants
 tests/test_batch.sh  gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # batch invariance + tenant isolation
@@ -225,7 +236,9 @@ internal GPU/head entry points. `clef_main.c` (CLI) and `clef_server.c` (HTTP) a
 `tools/convert.py` writes one GGUF with architecture `clef`. `clef.c` `load_config` reads the
 `clef.*` keys and `bind_weights` binds every tensor by name with an exact type+shape check, so a
 converter change and the engine must move together. Shape assumptions baked into the kernels are
-enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...). The GGUF is mmap'd and wrapped as a
+enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...), including, for a vision model,
+interleaved M-RoPE section `[11, 11, 10]` (the kernels' `lane % 3`; text cannot reveal a mismatch)
+and vision token ids below the vocabulary. The GGUF is mmap'd and wrapped as a
 single `MTLBuffer` with no copy; weight tensors are addressed by file offset.
 
 Converter layout decisions the engine depends on: per-layer projections fused into one GEMM each

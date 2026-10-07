@@ -98,6 +98,18 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
             snprintf(err, errlen, "model: unsupported vision shape (E=%d heads=%d patch=%d merge=%d)", c->v_E, c->v_heads, c->v_patch, c->v_merge);
             return false;
         }
+        /* The rotary prep kernels pick each rotary pair's position axis as lane % 3, which is
+         * interleaved M-RoPE with section [11, 11, 10] over 32 pairs, the only layout they
+         * implement. Text hides any other layout (its three positions are equal), so refuse it
+         * here rather than answer image requests with the wrong axes (review #3). The converter
+         * refuses non-interleaved layouts; the GGUF records the section. */
+        int32_t sec[4];
+        uint64_t n_sec = 0;
+        if (!gguf_read_i32_array(f, "clef.rope.mrope_section", sec, 4, &n_sec) || n_sec != 3 ||
+            sec[0] != 11 || sec[1] != 11 || sec[2] != 10 || c->n_rot != 64) {
+            snprintf(err, errlen, "model: unsupported M-RoPE layout (the kernels implement interleaved [11, 11, 10])");
+            return false;
+        }
         /* Only after the fixed geometry is confirmed: cfg_u32 admits each factor up to 2^24, and
          * this product overflowed int (undefined behavior) on a crafted file before the check
          * above rejected it (review #3, tests/test_vision_config.c). */

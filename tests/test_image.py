@@ -80,6 +80,125 @@ LUMA_UNDER_CHROMA_JPEG = (
 )
 
 
+# Progressive 4:2:0 JPEGs with one DC scan per component (cjpeg -scans: "0: 0 0 0 0; 1: 0 0 0 0;
+# 2: 0 0 0 0;" then each component's AC), which libjpeg decodes. A non-interleaved luma DC scan
+# was walked as MCUs: the 37x21 file was refused and the 32x32 one decoded wrong (review #3).
+SEPARATE_DC_SCANS_37X21 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
+    "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+    "Hh4eHh4eHh7/wgARCAAVACUDASIAAhEBAxEB/8QAGAABAQEBAQAAAAAAAAAAAAAABgQHBQj/2gAIAQEAAAAA8+MmcURrbl+GUc/b"
+    "S4JF/8QAFgEBAQEAAAAAAAAAAAAAAAAABwgG/9oACAECEAAAAGyesLTZEPf/xAAXAQEAAwAAAAAAAAAAAAAAAAAFAgQG/9oACAED"
+    "EAAAALC+QTiV/8QAKxAAAQMDAwMDAwUAAAAAAAAAAQIDEQQFBgASIQcTMSNhgRQVoTNCUZGi/9oACAEBAAE/ALPRd6ONWfHO9t9O"
+    "fjVnwfvbfR/GuoHT8vuUNtSwqAC+sbBBmUp588Qr+x8UHR7uMz9L/nWF0Pe2cTrC8c72z0/xq73yyYjUItwonLndSgLNM0oJS0CR"
+    "HcXztJSSQACeBMAgm7XjN80yGqrPuSqClcfCmWrcg04CUp2JO79QyBJClESfAgAUnT6wW1pLF0uNsoXlIC0t1NShtRSSRICiDEg8"
+    "+x10xp0OdqfbV+vD2JYU3X21ps1lTUJpWnFiQyVJUrft8KICDAPEkEyBBx+00lJjdTUoCt4bCElJ2lJUQkKB9pn41kmQXG35NU4r"
+    "Z1N29lhDaXKltMvub2gowo8IELHgbgUyFCY1iGC2dVsBKf4/br//xAAnEQABAgQFAwUAAAAAAAAAAAABAwQAAgURBhIhMVETFEEi"
+    "YXKx0v/aAAgBAgEBPwDG9W7bNrDl89dKzL3EkgFwT5vwN/fwOIcVJcqzZXBI+B/UY4lCtQlTn1BO0LALuF+rrYE68jLb7MP6g57m"
+    "f1neP//EACYRAAIBAgQFBQAAAAAAAAAAAAECAwAEBQYRIRIUMUFRIiNzkdL/2gAIAQMBAT8Asbzk9KzPj2IpgyojCNZiACx0JUbk"
+    "gDc9h2BB61FPcFAVuiR8Z/VWUKT4pDFINVLbjzWcHN3mdIZ/UqQ8QB6Bi+mv15qTEbriPuGv/9k="
+)
+SEPARATE_DC_SCANS_32X32 = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
+    "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+    "Hh4eHh4eHh7/wgARCAAgACADASIAAhEBAxEB/8QAGQABAQADAQAAAAAAAAAAAAAABgcDBAUI/9oACAEBAAAAAPPjJnpDbcvhmK1n"
+    "53315/gf/8QAFQEBAQAAAAAAAAAAAAAAAAAABwj/2gAIAQIQAAAAbJ6WyX//xAAVAQEBAAAAAAAAAAAAAAAAAAAFBP/aAAgBAxAA"
+    "AAChcov/xAAwEAABAwIFAgMGBwAAAAAAAAABAgMRBAUGEhMhMQAHFCMzFSIyUYGhJkFCRFNxkf/aAAgBAQABPwCz0WtG3Vnw5rZf"
+    "Ln6dWfA+tl8n7ddwO35fcobalhUAF9YyCDMpTvztCv8AR9MF0Otk2nrBeHNbJ5f26u98smEahFuFE5c7qUBZpmlBKWgSI1F75SUk"
+    "kAAnYTAIJu14xvjTENVWe0lUFK4+FMtW5BpwEpTkSc3qGQJIUoiTwIAHa6i1tLaeOr/dnsI4bpBbkNm63BZbpitJIaSB77kRBKZS"
+    "AD+agYIBBs+HWbXhSquD6m6dKGiA4twNhEjdWY8ZRKv6SeOemb7dbtVrtuEkeCtvwCsDcVDwghRST6aTIiAFjKDInKOyVFraG08d"
+    "PsLxF3MrVZXCzQrFCylaEgpDZIWNuQXNQgneCOOB35rqq74gocAWt5QtdGEv16WwnLUPycqSoEkhG4y7QuZBKUw7UeC/DGGDNf6d"
+    "bWt/t/m2g/yfNX6eB73w/wD/xAAoEQACAAMGBQUAAAAAAAAAAAABAgMEUQAGESExQQUSFCJhMnGRocH/2gAIAQIBAT8AvvxbpubO"
+    "0zPTs1FaPiEQDEE740GvnYUtfVljTriJ6EBJ80Hz9A2nVZoJjxe5nzAOirsW/Peun//EACURAQABAgQGAwEAAAAAAAAAAAECBREA"
+    "AwQhBjJBUWGREhQiMf/aAAgBAwEBPwDQ6z6dscT16owo0YQkZcc5AZNlibqBu9DoI/3FP0cNRUbZvJA+Sd+x79gmOJ9VOp1sjmfp"
+    "hEsPLG+7KXncLeNhXH//2Q=="
+)
+
+
+# Layouts Pillow never writes, from cjpeg, which libjpeg decodes (tests/test_image_diff.py): vertical-only
+# 2:1 chroma (4:4:0, -sample 1x2,1x1,1x1), decoded with replicated rows up to 69 levels off, and SOF1
+# (-quality 1: 16-bit quantizers), which was refused.
+CHROMA_440_JPEG = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
+    "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+    "Hh4eHh4eHh7/wAARCAARAA8DARIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF"
+    "BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+    "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi"
+    "4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAEC"
+    "AxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVm"
+    "Z2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq"
+    "8vP09fb3+Pn6/9oADAMBAAIRAxEAPwCX4a/8U19t/wCGaf8AitftPl/29/bf7r7Lt3fZ/L3fZ87t0+cb/uL93uWn/FUY/wCbdfs3"
+    "/bn/AG3u/wDAbf5O3/bx5/8ADn5sahhVPKFjsNP1jUYvAE8mraf9odRLdja3lBj5TchOSMk8fgKk1mT+0fEGoy/2d/wgv+lSt9i2"
+    "+VjLn91jEf8Aq+mMcZ6CvscBeFCPsbp2V+RqD2+06mkn5w0Wt90fe5Y5Qw0Hh7puMb+zapt6fadXSb3s4aLW+6PU/wBvP/mSf+3/"
+    "AP8Abeivjqh8FVPO/wBoT/koOqf9hW+/9G0V9PxT/wAi/Af4P/bYH2HGn/Iryz/r3/7bTP/Z"
+)
+SOF1_JPEG = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCDEAMgAiYCWAK8AlgB9AMgArwCigK8A4QDUgMgA7YEsAfQBRQEsARMBEwEsAmSBtYHOgWq"
+    "B9ALVAn2C+oLuAsiCfYK8Aq+DIAOEBH4DzwMgA1IEP4Negq+CvAPoBVKD9IQ/hKOEyQUHhRQFB4MHA8KFhIXohXgE4gXcBH4E7oU"
+    "HhNW/9sAgxEDUgOEA4QEsAQaBLAJLgUUBRQJLhNWDOQK8AzkE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YT"
+    "VhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVhNWE1YTVv/BABEIABAAEAMBIgAC"
+    "EQEDEQH/xAAfAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgv/xAC1EAACAQMDAgQDBQUEBAAAAX0BAgMABBEFEiExQQYTUWEH"
+    "InEUMoGRoQgjQrHBFVLR8CQzYnKCCQoWFxgZGiUmJygpKjQ1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoOE"
+    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4eLj5OXm5+jp6vHy8/T19vf4+fr/xAAf"
+    "AQADAQEBAQEBAQEBAAAAAAAAAQIDBAUGBwgJCgv/xAC1EQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGh"
+    "scEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqS"
+    "k5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/"
+    "ACiiigD/2Q=="
+)
+
+
+# A progressive file from tests/fuzz_jpeg_diff.c whose luma AC scan holds "FF FF FF 00": libjpeg's slow
+# path read it as one FF data byte while the old decoder ended the scan there and decoded the rest
+# from padding. Fill before a stuffed zero is not standard and is now refused (see with_padded_stuffing).
+FF_RUN_BEFORE_STUFFED_ZERO_JPEG = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
+    "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+    "Hh4eHh4eHh7/wgARCAAgACADASIAAhEBAxEB/8QAGQABAQADAQAAAAAAAAAAAAAABgcDBAUI/9oACAEBAAAAAPPjJnpDbcvhmK1n"
+    "533l5/gf/8QAFQEBAQAAAAAAAAAAAAAAAAAABwj/2gAIAQIQAAAAbJ6WyX//xAAVAQEBAAAAAAAAAAAAAAAAAAAFBP/aAAgBAxAA"
+    "AAChcov/xAAwEAABAwIFAgMGBwAAAAAAAAABAgMRBAUGEhMhMQAHFCMzFSIyUYGhJkFCRFNxkf/aAAgBAQABPwCz0WtG3Vnw5rZf"
+    "Ln6dWfA+tl8n7ddwO37///8AbS7SWdYyCDMpTvztCv8AR9MF0Otk2nrBeHNbGCeX9urvfLJhGoRbhROXO6lAWaZpQSloEiNRguUl"
+    "JJAAJ2EwCCbteMb40xDVVntJVBSuPhTLVuQacBKU5EnN6hkCSFKIk8CAB2uotbS2njq/3Z7COG6QW5DZutwWW6YrSSGkge+5EQSm"
+    "UgA/moGCAQbPh1m14Uqrg+punShogOLcDYRI3VmPGUSr+knjnpm+3W7Va7bhJHgrb8ArA3FQ8IIUUiymkyIgBYygyJyjslRa2htP"
+    "HT7C8RdzK1WVws0KxQspWhIKQ2SFjbkFzUIJ3gjjgd+a6qu+IKHAFreULXRhL9elsJw1D8nKkqBJIRuMu0LmQSlMO1HgvwxhgzX+"
+    "nW1rf7f5toP8nzV+nge98P8A/8QAKBEAAgADBgUFAAAAAAAAAAAAAQIDBFEABhEhMUEFEhQiYTJxkaHB/9oACAECAQE/AL78W6bm"
+    "ztMz07NRWj4hEAxBO+NBr52FLX1ZY064iehASfNB8/QNp1WaCY8XuZ8wDoq7Fvz3rp//xAAlEQEAAQIEBgMBAAAAAAAAAAABAgUR"
+    "AAMEIQYyQVFhkRIUIjH/2gAIAQMBAT8A0Os+nbHE9eqMKNGEJGXHOQGTZYm6gbvQ6CP9xT9HDUVG2byQPknfse/YJjifVTqdbI5n"
+    "6YRLDyxvuyl53C3jYVx//9k="
+)
+
+
+def with_fill_bytes(jpeg: bytes) -> bytes:
+    """The same JPEG with one 0xFF fill byte before every marker after SOI, which the format allows
+    and libjpeg skips. The vendored decoder stepped over "FF FF" as a pair and so lost the marker's
+    own FF (review #3, found by tests/fuzz_jpeg_diff.c)."""
+    out, pos = bytearray(jpeg[:2]), 2
+    while pos < len(jpeg):
+        assert jpeg[pos] == 0xFF
+        m = jpeg[pos + 1]
+        out += b"\xff"
+        if m == 0xD9:
+            out += jpeg[pos:]
+            break
+        seg = int.from_bytes(jpeg[pos + 2:pos + 4], "big")
+        end = pos + 2 + seg
+        if m == 0xDA:   # entropy-coded data runs to the next marker that is not stuffing or RSTn
+            while end + 1 < len(jpeg) and not (jpeg[end] == 0xFF and jpeg[end + 1] not in (0x00,) and not 0xD0 <= jpeg[end + 1] <= 0xD7):
+                end += 1
+        out += jpeg[pos:end]
+        pos = end
+    return bytes(out)
+
+
+def with_padded_stuffing(jpeg: bytes) -> bytes:
+    """Every stuffed FF 00 in the entropy-coded data written as FF FF 00, fill before a stuffed zero,
+    which is not standard JPEG. libjpeg documents it as one FF data byte, but Pillow's libjpeg-turbo
+    decodes it differently through its fast Huffman path, silently, once enough input is buffered,
+    so the engine refuses it (review #3, found by tests/fuzz_jpeg_diff.c)."""
+    sos = jpeg.index(b"\xff\xda")
+    head, body = jpeg[:sos], jpeg[sos:]
+    seg = int.from_bytes(body[2:4], "big")
+    return head + body[:2 + seg] + body[2 + seg:].replace(b"\xff\x00", b"\xff\xff\x00")
+
+
 def progressive_se255(arr: np.ndarray) -> bytes:
     """A progressive JPEG whose first AC scan declares Se = 255: the coefficient index ran past the
     64-entry zigzag table (global over-read feeding a heap write) until the scan header was validated."""
@@ -195,6 +314,25 @@ def main() -> None:
             compressor = zlib.compressobj(level, zlib.DEFLATED, zlib.MAX_WBITS, 8, strategy)
             stream = compressor.compress(raw) + compressor.flush()
             cases.append((name, png_stream(stream, 256, 256), Image.fromarray(arr), MIN_PIXELS, MAX_PIXELS))
+        for name, b64 in (("separate-dc-37x21", SEPARATE_DC_SCANS_37X21), ("separate-dc-32x32", SEPARATE_DC_SCANS_32X32),
+                          ("chroma-440", CHROMA_440_JPEG), ("sof1", SOF1_JPEG)):
+            cases.append((name, b64, Image.open(io.BytesIO(base64.b64decode(b64))), MIN_PIXELS, MAX_PIXELS))
+        for prog in (False, True):
+            buf = io.BytesIO()
+            Image.fromarray(synth(np.random.default_rng(23), 37, 53)).save(buf, "JPEG", quality=80, progressive=prog)
+            filled = with_fill_bytes(buf.getvalue())
+            cases.append((f"fill-bytes{'-prog' if prog else ''}", base64.b64encode(filled).decode(),
+                          Image.open(io.BytesIO(filled)), MIN_PIXELS, MAX_PIXELS))
+        # A one-component frame declaring 2x2 sampling, which libjpeg and Pillow ignore: the old decoder
+        # walked its blocks as 2x2 MCUs (review #3, a 2x1 frame found by tests/fuzz_jpeg_diff.c).
+        gray = io.BytesIO()
+        Image.fromarray(synth(np.random.default_rng(31), 21, 37)).convert("L").save(gray, "JPEG", quality=85)
+        g = bytearray(gray.getvalue())
+        sof = g.index(b"\xff\xc0")
+        if g[sof + 9] != 1 or g[sof + 11] != 0x11:
+            sys.exit("gray-sampling fixture is not a one-component 1x1 frame")
+        g[sof + 11] = 0x22
+        cases.append(("gray-declared-2x2", base64.b64encode(bytes(g)).decode(), Image.open(io.BytesIO(bytes(g))), MIN_PIXELS, MAX_PIXELS))
         lines = [json.dumps({"image": b64, "out": f"{tmp}/{name}", "min_pixels": mn, "max_pixels": mx})
                  for name, b64, _, mn, mx in cases]
         results = run_tool(lines)
@@ -257,6 +395,13 @@ def main() -> None:
                json.dumps({"image": "data:image/png,notbase64", "out": f"{tmp}/bad4"}),
                json.dumps({"image": base64.b64encode(se255).decode(), "out": f"{tmp}/bad5"}),
                json.dumps({"image": LUMA_UNDER_CHROMA_JPEG, "out": f"{tmp}/bad6"})]
+        noisy = io.BytesIO()
+        Image.fromarray(np.random.default_rng(29).integers(0, 256, (48, 64, 3), dtype=np.uint8)).save(noisy, "JPEG", quality=95)
+        padded = with_padded_stuffing(noisy.getvalue())
+        if padded.count(b"\xff\xff\x00") < 3:
+            sys.exit("padded-stuffing fixture has too few stuffed bytes to test anything")
+        bad.append(json.dumps({"image": base64.b64encode(padded).decode(), "out": f"{tmp}/bad7"}))
+        bad.append(json.dumps({"image": FF_RUN_BEFORE_STUFFED_ZERO_JPEG, "out": f"{tmp}/bad8"}))
         raw = b"\0\x10\x20\x30"   # one RGB scanline, including its filter byte
         stream = zlib.compress(raw)
         corrupt_checksum = stream[:-1] + bytes([stream[-1] ^ 1])
@@ -278,7 +423,7 @@ def main() -> None:
         # the crafted JPEGs' unmodified sources still decode, and PIL reads the unusual sampling layout
         Image.open(io.BytesIO(base64.b64decode(LUMA_UNDER_CHROMA_JPEG))).load()
         print("errors: bad base64, truncated PNG, aspect ratio, 16-bit PNG, a non-base64 data URL, a progressive scan "
-              "with Se = 255, a luma-under-chroma JPEG, seven malformed zlib streams and three corrupt CRCs rejected"
+              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, seven malformed zlib streams and three corrupt CRCs rejected"
               if not failures else "errors: see above")
     sys.exit(1 if failures else 0)
 

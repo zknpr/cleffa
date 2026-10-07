@@ -132,6 +132,11 @@ def main() -> None:
         raise ValueError("unsupported vision tower")
     if vision.get("deepstack_visual_indexes"):
         raise ValueError("deepstack injection is not implemented")
+    # The rotary kernels pick each frequency's position axis as lane % 3: interleaved M-RoPE with
+    # section [11, 11, 10]. The GGUF records the section (checked again at load), not the
+    # interleaving, so refuse anything else here.
+    if rope.get("mrope_interleaved") is not True or list(rope.get("mrope_section", [])) != [11, 11, 10]:
+        raise ValueError("only interleaved M-RoPE with mrope_section [11, 11, 10] is implemented")
     if vision.get("hidden_act") != "gelu_pytorch_tanh" or vision["hidden_size"] % vision["num_heads"]:
         raise ValueError("unexpected vision block configuration")
     if vision["out_hidden_size"] != text["hidden_size"]:
