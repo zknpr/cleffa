@@ -94,14 +94,14 @@ EXCLUDE_EXT = {'.o', '.a', '.dylib', '.inc', '.bin', '.npy', '.npz', '.pt', '.xm
                '.gz', '.zip', '.tar', '.zst', '.xz', '.bz2', '.7z', '.dmg', '.pkg'}
 
 def path_pattern(path: str) -> str:
-    """`path` where it is a path: not preceded by another slash (the `//root` of
-    `mysql://root:pw@db` is a URL authority, not a home directory) and not followed by a name
+    """`path` where it is a path: not inside a URL authority (the `//root` of
+    `mysql://root:pw@db` is not a home directory) and not followed by a name
     character (`/rooted/` is another directory). Shared by the rewrite and the forbidden
     pattern, so a home of /root neither rewrites a connection string's userinfo nor excludes
-    a file for `/rooted/path` after the rewrite left it alone (reviews #94, #100). The two
-    slashes of a `file://` URL are the URL's, not a directory's, so a path right after them
-    is still a path (review #120)."""
-    return r'(?:(?<=file://)|(?<!/))' + re.escape(path) + r'(?![A-Za-z0-9_.-])'
+    a file for `/rooted/path` after the rewrite left it alone (reviews #94, #100). What makes
+    `//root` an authority is the `:/` before it; a path after `file://` or with a doubled
+    leading slash (`//workspace/cleffa/x`) is still a path (reviews #120, #128)."""
+    return r'(?<!:/)' + re.escape(path) + r'(?![A-Za-z0-9_.-])'
 
 
 def path_rewrite(path: str, placeholder: str) -> tuple[re.Pattern, str]:
@@ -377,6 +377,30 @@ def basic_credential(text: str) -> bool:
     return False
 
 
+STRONG_KEY = re.compile(r'^[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX + '$', re.IGNORECASE)
+PLACEHOLDER_VALUE = re.compile(r'^(?:' + PLACEHOLDER + r')$', re.IGNORECASE)
+
+
+def json_credential(text: str) -> bool:
+    """A strongly named field of a JSON document with a non-empty string value that is not a
+    placeholder. In decoded JSON the key and the value are unambiguous, so the first-character
+    exclusions that keep plain-text escapes and structures out do not apply (review #127)."""
+    def walk(v) -> bool:
+        if isinstance(v, dict):
+            for k, x in v.items():
+                if isinstance(k, str) and isinstance(x, str) and x and STRONG_KEY.match(k) and not PLACEHOLDER_VALUE.match(x):
+                    return True
+                if walk(x):
+                    return True
+        elif isinstance(v, list):
+            return any(walk(x) for x in v)
+        return False
+    try:
+        return walk(json.loads(text))
+    except ValueError:
+        return False
+
+
 def forbidden_in(text: str, pattern: re.Pattern = None) -> bool:
     """FORBIDDEN (or the given pattern) and the Basic-authorization check over the text, over
     its decoded strings when it is JSON, and over both with character escapes decoded."""
@@ -385,7 +409,7 @@ def forbidden_in(text: str, pattern: re.Pattern = None) -> bool:
     decoded = json_strings(text)
     if decoded is not None:
         views += [decoded, unescape(decoded)]
-    return any(pattern.search(v) or basic_credential(v) for v in views)
+    return any(pattern.search(v) or basic_credential(v) or json_credential(v) for v in views)
 
 
 FLOAT_DTYPES = {'F64': 8, 'F32': 4, 'F16': 2, 'BF16': 2}   # element sizes in bytes

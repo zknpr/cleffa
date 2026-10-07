@@ -940,10 +940,10 @@ class EvidenceArchive(unittest.TestCase):
         # /root it must not match /rooted/path or the //root of a URL authority, which the
         # rewrite already leaves alone, or the build drops legitimate evidence on that machine.
         pat = re.compile(ea.path_pattern('/root'))
-        for text in ['log=/root/x.log', 'home: /root', '"/root"']:
-            self.assertTrue(pat.search(text), text)
-        for text in ['/rooted/path', 'mysql://root:pw@db', 'https://h//root/y', '/root.bak']:
-            self.assertFalse(pat.search(text), text)
+        for text in ['log=/root/x.log', 'home: /root', '"/root"', '//root/x', 'file:///root/x', 'https://h//root/y']:
+            self.assertTrue(pat.search(text), text)   # a doubled slash or a URL's own path is still a path
+        for text in ['/rooted/path', 'mysql://root:pw@db', 'ssh://root@host', '/root.bak']:
+            self.assertFalse(pat.search(text), text)   # an authority follows ':/'; a longer name is another path
         self.assertEqual(ea.path_rewrite('/root', '<home>')[0].pattern, ea.path_pattern('/root'))
 
     def test_triple_quoted_credentials_are_caught(self):
@@ -1118,14 +1118,15 @@ class EvidenceArchive(unittest.TestCase):
         # a checkout outside /Users, /home and /root, where only the dynamic pattern applies.
         from unittest.mock import patch
         exp = self.root / 'gemm-probe-20261004'
-        (exp / 'fileurl.log').write_text('see file:///workspace/cleffa/result.json and /workspace/cleffa/x\n')
+        (exp / 'fileurl.log').write_text('see file:///workspace/cleffa/result.json and /workspace/cleffa/x\n'
+                                         'and //workspace/cleffa/y but not ssh://workspace/cleffa\n')
         rewrites = [ea.path_rewrite('/workspace/cleffa', '<repo>')]
         forbidden = re.compile(ea.path_pattern('/workspace/cleffa') + '|' + ea.CREDENTIAL_PATTERNS, re.IGNORECASE)
         with patch.object(ea, 'REWRITES', rewrites), patch.object(ea, 'FORBIDDEN', forbidden):
             ea.build(self.root, Path(self.tmp.name) / 'fileurl.tar.gz', 'ev')
         with tarfile.open(Path(self.tmp.name) / 'fileurl.tar.gz') as tar:
             text = tar.extractfile('ev/gemm-probe-20261004/fileurl.log').read().decode()
-        self.assertEqual(text, 'see file://<repo>/result.json and <repo>/x\n')
+        self.assertEqual(text, 'see file://<repo>/result.json and <repo>/x\nand /<repo>/y but not ssh://workspace/cleffa\n')
         self.assertFalse(re.compile(ea.path_pattern('/root')).search('mysql://root:pw@db'))   # a URL authority stays
 
     def test_compound_token_names_are_strong(self):
@@ -1174,6 +1175,24 @@ class EvidenceArchive(unittest.TestCase):
         for name, text in {**caught, **kept}.items():
             (exp / name).write_text(text)
         manifest = ea.build(self.root, Path(self.tmp.name) / 'triplelong.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_decoded_json_credential_fields_are_caught_whatever_the_first_character(self):
+        # In decoded JSON the key and the value are unambiguous strings; the first-character
+        # exclusions exist for plain text, where a backslash or a brace is an escape or a
+        # structure. A non-empty, non-placeholder string under a strong key is a credential.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'j1.json': '{"password":"\\\\hunter2"}', 'j2.json': '{"api_key":"[abc123"}',
+                  'j3.json': '{"secret": "{brace"}', 'j4.json': '{"auth_token": "<x"}', 'j5.json': '{"nested": {"db": {"password": "(p"}}}'}
+        kept = {'k1.json': '{"password": "<redacted>", "secret": "", "api_key": null, "passwd": "${PW}"}',
+                'k2.json': '{"password": {"type": "string"}, "secret": [1], "token": "abc"}'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'jsonlead.tar.gz', 'ev')
         names = {e['path'] for e in manifest['files']}
         for name in caught:
             self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
