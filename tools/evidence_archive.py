@@ -98,7 +98,7 @@ EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
 ENGINE_MARKERS = ('clef.c', 'clef_engine.h')
 ENGINE_DIRS = {'tests', 'bench', 'tools', 'metal', 'ref', 'docs', 'golden', 'gguf', 'model', 'model-flash'}
 ENGINE_ROOT_FILES = {'Makefile', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'CLAUDE.md', 'AGENTS.md',
-                     'pyrightconfig.json', 'smoke_test.py', 'download_models.sh', 'release.sh'}
+                     'pyrightconfig.json', 'requirements.txt', 'smoke_test.py', 'download_models.sh', 'release.sh'}
 ENGINE_ROOT_EXT = {'.d', '.o'}
 # The engine's own root sources are all named clef*; an experiment's probe program beside them
 # (scorer.c, timed_head.c) is that experiment's evidence and stays.
@@ -239,6 +239,8 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        # any length: `--api-key abcdefghijklmnop`, `--password x` (reviews #113, #117)
                        r'(?<![A-Z0-9-])--?[A-Z0-9-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'[ \t]+["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]*|'
+                       # curl's user:password argument, whose option is not named for a credential
+                       r'(?<![A-Z0-9-])(?:--user|-u)[ \t=]+["\']?[^\s"\':]+:[^\s"\']+|'
                        r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
 FORBIDDEN = re.compile(PATH_PATTERNS + '|' + CREDENTIAL_PATTERNS, re.IGNORECASE)
 CREDENTIALS = re.compile(CREDENTIAL_PATTERNS, re.IGNORECASE)
@@ -563,7 +565,7 @@ def prepare(path: Path, raw: bytes) -> tuple[bytes | None, bool, str]:
     # what the rewrites are for; the rewritten text is scanned for everything.
     if forbidden_in(text, CREDENTIALS):
         return None, False, 'forbidden content'
-    if path.suffix.lower() == '.md' and 'apple.com/legal/internet-services/terms/site.html' in text:
+    if 'apple.com/legal/internet-services/terms/site.html' in text:   # whatever the saved page's suffix
         # A documentation page saved from Apple's developer site beside an experiment, like the
         # Metal specification extracts: third-party text, not evidence (hand skim).
         return None, False, 'third-party document'

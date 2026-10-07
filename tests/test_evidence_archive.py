@@ -1298,6 +1298,42 @@ class EvidenceArchive(unittest.TestCase):
         with patch.object(ea, 'classify', admit), self.assertRaisesRegex(SystemExit, 'unsafe'):
             ea.build(self.root, Path(self.tmp.name) / 'names2.tar.gz', 'ev')
 
+    def test_scraped_apple_page_is_excluded_under_any_text_suffix(self):
+        exp = self.root / 'gemm-probe-20261004'
+        marker = 'Copyright. https://www.apple.com/legal/internet-services/terms/site.html\n'
+        for name in ('page.txt', 'page.log', 'page.yaml'):
+            (exp / name).write_text('<!-- { "availability" : [ "macOS: 27.0.0 -" ] } -->\n' + marker)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'apple2.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in ('page.txt', 'page.log', 'page.yaml'):
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_copied_requirements_manifest_is_excluded(self):
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'engine').mkdir(exist_ok=True)
+        (exp / 'engine' / 'clef.c').write_text('int x;\n')
+        (exp / 'engine' / 'requirements.txt').write_text('torch==2.11\n')
+        (exp / 'engine' / 'results.txt').write_text('46/46\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'req.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/engine/requirements.txt', names)
+        self.assertIn('gemm-probe-20261004/engine/results.txt', names)
+
+    def test_curl_user_password_arguments_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'curl1.sh': 'curl --user alice:hunter2 https://example.com/api\n',
+                  'curl2.log': 'curl -u alice:hunter2 -X POST https://example.com\n',
+                  'curl3.sh': 'curl --user=bob:s3cret https://example.com\n'}
+        kept = {'curl4.sh': 'curl --user alice https://example.com\npython -u script.py\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'curl.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
