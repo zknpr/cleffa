@@ -1027,6 +1027,41 @@ class EvidenceArchive(unittest.TestCase):
         self.assertTrue(rewritten['rewritten'])
         self.assertIn('sha256', rewritten)
 
+    def test_any_leading_character_of_a_strong_credential_value_is_caught(self):
+        # `API_KEY=/abc123` and `PASSWORD=$upersecret` are credentials. Only an escape or an
+        # opening structure (backslash, brace, bracket, parenthesis, angle bracket) does not
+        # start a value: those are the measured prose and schema shapes.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'slashkey.log': 'API_KEY=/abc123\n', 'dollar.log': 'PASSWORD=$upersecret\n',
+                  'tilde.log': 'secret: ~tilde123\n', 'pipe.log': 'passwd="|pipe123"\n',
+                  'percent.json': '{"password": "%percent1"}'}
+        kept = {'prose2.json': '{"text": "shall be kept secret:\\n5.6.1. The parties"}',
+                'schema2.json': '{"password": {"type": "string"}, "secret": [1, 2]}',
+                'notes.log': 'password: [redacted]\nsecret: <masked>\napi_key: (none)\nsecret: ${SECRET}\npassword: {{vault}}\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'lead.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_command_line_credential_options_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'cli1.log': 'command --api-key abcdefghijklmnop\n', 'cli2.log': 'curl --api-token abcdefghijklmnop\n',
+                  'cli3.log': 'tool --password hunter2 --verbose\n', 'cli4.sh': 'run --private-key ./id_rsa\n',
+                  'cli5.log': 'client --db-pass "correct horse"\n'}
+        kept = {'opts.log': '--token-count 16\n--password-stdin\n--max-tokens 4096\n--no-token true\n--key-file jev.api\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'cli.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

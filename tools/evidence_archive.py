@@ -143,20 +143,24 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
               '|'.join(w.capitalize() for w in KEY_WORDS.split('|')) + r')))*')
 # A strongly named credential (password, passphrase, secret, API or key material, not the
 # generic token or the pass/pwd abbreviations) is a credential whatever its value's length:
-# `PASSWORD=hunter2` is a password (review #95). The value must start with a letter, a digit or
-# password punctuation (`!hunter2`; review #105), not with a backslash, bracket, brace, `<`, `$`
-# or `/`, and run four or more characters to a quote, comma, semicolon or bracket: on the
-# 2026-10-06 tree that form excludes nothing, while any single character excluded three
-# ContractNLI texts on `secret:\` before an escaped line break, and an opening brace is a
-# schema object. Only a placeholder is not a value: an empty one, null/none/true/false,
-# <redacted>, ${VAR}, {{var}} or a run of asterisks, and the value is on the key's line: prose
+# `PASSWORD=hunter2` is a password (review #95). The value may start with any character
+# (`!hunter2`, `/abc123`, `$upersecret`; reviews #105, #111) except an escape or an opening
+# structure: a backslash (`secret:\` before an escaped line break in three ContractNLI texts),
+# a brace (a schema object), a bracket, a parenthesis or an angle bracket (placeholders), and
+# runs four or more characters to a quote, comma, semicolon or bracket; on the 2026-10-06 tree
+# that form excludes nothing. Only a placeholder is not a value: an empty one,
+# null/none/true/false, <redacted>, (none), ${VAR}, {{var}}, {var} or a run of asterisks, and
+# the value is on the key's line: prose
 # such as "kept secret:" followed by a new sentence is not an assignment. A YAML block scalar
 # after a sensitive key (`password: |-` with the value on the next lines) is rejected on the
 # indicator alone, since the value cannot be matched inline (review #96).
 STRONG = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD'
 # A TOML or Python triple-quoted value, which may span lines (review #101).
 TRIPLE = r'"""(?:(?!""")[\s\S]){4,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){4,256}\'\'\''
-PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|\{[^}\s]*\})(?![A-Za-z0-9_])'
+# A shell variable reference ($SECRET, uppercase by convention; case-sensitive inside the
+# otherwise case-insensitive pattern) is a placeholder; $upersecret is a password.
+PLACEHOLDER = (r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|\{[^}\s]*\}|\([^)\s]*\)|'
+               r'(?-i:\$[A-Z_][A-Z0-9_]*))(?![A-Za-z0-9_])')
 # Two groups: paths and names the rewrites replace (scanned on the rewritten text, since a
 # surviving path is a leak) and credentials (scanned on the original text as well, since a
 # rewrite could alter the bytes around a secret before the pattern sees them; review #94).
@@ -183,7 +187,11 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:' + TRIPLE + r'|"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
                        r'\b[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX +
-                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[A-Z0-9!@#%^&*+?._~-][^\s"\',;}\]{]{3,}|'
+                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]{3,}|'
+                       # a command-line option named for a credential, with its value after whitespace:
+                       # `--api-key abcdefghijklmnop`, `--password hunter2` (review #113)
+                       r'(?<![A-Z0-9-])--?[A-Z0-9-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX +
+                       r'[ \t]+["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]{3,}|'
                        r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
 FORBIDDEN = re.compile(PATH_PATTERNS + '|' + CREDENTIAL_PATTERNS, re.IGNORECASE)
 CREDENTIALS = re.compile(CREDENTIAL_PATTERNS, re.IGNORECASE)

@@ -14,10 +14,33 @@ import checkout_latency
 
 class ReportTests(unittest.TestCase):
     def run_main(self, out: Path, measure):
-        identity = lambda path: {"path": path.name, "bytes": 1, "sha256": "0" * 64}   # not the 18 GB files
-        with patch.object(checkout_latency, "measure", measure), patch.object(checkout_latency, "gguf_identity", identity), \
+        # measure_bound() hashes and guards the 18 GB files; the report tests stand in for it.
+        def bound(model, rows, args):
+            return {"path": f"gguf/{model}.gguf", "bytes": 1, "sha256": "0" * 64}, measure(model, rows, args)
+        with patch.object(checkout_latency, "measure_bound", bound), \
                 patch.object(sys, "argv", ["checkout_latency.py", str(out), "--models", "clef-flash", "clef"]):
             checkout_latency.main()
+
+    def test_measurement_fails_if_the_gguf_changes_meanwhile(self):
+        # The published hash must describe the bytes the server ran: a GGUF replaced after the
+        # hash and before or during the measurement fails the run.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "gguf").mkdir()
+            gguf = root / "gguf" / "clef-flash.gguf"
+            gguf.write_bytes(b"GGUF" + bytes(range(256)))
+            rows, args = [], None
+            with patch.object(checkout_latency, "ROOT", root), \
+                    patch.object(checkout_latency, "measure", lambda m, r, a: [{"id": "blog", "median_ms": 1.0}]):
+                identity, result = checkout_latency.measure_bound("clef-flash", rows, args)
+                self.assertEqual(identity["bytes"], gguf.stat().st_size)
+
+                def regenerate(model, r, a):
+                    gguf.write_bytes(b"GGUF" + bytes(range(255, -1, -1)))   # same size, other bytes
+                    return [{"id": "blog", "median_ms": 1.0}]
+                with patch.object(checkout_latency, "measure", regenerate), \
+                        self.assertRaisesRegex(RuntimeError, "changed"):
+                    checkout_latency.measure_bound("clef-flash", rows, args)
 
     def test_report_binds_to_the_measured_gguf(self):
         # The model name alone does not say which weights ran; the report carries each GGUF's

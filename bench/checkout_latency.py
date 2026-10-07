@@ -76,6 +76,27 @@ def gguf_identity(path: Path) -> dict:
             "bytes": path.stat().st_size, "sha256": digest.hexdigest()}
 
 
+def file_state(path: Path) -> tuple:
+    st = path.stat()
+    return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+def measure_bound(model: str, rows: list[dict], args: argparse.Namespace) -> tuple[dict, list[dict]]:
+    """Hash the GGUF, measure, and require the file to be the same one afterwards: device,
+    inode, size, mtime and ctime, which an ordinary writer cannot restore after a rewrite. A
+    GGUF regenerated after the hash and before or during the measurement would otherwise leave
+    a report whose digest names bytes the server never ran (review #112)."""
+    gguf = ROOT / "gguf" / (model + ".gguf")
+    before = file_state(gguf)
+    identity = gguf_identity(gguf)
+    if file_state(gguf) != before:
+        raise RuntimeError(f"{gguf} changed while it was being hashed")
+    result = measure(model, rows, args)
+    if file_state(gguf) != before:
+        raise RuntimeError(f"{gguf} changed during the measurement; the report would not describe the weights that ran")
+    return identity, result
+
+
 def measure(model: str, rows: list[dict], args: argparse.Namespace) -> list[dict]:
     gguf = ROOT / "gguf" / (model + ".gguf")
     encoded = subprocess.run(
@@ -185,8 +206,7 @@ def main() -> None:
     # for and carries a completion marker (review #92).
     partial = args.out.with_name(args.out.name + ".partial")
     for model in args.models:
-        report["gguf"][model] = gguf_identity(ROOT / "gguf" / (model + ".gguf"))
-        result = measure(model, rows, args)
+        report["gguf"][model], result = measure_bound(model, rows, args)
         report["models"][model] = result
         partial.write_text(json.dumps(report, indent=2) + "\n")
         print(model, [(r["id"], round(r["median_ms"], 1)) for r in result], flush=True)
