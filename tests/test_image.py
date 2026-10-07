@@ -462,6 +462,16 @@ def main() -> None:
             compressor = zlib.compressobj(level, zlib.DEFLATED, zlib.MAX_WBITS, 8, strategy)
             stream = compressor.compress(raw) + compressor.flush()
             cases.append((name, png_stream(stream, 256, 256), Image.fromarray(arr), MIN_PIXELS, MAX_PIXELS))
+        # Empty IDAT chunks, first and between data chunks: legal, and skipped (Codex on 600ddfe: the
+        # accumulation reallocated to zero bytes, which C lets return NULL).
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+        arr = synth(np.random.default_rng(59), 6, 8)
+        z = zlib.compress(b"".join(b"\0" + row.tobytes() for row in arr))
+        ihdr = chunk(b"IHDR", struct.pack(">IIBBBBB", 8, 6, 8, 2, 0, 0, 0))
+        for name, idats in (("png-empty-first-idat", [b"", z]), ("png-empty-middle-idat", [z[:10], b"", z[10:]])):
+            data = b"\x89PNG\r\n\x1a\n" + ihdr + b"".join(chunk(b"IDAT", x) for x in idats) + chunk(b"IEND", b"")
+            cases.append((name, base64.b64encode(data).decode(), Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
         for name, b64 in (("separate-dc-37x21", SEPARATE_DC_SCANS_37X21), ("separate-dc-32x32", SEPARATE_DC_SCANS_32X32),
                           ("chroma-440", CHROMA_440_JPEG), ("sof1", SOF1_JPEG)):
             cases.append((name, b64, Image.open(io.BytesIO(base64.b64decode(b64))), MIN_PIXELS, MAX_PIXELS))

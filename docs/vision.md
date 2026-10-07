@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band) | 92/92 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; and two PNGs with empty IDAT chunks) | 94/94 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -145,8 +145,8 @@ context, so an image of exactly 16,384 tokens, or several images that fit one at
 preprocessed before the later length check refused the request: 542 MB and 492 MB resident for a
 4096x4096 image and two 4096x2048 ones. The encoder now reserves the fixed prompt (57 tokens with
 one image), the markers and the earlier images before preprocessing each one: 139 MB and 291 MB,
-the first of the two images still fitting alone. The schema is not reserved, so nothing the
-reference accepts is refused. `tests/test_record.py` checks both peaks.
+the first of the two images still fitting alone. The schema was not reserved at first; the eighth
+round below adds it. `tests/test_record.py` checks both peaks.
 
 The decoders were then fuzzed, since every review round had found something new by reading.
 `tests/fuzz_image.c` is a libFuzzer target over decode, `smart_resize`, the antialiased resize,
@@ -292,6 +292,26 @@ keeps the fuzz file and two crafted single blocks, a progressive run ending past
 baseline run past 63; the old build differs on the first and refuses the others. A second
 15-minute run on the final decoder executed 67.7 million inputs, every accepted file compared,
 with no finding. Evidence: `golden/fuzz-image-2026-10-07/review7/`.
+
+An eighth round (Codex on `600ddfe`) raised two points. (27) Confirmed as described: the image
+budget left the schema out, on the stated ground that reserving it could refuse what the reference
+accepts. That was wrong: the final length check already refuses any request whose fixed prompt,
+images and schema exceed the context, so the reserve can include the schema and only refuse
+earlier. A request whose schema could never fit still decoded and preprocessed its images: a
+14,336-token image with a 2,500-token question peaked at 479 MB before the late refusal. The
+schema is now built before the images and counted in each image's budget; the same request is
+refused before preprocessing at 127 MB, a third `tests/test_record.py` peak. This is not an
+amplification, since an accepted request with a short schema allocates the same patches, but it
+also puts the schema's cheap validation before image decoding. (28) Refuted for this platform:
+`png.h` grew its IDAT buffer with `realloc(idat_data, idat_len + chunk_len)`, and for an empty first
+IDAT that is `realloc(NULL, 0)`. C lets that return NULL, and the following `memcpy(NULL + 0, ...,
+0)` is undefined in C11. macOS returns a minimum-sized object instead. Even with an allocator
+substituted to return NULL, measured under ASan and UBSan, the file decoded identically to Pillow
+without a report: clang's pointer-overflow check excludes a null pointer plus zero, which C2y
+(N3322) also defines. An empty IDAT is now skipped before reallocating anyway, since it costs one
+branch, and two PNGs with empty IDATs, first and between data chunks, are parity cases. A
+15-minute `make fuzz-image` run on the result (ASan and UBSan, 30.6 million inputs, 971 edges)
+found nothing. Evidence: `golden/fuzz-image-2026-10-07/review8/`.
 
 ## Numerical parity
 

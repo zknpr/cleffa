@@ -137,6 +137,117 @@ void clef_record_free(clef_record *r) {
     memset(r, 0, sizeof(*r));
 }
 
+/* Decodes and preprocesses the request's images into out->images, after the schema is built so
+ * that its length counts toward each image's budget (see the reserve below). */
+static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval *images, size_t n_images,
+                          clef_encode_opts opts, size_t schema_tokens, clef_record *out, char *err, size_t errlen) {
+    /* media_kwargs: the reference forwards them to the processor; only its pixel bounds are
+     * taken here (deliberate divergence: other processor arguments are rejected, not ignored).
+     * The processor applies the bounds only when both are given and silently ignores a lone
+     * one (Qwen2VLImageProcessor._standardize_kwargs); a lone bound is rejected here instead. */
+    clef_image_params prm = opts.vision.image;
+    const jval *mk = json_get(req, "media_kwargs");
+    if (mk && mk->type != J_NULL) {
+        if (mk->type != J_OBJECT) return fail(err, errlen, "media_kwargs must be an object", NULL, 0);
+        /* n counts distinct keys: the DOM merges a repeated key as json.loads does (clef_json.h), so
+         * {"min_pixels": a, "min_pixels": b} is one member and refused here like any lone bound. */
+        if (mk->n == 1) return fail(err, errlen, "media_kwargs: give both min_pixels and max_pixels (the reference ignores one alone)", NULL, 0);
+        for (size_t i = 0; i < mk->n; i++) {
+            const jmember *m = &mk->members[i];
+            const bool is_min = m->klen == 10 && !memcmp(m->key, "min_pixels", 10);
+            const bool is_max = m->klen == 10 && !memcmp(m->key, "max_pixels", 10);
+            if (!is_min && !is_max) return fail(err, errlen, "media_kwargs: only min_pixels and max_pixels are supported, not %.*s", m->key, m->klen);
+            /* strtol over the token's own bytes: atol on an out-of-range number is undefined
+             * behavior, and only a saturating libc made it look safe (review #3). */
+            char num[24];
+            long value = 0;
+            bool is_int = m->val->type == J_INT && m->val->len > 0 && m->val->len < sizeof(num);
+            if (is_int) {
+                memcpy(num, m->val->s, m->val->len);
+                num[m->val->len] = 0;
+                char *endp;
+                errno = 0;
+                value = strtol(num, &endp, 10);
+                is_int = errno == 0 && endp == num + m->val->len;
+            }
+            if (!is_int || value <= 0 || value > INT32_MAX) {
+                return fail(err, errlen, "media_kwargs: %.*s must be a positive integer", m->key, m->klen);
+            }
+            if (is_min) prm.min_pixels = value; else prm.max_pixels = value;
+        }
+        if (prm.min_pixels > prm.max_pixels) return fail(err, errlen, "media_kwargs: min_pixels exceeds max_pixels", NULL, 0);
+    }
+    /* Images are never truncated, and the fixed prompt, one start/end pair per image, the
+     * newline after them and the schema always come with them: an image is refused before
+     * preprocessing when it, the images before it and all of those cannot fit the context. That
+     * is exactly the final length check's sum less the later images, so it refuses nothing the
+     * reference accepts, only earlier. A per-image comparison with the whole context let an image
+     * of exactly 16,384 tokens allocate 384 MiB of patches, and several large images each pass
+     * it, before the length check refused the request (review #3); without the schema, a request
+     * whose schema could never fit still preprocessed its images (review #3, Codex on 600ddfe). */
+    size_t reserve = 1 + 2 * n_images + schema_tokens;
+    {
+        jbuf pb = {0};
+        clef_tokens pt = {0};
+        jbuf_puts(&pb, PROMPT_HEAD);
+        jbuf_puts(&pb, SYSTEM_PROMPT);
+        jbuf_puts(&pb, PROMPT_USER);
+        const bool tok_ok = tok_jbuf(tok, &pb, false, &pt) && tok_z(tok, PROMPT_TAIL, false, &pt);
+        reserve += pt.len;
+        jbuf_free(&pb);
+        clef_tokens_free(&pt);
+        if (!tok_ok) return fail(err, errlen, "out of memory", NULL, 0);
+    }
+    out->images = calloc(n_images, sizeof(*out->images));
+    if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
+    for (size_t i = 0; i < n_images; i++) {
+        const jval *im = images->items[i];
+        char ierr[256];
+        uint8_t *bytes = NULL;
+        size_t n = 0;
+        clef_rgb rgb = {0};
+        out->n_images = (int)i + 1;   /* freed by clef_record_free even when this one fails */
+        if (!image_bytes(im, i, &bytes, &n, err, errlen)) return false;
+        bool ok = clef_image_decode_limited(bytes, n, opts.vision.max_image_pixels, &rgb, ierr, sizeof(ierr));
+        free(bytes);
+        const int width = rgb.width, height = rgb.height;
+        /* Bound the work before doing it. The resize buffer and the f32 patches scale with the
+         * resized area, which media_kwargs can push to 268 Mpx (16384x16384, about 6 GB of
+         * patches) from a 40x40 file; the per-image limit used to be checked only after that
+         * allocation (review #3). Compute the geometry first and refuse what the per-image
+         * limit forbids or what no request could hold, then resize and patch. */
+        const int factor = prm.patch * prm.merge;
+        int rh = 0, rw = 0;
+        ok = ok && clef_smart_resize(height, width, factor, prm.min_pixels, prm.max_pixels, &rh, &rw, ierr, sizeof(ierr));
+        if (!ok) { clef_rgb_free(&rgb); snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
+        const long tokens = (long)(rh / factor) * (rw / factor);
+        if (opts.vision.max_image_tokens > 0 && tokens > opts.vision.max_image_tokens) {
+            clef_rgb_free(&rgb);
+            /* one token per merge window of patch*merge pixels on each side */
+            const long px_per_token = (long)prm.patch * prm.patch * prm.merge * prm.merge;
+            snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens, above the limit of %ld per image; "
+                     "downscale it or pass media_kwargs.max_pixels <= %ld",
+                     i, width, height, tokens, opts.vision.max_image_tokens,
+                     opts.vision.max_image_tokens * px_per_token);
+            return false;
+        }
+        if ((size_t)out->n_image_tokens + (size_t)tokens + reserve > (size_t)opts.max_length) {
+            clef_rgb_free(&rgb);
+            snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens; with %d image tokens before it and the "
+                     "%zu-token prompt the request cannot fit %d tokens",
+                     i, width, height, tokens, out->n_image_tokens, reserve, opts.max_length);
+            return false;
+        }
+        ok = clef_image_preprocess(&rgb, &prm, &out->images[i].pt, ierr, sizeof(ierr));
+        clef_rgb_free(&rgb);
+        if (!ok) { snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
+        if (out->images[i].pt.n_tokens != tokens) return fail(err, errlen, "internal: image token count changed after preprocessing", NULL, 0);
+        if (out->n_image_tokens > INT32_MAX - tokens) return fail(err, errlen, "too many image tokens", NULL, 0);
+        out->n_image_tokens += (int32_t)tokens;
+    }
+    return true;
+}
+
 static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_encode_opts opts,
                            clef_record *out, char *err, size_t errlen) {
     if (!req || req->type != J_OBJECT) return fail(err, errlen, "request must be a JSON object", NULL, 0);
@@ -204,111 +315,6 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     out->owned = malloc(owned_bytes + 16);
     if (!out->owned) return fail(err, errlen, "out of memory", NULL, 0);
     char *owned = out->owned;
-
-    if (n_images) {
-        /* media_kwargs: the reference forwards them to the processor; only its pixel bounds are
-         * taken here (deliberate divergence: other processor arguments are rejected, not ignored).
-         * The processor applies the bounds only when both are given and silently ignores a lone
-         * one (Qwen2VLImageProcessor._standardize_kwargs); a lone bound is rejected here instead. */
-        clef_image_params prm = opts.vision.image;
-        const jval *mk = json_get(req, "media_kwargs");
-        if (mk && mk->type != J_NULL) {
-            if (mk->type != J_OBJECT) return fail(err, errlen, "media_kwargs must be an object", NULL, 0);
-            /* n counts distinct keys: the DOM merges a repeated key as json.loads does (clef_json.h), so
-             * {"min_pixels": a, "min_pixels": b} is one member and refused here like any lone bound. */
-            if (mk->n == 1) return fail(err, errlen, "media_kwargs: give both min_pixels and max_pixels (the reference ignores one alone)", NULL, 0);
-            for (size_t i = 0; i < mk->n; i++) {
-                const jmember *m = &mk->members[i];
-                const bool is_min = m->klen == 10 && !memcmp(m->key, "min_pixels", 10);
-                const bool is_max = m->klen == 10 && !memcmp(m->key, "max_pixels", 10);
-                if (!is_min && !is_max) return fail(err, errlen, "media_kwargs: only min_pixels and max_pixels are supported, not %.*s", m->key, m->klen);
-                /* strtol over the token's own bytes: atol on an out-of-range number is undefined
-                 * behavior, and only a saturating libc made it look safe (review #3). */
-                char num[24];
-                long value = 0;
-                bool is_int = m->val->type == J_INT && m->val->len > 0 && m->val->len < sizeof(num);
-                if (is_int) {
-                    memcpy(num, m->val->s, m->val->len);
-                    num[m->val->len] = 0;
-                    char *endp;
-                    errno = 0;
-                    value = strtol(num, &endp, 10);
-                    is_int = errno == 0 && endp == num + m->val->len;
-                }
-                if (!is_int || value <= 0 || value > INT32_MAX) {
-                    return fail(err, errlen, "media_kwargs: %.*s must be a positive integer", m->key, m->klen);
-                }
-                if (is_min) prm.min_pixels = value; else prm.max_pixels = value;
-            }
-            if (prm.min_pixels > prm.max_pixels) return fail(err, errlen, "media_kwargs: min_pixels exceeds max_pixels", NULL, 0);
-        }
-        /* Images are never truncated, and the fixed prompt, one start/end pair per image and the
-         * newline after them always come with them: an image is refused before preprocessing when
-         * it, the images before it and that minimum cannot fit the context. A per-image comparison
-         * with the whole context let an image of exactly 16,384 tokens allocate 384 MiB of patches,
-         * and several large images each pass it, before the length check refused the request
-         * (review #3). The schema is left out, so this never refuses what the reference accepts. */
-        size_t reserve = 1 + 2 * n_images;
-        {
-            jbuf pb = {0};
-            clef_tokens pt = {0};
-            jbuf_puts(&pb, PROMPT_HEAD);
-            jbuf_puts(&pb, SYSTEM_PROMPT);
-            jbuf_puts(&pb, PROMPT_USER);
-            const bool tok_ok = tok_jbuf(tok, &pb, false, &pt) && tok_z(tok, PROMPT_TAIL, false, &pt);
-            reserve += pt.len;
-            jbuf_free(&pb);
-            clef_tokens_free(&pt);
-            if (!tok_ok) return fail(err, errlen, "out of memory", NULL, 0);
-        }
-        out->images = calloc(n_images, sizeof(*out->images));
-        if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
-        for (size_t i = 0; i < n_images; i++) {
-            const jval *im = images->items[i];
-            char ierr[256];
-            uint8_t *bytes = NULL;
-            size_t n = 0;
-            clef_rgb rgb = {0};
-            out->n_images = (int)i + 1;   /* freed by clef_record_free even when this one fails */
-            if (!image_bytes(im, i, &bytes, &n, err, errlen)) return false;
-            bool ok = clef_image_decode_limited(bytes, n, opts.vision.max_image_pixels, &rgb, ierr, sizeof(ierr));
-            free(bytes);
-            const int width = rgb.width, height = rgb.height;
-            /* Bound the work before doing it. The resize buffer and the f32 patches scale with the
-             * resized area, which media_kwargs can push to 268 Mpx (16384x16384, about 6 GB of
-             * patches) from a 40x40 file; the per-image limit used to be checked only after that
-             * allocation (review #3). Compute the geometry first and refuse what the per-image
-             * limit forbids or what no request could hold, then resize and patch. */
-            const int factor = prm.patch * prm.merge;
-            int rh = 0, rw = 0;
-            ok = ok && clef_smart_resize(height, width, factor, prm.min_pixels, prm.max_pixels, &rh, &rw, ierr, sizeof(ierr));
-            if (!ok) { clef_rgb_free(&rgb); snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
-            const long tokens = (long)(rh / factor) * (rw / factor);
-            if (opts.vision.max_image_tokens > 0 && tokens > opts.vision.max_image_tokens) {
-                clef_rgb_free(&rgb);
-                /* one token per merge window of patch*merge pixels on each side */
-                const long px_per_token = (long)prm.patch * prm.patch * prm.merge * prm.merge;
-                snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens, above the limit of %ld per image; "
-                         "downscale it or pass media_kwargs.max_pixels <= %ld",
-                         i, width, height, tokens, opts.vision.max_image_tokens,
-                         opts.vision.max_image_tokens * px_per_token);
-                return false;
-            }
-            if ((size_t)out->n_image_tokens + (size_t)tokens + reserve > (size_t)opts.max_length) {
-                clef_rgb_free(&rgb);
-                snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens; with %d image tokens before it and the "
-                         "%zu-token prompt the request cannot fit %d tokens",
-                         i, width, height, tokens, out->n_image_tokens, reserve, opts.max_length);
-                return false;
-            }
-            ok = clef_image_preprocess(&rgb, &prm, &out->images[i].pt, ierr, sizeof(ierr));
-            clef_rgb_free(&rgb);
-            if (!ok) { snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
-            if (out->images[i].pt.n_tokens != tokens) return fail(err, errlen, "internal: image token count changed after preprocessing", NULL, 0);
-            if (out->n_image_tokens > INT32_MAX - tokens) return fail(err, errlen, "too many image tokens", NULL, 0);
-            out->n_image_tokens += (int32_t)tokens;
-        }
-    }
 
     clef_tokens schema = {0}, prefix = {0}, suffix = {0}, state_ids = {0};
     jbuf b = {0};
@@ -423,6 +429,13 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
                      opts.max_length, opts.max_length);
             return false;
         }
+    }
+
+    /* Images after the schema, so that its length is part of each image's budget. */
+    if (ok && n_images && !encode_images(tok, req, images, n_images, opts, schema.len, out, err, errlen)) {
+        jbuf_free(&b);
+        clef_tokens_free(&schema);
+        return false;
     }
 
     if (ok) {

@@ -345,8 +345,10 @@ def image_budget_memory(gguf_path: str) -> int:
     """Review #3: an image that cannot fit with the prompt and the images before it is refused
     before its resize and patches are allocated. Before the fix, a 4096x4096 image (exactly the
     16,384-token context) reached 542 MB resident and two 4096x2048 images 492 MB; after, 139 MB
-    and 291 MB (the first of the two fits alone and is preprocessed). Peak RSS of clef-tool,
-    which applies no per-image token limit, as the CLI does by default."""
+    and 291 MB (the first of the two fits alone and is preprocessed). The schema counts too: a
+    14,336-token image fits the prompt alone, but not with a 2,500-token question, and was
+    preprocessed before the final length check refused it (review #3, Codex on 600ddfe). Peak RSS
+    of clef-tool, which applies no per-image token limit, as the CLI does by default."""
     def png(w: int, h: int) -> str:
         y, x = np.indices((h, w))
         arr = np.stack([x * 255 // (w - 1), y * 255 // (h - 1), (x + y) % 256], -1).astype(np.uint8)
@@ -355,11 +357,13 @@ def image_budget_memory(gguf_path: str) -> int:
         return base64.b64encode(buf.getvalue()).decode()
 
     q = {"q": {"type": "noul", "instructions": "Is it blue?"}}
+    long_q = {"q": {"type": "noul", "instructions": "Is it blue? " + "alpha " * 2500}}
     half = png(4096, 2048)
-    cases = [("one 16,384-token image", [png(4096, 4096)], 300), ("two 8,192-token images", [half, half], 400)]
+    cases = [("one 16,384-token image", [png(4096, 4096)], q, 300), ("two 8,192-token images", [half, half], q, 400),
+             ("a 14,336-token image with a 2,500-token schema", [png(4096, 3584)], long_q, 300)]
     failures = 0
-    for name, images, limit_mb in cases:
-        line = json.dumps({"model": "clef-flash", "state": "x", "images": images, "questions": q}) + "\n"
+    for name, images, questions, limit_mb in cases:
+        line = json.dumps({"model": "clef-flash", "state": "x", "images": images, "questions": questions}) + "\n"
         r = subprocess.run(["/usr/bin/time", "-l", str(ROOT / "clef-tool"), "encode", gguf_path], input=line,
                            capture_output=True, text=True)
         rss = next((int(l.split()[0]) for l in r.stderr.splitlines() if "maximum resident set size" in l), None)

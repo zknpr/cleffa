@@ -56,7 +56,7 @@ a progressive frame that reaches EOI before any scan is refused, each component'
 table must be defined by its first scan and is latched there as libjpeg does, and a block whose
 IDCT output leaves [-512, 511], where libjpeg's builds disagree, is refused. `clef_image.c` includes the
 headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
-`tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header also has optional inflate and CRC32 hooks;
+`tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header skips empty IDAT chunks and has optional inflate and CRC32 hooks;
 cleffa supplies these through the system zlib library, preserving size and checksum validation.
 Their license (`third_party/iris/LICENSE`):
 

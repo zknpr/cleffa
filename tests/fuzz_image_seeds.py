@@ -82,4 +82,11 @@ first = next(i for i, (m, _) in enumerate(segs) if m == 0xDA)
 save(b"".join(x for _, x in segs[:first + 1]) + test_image.dqt(0, bytes([1] * 64)) + b"".join(x for _, x in segs[first + 1:]),
      "dqt-redefined-after-scan.jpg")
 save(base64.b64decode(test_image.AC_FIRST_OVERSHOOT_JPEG), "ac-first-overshoot-fuzz.jpg")
+# a PNG with an empty IDAT before its data, which the decoder skips (Codex on 600ddfe)
+buf = io.BytesIO()
+Image.fromarray(arr(6, 8, 3)).save(buf, "PNG")
+data = buf.getvalue()
+first_idat = data.index(b"IDAT") - 4
+empty = b"\x00\x00\x00\x00IDAT" + (0x35AF061E).to_bytes(4, "big")   # CRC-32 of "IDAT"
+save(data[:first_idat] + empty + data[first_idat:], "empty-first-idat.png")
 print(f"{n} seeds in {out}")

@@ -64,7 +64,7 @@ make clean
   frame with no scan refused, quantization tables required by and latched at each component's
   first scan, blocks with IDCT output beyond [-512, 511] refused because libjpeg's C and NEON paths
   disagree there) and
-  optional PNG inflate/CRC hooks. `clef_image.c` passes the per-call source-pixel limit through
+  optional PNG inflate/CRC hooks, and `png.h` skips empty IDAT chunks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
   the original dependency-free PNG implementation remains the fallback. Decoder changes
@@ -257,8 +257,9 @@ BF16; the merger input is four consecutive patch rows (merge-window order makes 
 Images come in the hosted API's two forms in the request's `images` list, a `data:` URL or a
 `{"content_type", "base64"}` object (bare base64 is an extension); `image_bytes` in `clef_record.c`
 checks a declared type (object `content_type` or data URL media type) against the signature and
-rejects WebP. The encoder computes each image's `smart_resize` geometry and refuses an image over
-the per-image limit or the context before resizing or allocating patches: the resized area is
+rejects WebP. The encoder builds the schema first, then computes each image's `smart_resize`
+geometry and refuses an image over the per-image limit, or one that cannot fit the context with the
+fixed prompt, the schema and the images before it, before resizing or allocating patches: the resized area is
 request-controlled through `media_kwargs` and reached 1.85 GB resident from a 40x40 file when the
 check came after preprocessing. `media_kwargs` integers are parsed range-checked, never with `atol`.
 The server's startup warm-up includes one image sized to the per-image limit when the model has a

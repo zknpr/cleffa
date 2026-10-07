@@ -21,6 +21,7 @@
  * Cleffa extensions: PNG_INFLATE may supply a malloc-owned, exact-size zlib decoder;
  * PNG_UPDATE_CRC may supply the same incremental, uncomplemented CRC32 update.
  * The built-in dependency-free decoder remains the default when it is not defined.
+ * An empty IDAT chunk is skipped without reallocating the accumulated data.
  */
 
 #ifndef PNG_H
@@ -851,11 +852,16 @@ png_image *png_load_mem(const uint8_t *data, size_t len) {
             /* Accumulate IDAT chunks */
             if (!seen_ihdr || seen_iend ||
                 (size_t)chunk_len > PNG_MAX_INPUT_BYTES - idat_len) goto fail;
-            uint8_t *grown = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
-            if (!grown && chunk_len != 0) goto fail;
-            idat_data = grown;
-            memcpy(idat_data + idat_len, chunk_data, chunk_len);
-            idat_len += chunk_len;
+            /* cleffa: an empty IDAT adds nothing. Skipping it keeps realloc(NULL, 0), which C
+             * lets return NULL, out of the pointer arithmetic below; macOS returns a minimum-sized
+             * object instead, so it was not reached here (Codex on 600ddfe). */
+            if (chunk_len != 0) {
+                uint8_t *grown = (uint8_t *)realloc(idat_data, idat_len + chunk_len);
+                if (!grown) goto fail;
+                idat_data = grown;
+                memcpy(idat_data + idat_len, chunk_data, chunk_len);
+                idat_len += chunk_len;
+            }
             seen_idat = 1;
         } else if (memcmp(chunk_type, "PLTE", 4) == 0) {
             if (!seen_ihdr || seen_idat || chunk_len == 0 ||
