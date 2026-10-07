@@ -527,6 +527,56 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     return true;
 }
 
+/* An integer JSON value equal to want (J_INT keeps its canonical decimal text). */
+static bool json_int_is(const jval *v, long long want) {
+    char buf[24];
+    const int n = snprintf(buf, sizeof(buf), "%lld", want);
+    return v && v->type == J_INT && v->len == (size_t)n && !memcmp(v->s, buf, (size_t)n);
+}
+
+static bool json_halves(const jval *v) {   /* [0.5, 0.5, 0.5] */
+    if (!v || v->type != J_ARRAY || v->n != 3) return false;
+    for (size_t i = 0; i < 3; i++) if (v->items[i]->type != J_FLOAT || v->items[i]->f != 0.5) return false;
+    return true;
+}
+
+/* clef_image.c hard-codes the reference's Qwen2VLImageProcessor: bicubic resample, rescale by
+ * 1/255, normalize with mean and std 0.5, RGB conversion. tools/convert.py refuses any other
+ * processor and records the one it accepted as clef.vision.image_processor, but the loader never
+ * read it, so a GGUF from elsewhere describing other preprocessing loaded and was served with this
+ * one (Codex on a82292d). Each field the converter checks is checked again here, and the recorded
+ * geometry and pixel bounds must equal the numeric keys the engine uses. */
+static bool processor_supported(const gguf_file *f, uint32_t patch, uint32_t merge, uint32_t temporal,
+                                uint32_t min_px, uint32_t max_px, char *err, size_t errlen) {
+    gguf_str text;
+    if (!gguf_get_str(f, "clef.vision.image_processor", &text)) {
+        snprintf(err, errlen, "model: incomplete clef.vision.* keys (no image_processor)");
+        return false;
+    }
+    jarena *a = jarena_new();
+    if (!a) { snprintf(err, errlen, "out of memory"); return false; }
+    char jerr[128];
+    const jval *ip = text.len <= (1u << 20) ? json_parse(a, text.ptr, (size_t)text.len, jerr, sizeof(jerr)) : NULL;
+    const jval *size = ip && ip->type == J_OBJECT ? json_get(ip, "size") : NULL;
+    const jval *rescale = ip && ip->type == J_OBJECT ? json_get(ip, "rescale_factor") : NULL;
+    const bool ok = ip && ip->type == J_OBJECT &&
+        json_str_eq(json_get(ip, "image_processor_type"), "Qwen2VLImageProcessor") &&
+        json_int_is(json_get(ip, "resample"), 3) &&
+        json_halves(json_get(ip, "image_mean")) && json_halves(json_get(ip, "image_std")) &&
+        rescale && rescale->type == J_FLOAT && fabs(rescale->f - 1.0 / 255) <= 1e-12 &&
+        json_get(ip, "do_convert_rgb") && json_get(ip, "do_convert_rgb")->type == J_TRUE &&
+        json_get(ip, "do_resize") && json_get(ip, "do_resize")->type == J_TRUE &&
+        json_get(ip, "do_rescale") && json_get(ip, "do_rescale")->type == J_TRUE &&
+        json_get(ip, "do_normalize") && json_get(ip, "do_normalize")->type == J_TRUE &&
+        json_int_is(json_get(ip, "patch_size"), patch) && json_int_is(json_get(ip, "merge_size"), merge) &&
+        json_int_is(json_get(ip, "temporal_patch_size"), temporal) &&
+        size && size->type == J_OBJECT && json_int_is(json_get(size, "shortest_edge"), min_px) &&
+        json_int_is(json_get(size, "longest_edge"), max_px);
+    jarena_free(a);
+    if (!ok) snprintf(err, errlen, "model: clef.vision.image_processor describes preprocessing this engine does not implement");
+    return ok;
+}
+
 bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, size_t errlen) {
     uint32_t patch, merge, temporal, min_px, max_px, image_id, start_id, end_id, video_id, vocab;
     if (!gguf_find_kv(f, "clef.vision.image_token_id")) {
@@ -555,6 +605,7 @@ bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, s
         snprintf(err, errlen, "model: vision token ids must be below the vocabulary size %u", vocab);
         return false;
     }
+    if (!processor_supported(f, patch, merge, temporal, min_px, max_px, err, errlen)) return false;
     v->image = (clef_image_params){ (long)min_px, (long)max_px, (int)patch, (int)merge, (int)temporal };
     v->image_token_id = (int32_t)image_id;
     v->start_token_id = (int32_t)start_id;

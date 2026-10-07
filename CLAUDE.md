@@ -63,7 +63,8 @@ make clean
   three-component frames copied as RGB under libjpeg's JFIF/Adobe/component-id rule, a progressive
   frame with no scan refused, quantization tables required by and latched at each component's
   first scan, blocks with IDCT output beyond [-512, 511] refused because libjpeg's C and NEON paths
-  disagree there) and
+  disagree there, sequential frames split across scans buffered and finished like progressive
+  ones, a scan before the frame header or a second frame header refused) and
   optional PNG inflate/CRC hooks, and `png.h` skips empty IDAT chunks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
@@ -241,8 +242,10 @@ internal GPU/head entry points. `clef_main.c` (CLI) and `clef_server.c` (HTTP) a
 converter change and the engine must move together. Shape assumptions baked into the kernels are
 enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...), including, for a vision model,
 interleaved M-RoPE section `[11, 11, 10]` (the kernels' `lane % 3`; text cannot reveal a mismatch),
-vision token ids below the vocabulary, and at least 8 vision heads (`vis_qkv_rope` clears the
-attention tail with one thread per head and patch, and the smallest image has 4 patches). The GGUF is mmap'd and wrapped as a
+vision token ids below the vocabulary, at least 8 vision heads (`vis_qkv_rope` clears the
+attention tail with one thread per head and patch, and the smallest image has 4 patches), and a
+recorded `clef.vision.image_processor` describing exactly the preprocessing `clef_image.c`
+implements (checked field by field, as the converter checks it). The GGUF is mmap'd and wrapped as a
 single `MTLBuffer` with no copy; weight tensors are addressed by file offset.
 
 Converter layout decisions the engine depends on: per-layer projections fused into one GEMM each

@@ -54,7 +54,9 @@ decodes as 1x1 whatever sampling it declares, three components are copied as RGB
 (no JFIF marker, and an Adobe transform of 0 or, without an Adobe marker, component ids R, G, B),
 a progressive frame that reaches EOI before any scan is refused, each component's quantization
 table must be defined by its first scan and is latched there as libjpeg does, and a block whose
-IDCT output leaves [-512, 511], where libjpeg's builds disagree, is refused. `clef_image.c` includes the
+IDCT output leaves [-512, 511], where libjpeg's builds disagree, is refused. A sequential frame may
+split its components across scans, which are buffered and finished like a progressive frame's, and
+a scan before the frame header, or a second frame header, is refused. `clef_image.c` includes the
 headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
 `tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header skips empty IDAT chunks and has optional inflate and CRC32 hooks;
 cleffa supplies these through the system zlib library, preserving size and checksum validation.

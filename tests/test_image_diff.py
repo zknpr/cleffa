@@ -59,6 +59,13 @@ SCAN_SCRIPTS = {
     "dc-refine-sep": "0: 0 0 0 1; 1: 0 0 0 1; 2: 0 0 0 1; 0: 0 0 1 0; 1: 0 0 1 0; 2: 0 0 1 0; "
                      "0: 1 63 0 0; 1: 1 63 0 0; 2: 1 63 0 0;",
 }
+# sequential (SOF0) frames whose components are split across scans, which Pillow decodes and the
+# decoder refused until Codex's review of a82292d
+SEQ_SCRIPTS = {
+    "seq-per-comp": "0; 1; 2;",
+    "seq-y-cbcr": "0; 1, 2;",
+    "seq-cr-y-cb": "2; 0; 1;",
+}
 GRAY_SCRIPTS = {
     "gray-sa": "0: 0 0 0 1; 0: 1 5 0 2; 0: 6 63 0 2; 0: 1 63 2 1; 0: 0 0 1 0; 0: 1 63 1 0;",
 }
@@ -84,6 +91,12 @@ def cjpeg_variants(tmp: Path, gray: bool):
         p.write_text(script)
         for samp in ("2x2,1x1,1x1", "2x1,1x1,1x1", "1x1,1x1,1x1"):
             out.append((f"{name}-{samp.replace(',', '-')}", ["-sample", samp, "-progressive", "-scans", str(p), *q]))
+    for name, script in SEQ_SCRIPTS.items():
+        p = tmp / f"{name}.txt"
+        p.write_text(script)
+        for samp in ("1x1,1x1,1x1", "2x1,1x1,1x1", "2x2,1x1,1x1"):
+            out.append((f"{name}-{samp.replace(',', '-')}", ["-sample", samp, "-scans", str(p), *q]))
+        out.append((f"{name}-restart", ["-sample", "2x2,1x1,1x1", "-restart", "1B", "-scans", str(p), *q]))
     out += [("restart-1", ["-sample", "2x2,1x1,1x1", "-restart", "1B", *q]),
             ("restart-2-prog", ["-sample", "2x2,1x1,1x1", "-restart", "2", "-progressive", *q]),
             ("optimize", ["-optimize", *q]), ("q1", ["-quality", "1"]), ("q100", ["-quality", "100"]),

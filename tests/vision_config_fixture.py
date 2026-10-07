@@ -1,6 +1,7 @@
 """Write small header-only GGUFs for tests/test_vision_config.c: the clef.* keys of a converted
 model with no tensors, and copies with one vision geometry field set to 2^24 (the most cfg_u32
 admits). Usage: vision_config_fixture.py MODEL.gguf OUT_DIR"""
+import json
 import sys
 from pathlib import Path
 
@@ -56,7 +57,21 @@ def main() -> None:
     # Codex on ed8abd7: four heads of 72 pass the head-size checks, but too few threads clear the
     # attention tail of a four-patch image
     write(out / "vision-4-heads.gguf", kvs, {"clef.vision.embedding_length": 288, "clef.vision.attention.head_count": 4})
-    print(f"wrote 8 fixtures with {len(kvs)} clef.* keys to {out}")
+    # Codex on a82292d: the recorded image processor must describe the preprocessing clef_image.c
+    # implements; it was never read
+    ip = json.loads(next(v for n, v, _, _ in kvs if n == "clef.vision.image_processor"))
+    def processor(**change) -> str:
+        p = json.loads(json.dumps(ip))
+        for k, v in change.items():
+            p[k] = v
+        return json.dumps(p, sort_keys=True)
+    write(out / "vision-processor-bilinear.gguf", kvs, {"clef.vision.image_processor": processor(resample=2)})
+    write(out / "vision-processor-clip-mean.gguf", kvs, {"clef.vision.image_processor": processor(
+        image_mean=[0.48145466, 0.4578275, 0.40821073], image_std=[0.26862954, 0.26130258, 0.27577711])})
+    write(out / "vision-processor-max-pixels.gguf", kvs, {"clef.vision.image_processor": processor(
+        size={"shortest_edge": ip["size"]["shortest_edge"], "longest_edge": ip["size"]["longest_edge"] // 2})})
+    write(out / "vision-processor-missing.gguf", kvs, {}, frozenset({"clef.vision.image_processor"}))
+    print(f"wrote 12 fixtures with {len(kvs)} clef.* keys to {out}")
 
 
 if __name__ == "__main__":

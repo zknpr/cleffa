@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; and two PNGs with empty IDAT chunks) | 94/94 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and three sequential frames split across scans) | 97/97 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -322,6 +322,30 @@ whole crafted tower. Both released towers have 16 heads, the reads stay inside t
 and a model file already controls its outputs, so the impact is limited to a malformed model. The
 loader now requires at least 8 vision heads, as it enforces the kernels' other shape assumptions;
 `tests/test_vision_config.c` adds a 4-head header, which loaded before and is now refused.
+
+A tenth round (Codex on `a82292d`) raised three points, all confirmed. (30) A sequential (SOF0)
+JPEG may code its components in separate scans, one each or Y then Cb and Cr; Pillow decodes such
+files and the decoder, which required every component in the first scan, refused them. libjpeg
+buffers coefficients for the whole frame when its first scan lacks a component and dequantizes at
+output, writing only each block's DC and decoded AC coefficients into zero-initialized arrays, so a
+component never scanned decodes as zero and one scanned twice keeps the first scan's values where
+the second codes zeros, both without a warning. The decoder now does the same through the
+progressive path's block walk and finish, with a sequential block decoder that stores quantized
+coefficients. `tests/test_image.py` embeds a 24x16 cjpeg file with one scan per component and
+derives both edge cases from it; `tests/test_image_diff.py` adds 312 cjpeg files from three
+sequential scan scripts, three samplings and restart intervals, all refused before and identical
+after (1,925 identical of 2,071). (31) The decoding pass skipped frame headers because a first pass
+had looked ahead for one, so a scan placed before the frame header decoded with the later frame's
+geometry, and a file with two frame headers decoded too; libjpeg fails both (`JERR_SOS_NO_SOF`,
+`JERR_SOF_DUPLICATE`), and so does the decoder now, counting every SOFn marker type. (32)
+`tools/convert.py` refuses any image processor but the reference's and records it as
+`clef.vision.image_processor`, but the loader never read it, so a GGUF from elsewhere describing
+other preprocessing loaded and was served with this one. The loader now parses it and checks every
+field the converter checks, and that its patch geometry and pixel bounds equal the numeric keys the
+engine uses; four crafted headers (bilinear resampling, CLIP normalization, a different pixel bound,
+no record) loaded before and are refused now. A 15-minute differential run on the result executed
+86.3 million inputs with no finding; coverage rose from 706 to 752 edges with the new path.
+Evidence: `golden/fuzz-image-2026-10-07/review10/`.
 
 ## Numerical parity
 

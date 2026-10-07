@@ -89,4 +89,6 @@ data = buf.getvalue()
 first_idat = data.index(b"IDAT") - 4
 empty = b"\x00\x00\x00\x00IDAT" + (0x35AF061E).to_bytes(4, "big")   # CRC-32 of "IDAT"
 save(data[:first_idat] + empty + data[first_idat:], "empty-first-idat.png")
+# a sequential frame with one scan per component (Codex on a82292d)
+save(base64.b64decode(test_image.SEQUENTIAL_SCAN_PER_COMPONENT_JPEG), "sequential-scan-per-component.jpg")
 print(f"{n} seeds in {out}")

@@ -83,6 +83,9 @@
  *     there, as libjpeg does; a block with a dequantized coefficient beyond 16 bits or an IDCT
  *     output beyond [-512, 511] is refused, since libjpeg wraps such outputs where this decoder
  *     clamps;
+ *   - a sequential frame may split its components across scans: its coefficients are buffered
+ *     and finished like a progressive frame's, as libjpeg does; a scan before the frame header,
+ *     or a second frame header, is refused (JERR_SOS_NO_SOF, JERR_SOF_DUPLICATE);
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
  *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
  *     result for it depends on how its input is buffered. */
@@ -271,6 +274,8 @@ typedef struct {
     unsigned huff_defined;   /* cleffa: bit t set once a DHT defined huff[t] */
     int8_t coef_bits[4][64]; /* cleffa: progressive precision per coefficient, -1 = never coded */
     int scans_seen;          /* cleffa: SOS segments processed */
+    int sof_seen;            /* cleffa: frame headers met by the decoding pass */
+    int seq_buffered;        /* cleffa: a sequential frame whose components are split across scans */
     int saw_jfif, saw_adobe, adobe_transform;   /* cleffa: markers before the first SOS */
 
     /* DC prediction for each component */
@@ -706,6 +711,47 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
         }
     }
 
+    return 0;
+}
+
+/* cleffa: a sequential block stored as quantized coefficients, for a frame whose components are
+ * split across scans. libjpeg decodes such a frame into zero-initialized coefficient arrays and
+ * dequantizes at output (jdcoefct.c consume_data); it writes the DC coefficient and each decoded
+ * AC coefficient and nothing else, so a component scanned twice keeps the first scan's values
+ * where the second codes zeros, and a component never scanned stays zero. Both decode without a
+ * warning, as here. Otherwise the arithmetic is jpeg_decode_block's. */
+static int jpeg_seq_decode_coefs(jpeg_decoder *dec, int comp_idx, int16_t *coef) {
+    jpeg_huff_table *dc_huff = &dec->huff[dec->comp[comp_idx].dc_idx];
+    jpeg_huff_table *ac_huff = &dec->huff[dec->comp[comp_idx].ac_idx + 2];
+
+    int dc_len = jpeg_decode_huffman(&dec->bs, dc_huff);
+    if (dc_len < 0) return -1;
+    int dc_val = 0;
+    if (dc_len > 0) {
+        dc_val = jpeg_get_bits(&dec->bs, dc_len);
+        if (dc_val < 0) return -1;
+        dc_val = jpeg_extend(dc_val, dc_len);
+    }
+    dec->dc_pred[comp_idx] = (int)((unsigned)dec->dc_pred[comp_idx] + (unsigned)dc_val);
+    coef[0] = (int16_t)dec->dc_pred[comp_idx];
+
+    for (int k = 1; k < 64; ) {
+        int rs = jpeg_decode_huffman(&dec->bs, ac_huff);
+        if (rs < 0) return -1;
+        int run = rs >> 4, size = rs & 0x0F;
+        if (size == 0) {
+            if (run != 15) break;   /* EOB */
+            k += 16;                /* ZRL */
+            continue;
+        }
+        k += run;
+        int ac_val = jpeg_get_bits(&dec->bs, size);
+        if (ac_val < 0) return -1;
+        ac_val = jpeg_extend(ac_val, size);
+        if (k > 63) k = 63;         /* libjpeg's padded natural order, as in jpeg_decode_block */
+        coef[jpeg_zigzag[k]] = (int16_t)ac_val;
+        k++;
+    }
     return 0;
 }
 
@@ -1167,7 +1213,9 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                             int by = mcu_y * v_samp + v;
                             int16_t *coef = dec->comp[comp_idx].coefs + (by * blocks_x + bx) * 64;
 
-                            if (dec->ah == 0) {
+                            if (!dec->is_progressive) {
+                                if (jpeg_seq_decode_coefs(dec, comp_idx, coef) < 0) return -1;
+                            } else if (dec->ah == 0) {
                                 if (jpeg_prog_decode_dc_first(dec, comp_idx, coef) < 0) return -1;
                             } else {
                                 if (jpeg_prog_decode_dc_refine(dec, coef) < 0) return -1;
@@ -1224,7 +1272,9 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
                 /* Map image-based block position to MCU-aligned storage index */
                 int16_t *coef = dec->comp[comp_idx].coefs + (by * store_blocks_x + bx) * 64;
 
-                if (dec->ss == 0) {
+                if (!dec->is_progressive) {
+                    if (jpeg_seq_decode_coefs(dec, comp_idx, coef) < 0) return -1;
+                } else if (dec->ss == 0) {
                     if (dec->ah == 0) {
                         if (jpeg_prog_decode_dc_first(dec, comp_idx, coef) < 0) return -1;
                     } else {
@@ -1436,6 +1486,15 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         uint16_t seg_len = (file_data[pos] << 8) | file_data[pos + 1];
         if (pos + seg_len > file_size) break;
 
+        /* cleffa: libjpeg reads markers in order, so a scan before any frame header fails
+         * (JERR_SOS_NO_SOF) and so does a second frame header of any SOFn type
+         * (JERR_SOF_DUPLICATE). The first pass looks ahead for the frame, and this pass skipped
+         * frame headers, so a scan was decoded with the geometry of a later frame and a file with
+         * two frames was decoded (Codex on a82292d). */
+        if (marker >= 0xC0 && marker <= 0xCF && marker != JPEG_DHT && marker != 0xC8 && marker != 0xCC) {
+            if (dec.sof_seen++) goto fail;
+        }
+
         if (marker == JPEG_DHT) {
             /* Define Huffman table */
             size_t off = pos + 2;
@@ -1511,6 +1570,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
         } else if (marker == JPEG_SOS) {
             /* Start of scan */
+            if (!dec.sof_seen) goto fail;
             dec.scans_seen++;
             if (seg_len < 6) goto fail;
 
@@ -1537,8 +1597,8 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                     }
                 }
                 if (comp_idx < 0) goto fail;
-                /* cleffa: each component at most once per scan. A baseline scan must name every
-                 * component, so with this the table check below covers all that it decodes. */
+                /* cleffa: each component at most once per scan, so the table check below covers
+                 * every component the scan decodes. */
                 for (int k = 0; k < i; k++) if (scan_comps[k] == comp_idx) goto fail;
                 scan_comps[i] = comp_idx;
             }
@@ -1617,16 +1677,29 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             }
             dec.bs.len = scan_end - scan_data_start;
 
-            if (dec.is_progressive) {
-                /* Decode progressive scan */
-                for (int i = 0; i < ns; i++)
-                    for (int k = dec.ss; k <= dec.se; k++) dec.coef_bits[scan_comps[i]][k] = (int8_t)dec.al;
+            /* cleffa: a sequential frame may split its components across scans (one each, or Y
+             * then Cb and Cr). libjpeg buffers coefficients for the whole frame when its first
+             * scan lacks a component (jdinput.c has_multiple_scans), and so does this decoder from
+             * then on, through the progressive path's walk and finish; such files were refused,
+             * though Pillow decodes them (Codex on a82292d). */
+            if (!dec.is_progressive && !dec.seq_buffered && ns != dec.num_components) {
+                for (int i = 0; i < dec.num_components; i++) {
+                    size_t num_blocks = (size_t)dec.comp[i].blocks_x * dec.comp[i].blocks_y;
+                    dec.comp[i].coefs = (int16_t *)calloc(num_blocks * 64, sizeof(int16_t));
+                    if (!dec.comp[i].coefs) goto fail;
+                }
+                dec.seq_buffered = 1;
+            }
+            if (dec.is_progressive || dec.seq_buffered) {
+                /* Decode progressive scan, or one sequential scan into the coefficient buffers */
+                if (dec.is_progressive)
+                    for (int i = 0; i < ns; i++)
+                        for (int k = dec.ss; k <= dec.se; k++) dec.coef_bits[scan_comps[i]][k] = (int8_t)dec.al;
                 if (jpeg_decode_progressive_scan(&dec, scan_comps, ns) < 0) goto fail;
                 pos = scan_end;
                 continue;  /* Continue to next scan */
             } else {
                 /* Baseline: single scan with all components */
-                if (ns != dec.num_components) goto fail;
 
                 /* Allocate component planes */
                 int y_stride = dec.mcus_x * dec.comp[0].h_samp * 8;
@@ -1705,8 +1778,8 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         pos += seg_len;
     }
 
-    /* For progressive, finish decoding after all scans */
-    if (dec.is_progressive) {
+    /* For progressive, or a sequential frame split across scans, finish decoding after all scans */
+    if (dec.is_progressive || dec.seq_buffered) {
         /* cleffa: a progressive frame that reached EOI before any scan is not an image; libjpeg
          * fails with JERR_SOF_NO_SOS ("missing SOS marker"), and finishing it here returned a
          * blank picture. */
@@ -1731,7 +1804,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
          * That reconstruction is not implemented here, so such files are refused rather than
          * decoded differently from the reference. */
         {
-            int smooth = 0, possible = 1;
+            int smooth = 0, possible = dec.is_progressive;   /* libjpeg smooths progressive frames only */
             for (int ci = 0; ci < dec.num_components && possible; ci++) {
                 const uint16_t *q = dec.comp_qt[ci];
                 if (dec.coef_bits[ci][0] < 0) possible = 0;
