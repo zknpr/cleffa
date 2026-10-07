@@ -1,6 +1,7 @@
 """The checkout latency report must not look complete until every requested model finished."""
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -16,6 +17,14 @@ class ReportTests(unittest.TestCase):
         with patch.object(checkout_latency, "measure", measure), \
                 patch.object(sys, "argv", ["checkout_latency.py", str(out), "--models", "clef-flash", "clef"]):
             checkout_latency.main()
+
+    def test_server_environment_carries_no_engine_overrides(self):
+        # A CLEF_* diagnostic inherited from the shell (CLEF_PROFILE serializes the GPU,
+        # CLEF_ATTN_TU=0 selects another mode) would skew every sample without a trace.
+        with patch.dict(os.environ, {"CLEF_PROFILE": "1", "CLEF_ATTN_TU": "0", "PATH": os.environ.get("PATH", "")}):
+            env = checkout_latency.engine_env()
+        self.assertFalse([k for k in env if k.startswith("CLEF_")], env)
+        self.assertIn("PATH", env)
 
     def test_report_is_published_only_after_every_model(self):
         def fail_on_second(model, rows, args):

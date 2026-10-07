@@ -13,6 +13,7 @@ import datetime
 import hashlib
 import http.client
 import json
+import os
 import platform
 import random
 import socket
@@ -55,6 +56,14 @@ def request_body(row: dict, model: str) -> bytes:
     return json.dumps({**{k: v for k, v in row.items() if k != "id"}, "model": model}).encode()
 
 
+def engine_env() -> dict[str, str]:
+    """The server's environment: the shell's, without any CLEF_* diagnostic. CLEF_PROFILE
+    serializes the GPU and CLEF_ATTN_TU=0 or CLEF_HEAD_BF16=1 select another execution mode;
+    inherited silently, any of them would make the report describe something other than the
+    default engine (review #102)."""
+    return {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+
+
 def measure(model: str, rows: list[dict], args: argparse.Namespace) -> list[dict]:
     gguf = ROOT / "gguf" / (model + ".gguf")
     encoded = subprocess.run(
@@ -70,7 +79,7 @@ def measure(model: str, rows: list[dict], args: argparse.Namespace) -> list[dict
     with log_path.open("w") as log:
         server = subprocess.Popen(
             [str(ROOT / "clef-server"), "-m", str(gguf), "--port", str(port)],
-            cwd=ROOT, stdout=log, stderr=log,
+            cwd=ROOT, stdout=log, stderr=log, env=engine_env(),
         )
         conn = None
         try:
@@ -156,6 +165,7 @@ def main() -> None:
               "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "platform": platform.platform(), "passes": args.passes, "long_passes": args.long_passes,
               "truncation": False, "requested_models": list(args.models), "complete": False, "models": {},
+              "engine_overrides": "none: CLEF_* variables are removed from the server's environment",
               "engine_sha256": hashlib.sha256((ROOT / "clef-server").read_bytes()).hexdigest()}
     # Progress goes to a checkpoint beside the output; the output path receives the report only
     # once every requested model has finished, so an interrupted two-model run cannot be

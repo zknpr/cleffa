@@ -947,6 +947,31 @@ class EvidenceArchive(unittest.TestCase):
             self.assertFalse(pat.search(text), text)
         self.assertEqual(ea.path_rewrite('/root', '<home>')[0].pattern, ea.path_pattern('/root'))
 
+    def test_triple_quoted_credentials_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'cfg.toml': 'password = """correct horse battery staple"""\n',
+                  'cfg.py': "api_key = \'\'\'abcdefghijklmnopqrstuvwxyz\'\'\'\n",
+                  'short.py': 'SECRET = """hunter2"""\n',
+                  'multi.py': 'token = """line one\nline two of the token"""\n'}
+        kept = {'doc.py': 'doc = """not a secret, a docstring"""\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'triple.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_name_exclusions_fold_case(self):
+        exp = self.root / 'gemm-probe-20261004'
+        for name in ('Usage-20261007.json', 'SUBSCRIPTIONS.json', 'Checkpoint.json', 'MSL.txt', 'Cleffa-Evidence-x.tar.gz'):
+            (exp / name).write_text('{}' if name.endswith('.json') else 'x')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'case2.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in ('Usage-20261007.json', 'SUBSCRIPTIONS.json', 'Checkpoint.json', 'MSL.txt', 'Cleffa-Evidence-x.tar.gz'):
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

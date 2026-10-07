@@ -85,11 +85,11 @@ MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\x
 
 EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
 # Text extracts of Apple's Metal Shading Language specification kept beside some experiments.
-THIRD_PARTY_DOC = re.compile(r'^(msl|metal-spec|Metal-Shading-Language-Specification)\.(txt|pdf)$')
+THIRD_PARTY_DOC = re.compile(r'^(msl|metal-spec|Metal-Shading-Language-Specification)\.(txt|pdf)$', re.IGNORECASE)
 # Cloudflare account subscription and usage dumps: budget bookkeeping, not evidence.
-ACCOUNT_BOOKKEEPING = re.compile(r'^(subscriptions|usage([-_.].*)?)\.json$')
+ACCOUNT_BOOKKEEPING = re.compile(r'^(subscriptions|usage([-_.].*)?)\.json$', re.IGNORECASE)
 # Agents' own working-state files (goal, sessions, next action), not experiment evidence.
-AGENT_STATE = re.compile(r'^checkpoint[-.a-zA-Z0-9]*\.json$')
+AGENT_STATE = re.compile(r'^checkpoint[-.a-zA-Z0-9]*\.json$', re.IGNORECASE)   # name rules fold case (review #103)
 EXCLUDE_EXT = {'.o', '.a', '.dylib', '.inc', '.bin', '.npy', '.npz', '.pt', '.xml', '.pdf',
                '.gz', '.zip', '.tar', '.zst', '.xz', '.bz2', '.7z', '.dmg', '.pkg'}
 
@@ -152,6 +152,8 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 # after a sensitive key (`password: |-` with the value on the next lines) is rejected on the
 # indicator alone, since the value cannot be matched inline (review #96).
 STRONG = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD'
+# A TOML or Python triple-quoted value, which may span lines (review #101).
+TRIPLE = r'"""(?:(?!""")[\s\S]){4,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){4,256}\'\'\''
 PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\})(?![A-Za-z0-9_])'
 # Two groups: paths and names the rewrites replace (scanned on the rewritten text, since a
 # surviving path is a leak) and credentials (scanned on the original text as well, since a
@@ -176,7 +178,7 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
-                       r'["\']?\s*[=:]\s*(?:"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
+                       r'["\']?\s*[=:]\s*(?:' + TRIPLE + r'|"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
                        r'\b[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX +
                        r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[A-Z0-9][^\s"\',;}\]{]{3,}|'
                        r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
@@ -252,7 +254,7 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
     if len(parts) == 1 and not (path.suffix == '.jsonl' and path.name.startswith('engine_logits')):
         # Top-level files: only the engine outputs the parity tests write (size-checked below).
         return False, 'top-level file'
-    if path.name.startswith('cleffa-evidence-'):
+    if path.name.lower().startswith('cleffa-evidence-'):
         return False, 'archive output'
     if THIRD_PARTY_DOC.match(path.name):
         return False, 'third-party document'
