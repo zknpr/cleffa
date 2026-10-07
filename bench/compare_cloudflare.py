@@ -10,7 +10,10 @@ whose probability keys happen to match is an error, never agreement. Each plan
 row's input-ID hash must equal the FP32 oracle encoding's: equal counts and
 spans do not prove equal tokens. A plan collected before the hash existed is
 accepted only with --allow-unhashed-plan, and the summary then records that
-token identity was not verified.
+token identity was not verified. Each local response row names its request
+(`id`) and carries the planned request's hash (`request_sha256`); position in
+the file is not identity. Rows captured before those fields existed are
+accepted only with the same flag, recorded as unbound in the summary.
 """
 
 from __future__ import annotations
@@ -60,6 +63,20 @@ def check_input_ids(row: dict, enc: dict, allow_unhashed: bool) -> bool:
         return False
     if row["input_ids_sha256"] != digest:
         raise ValueError("Planned token IDs differ from the oracle encoding")
+    return True
+
+
+def check_local_binding(local_row: dict, row: dict, allow_unhashed: bool) -> bool:
+    """True when the local response names the planned request and carries its hash. A row
+    without the hash is accepted only with allow_unhashed, and the summary then says the local
+    responses were not bound; a wrong id or hash is an error, since the local answer would be
+    scored against another request's FP32 logits."""
+    if "request_sha256" not in local_row:
+        if not allow_unhashed:
+            raise ValueError("Local response carries no request hash; capture it with id and request_sha256 or pass --allow-unhashed-plan")
+        return False
+    if local_row.get("id") != row["id"] or local_row["request_sha256"] != row["request_sha256"]:
+        raise ValueError("Local response does not match its planned request")
     return True
 
 
@@ -168,7 +185,7 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
             if len(local) != len(rows):
                 raise ValueError("Local response count differs")
         comparisons, coverage, unstable = [], [], []
-        ids_verified = True
+        ids_verified = local_bound = True
         for i, (row, ref, enc) in enumerate(zip(rows, refs, encoded, strict=True)):
             if ref["id"] != row["id"] or hosted_payload(ref, model) != row["request"]:
                 raise ValueError("Oracle and hosted requests differ")
@@ -186,6 +203,8 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
                           set(local[i]["answers"]) != set(row["request"]["questions"]) or
                           local[i]["usage"]["input_tokens"] != row["full_input_tokens"]):
                 raise ValueError("Local response has incomplete questions or input")
+            if local:
+                local_bound = check_local_binding(local[i], row, allow_unhashed) and local_bound
             for question in row["questions"]:
                 qid, options = question["id"], question["option_ids"]
                 planned_type = row["request"]["questions"][qid]["type"]
@@ -224,6 +243,7 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
         summary["models"][model] = {
             "requests": len(rows), "questions": len(comparisons), "coverage": coverage,
             "input_ids_verified": ids_verified,
+            "local_bound": local_bound if local else None,
             "unstable_responses": unstable,
             "comparisons": {a + "_vs_" + b: {
                 "all": metrics(comparisons, a, b),
@@ -241,7 +261,8 @@ def main() -> None:
     parser.add_argument("out", type=Path)
     parser.add_argument("--local-dir", type=Path)
     parser.add_argument("--allow-unhashed-plan", action="store_true",
-                        help="accept a plan collected before input-ID hashes existed; recorded in the summary")
+                        help="accept a plan without input-ID hashes and local rows without request hashes "
+                             "(captured before they existed); both are recorded in the summary")
     args = parser.parse_args()
     summary = compare(args.hosted, args.local_dir, args.allow_unhashed_plan)
     with args.out.open("x") as out:

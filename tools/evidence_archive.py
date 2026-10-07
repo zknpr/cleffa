@@ -117,8 +117,14 @@ REWRITES = [
 # (review #79). The capital test is case-sensitive inside an otherwise case-insensitive pattern.
 KEY_WORDS = 'access|key|id|secret|token|value|hash|str|string|pass|pwd|auth|private|signing'
 # The words that name a credential: API keys, key material named for its use (private, signing,
-# encryption, access), secrets, tokens and passwords (review #80). Public keys are not secrets.
-SENSITIVE = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|TOKEN|PASSWORD'
+# encryption, access), secrets, tokens and passwords in their abbreviations too (PASS, PWD,
+# PASSWD, PASSPHRASE; reviews #80, #88). Public keys are not secrets.
+# Longer password spellings precede PASS so the whole word is consumed before the suffix rule.
+# The abbreviations PASS and PWD need a preceding name segment (DB_PASS, dbPass, ssh-pwd): on
+# their own they are a loop variable (`pass=0;pass<2;pass++`), a Python statement or a `PASS:`
+# log marker, and the unrestricted form excluded ten source files of the 2026-10-06 tree.
+SENSITIVE = (r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|TOKEN|'
+             r'PASSPHRASE|PASSWORD|PASSWD|(?:[A-Z0-9]+[_-]|(?-i:[a-z0-9]+))(?:PASS|PWD)')
 KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
               '|'.join(w.capitalize() for w in KEY_WORDS.split('|')) + r')))*')
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
@@ -177,9 +183,9 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
         return 'clone or environment'
     if any(p.endswith('.trace') or p.endswith('.dSYM') for p in ancestors):
         return 'trace or dSYM bundle'
-    if any(part.startswith('article-') for part in ancestors):
+    if any(part.lower().startswith('article-') for part in ancestors):   # any capitalization (review #90)
         return 'private workload directory'
-    if top.startswith('ds4-') and len(ancestors) >= 2 and parts[1] == 'source':
+    if top.lower().startswith('ds4-') and len(ancestors) >= 2 and parts[1].lower() == 'source':
         return 'upstream clone'
     if ancestors and not EXPERIMENT.match(top):
         # Only the oracle directories ref/oracle.py writes, and of those the small files, never

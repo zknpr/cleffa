@@ -800,6 +800,37 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/multi.yaml', names)
         self.assertNotIn('gemm-probe-20261004/multi.log', names)
 
+    def test_password_abbreviations_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'pass.log': 'DB_PASS=correct-horse-battery-staple\n',
+                  'pwd.log': 'DB_PWD=abcdefghijklmnop\n',
+                  'phrase.log': 'SSH_PASSPHRASE="correct horse battery staple"\n',
+                  'pass.json': '{"db_pass": "correct-horse-battery-staple"}',
+                  'passwd.json': '{"passwd": "abcdefghijklmnop"}'}
+        kept = {'counts.log': 'passes=3\nbypass=true\npass_count=16\ncompass_heading=north-north-west-by-north\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'pass.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_workload_directories_are_pruned_case_insensitively(self):
+        # A nested Article-* directory escaped the prefix test by capitalization; a top-level
+        # one was already pruned as an unrecognized directory.
+        nested = self.root / 'gemm-probe-20261004' / 'Article-Workload'   # no lowercase twin: APFS folds case
+        nested.mkdir()
+        (nested / 'result.json').write_text('{"articles_per_s": 0.7}')
+        top = self.root / 'Article-Review-20261005'
+        top.mkdir()
+        (top / 'result.json').write_text('{"articles_per_s": 0.7}')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'case.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/Article-Workload/result.json', names)
+        self.assertNotIn('Article-Review-20261005/result.json', names)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

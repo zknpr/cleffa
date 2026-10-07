@@ -8,7 +8,8 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from compare_cloudflare import check_input_ids, confidence_value, decision, distribution, load_hosted, score_value
+from compare_cloudflare import (check_input_ids, check_local_binding, confidence_value, decision, distribution,
+                                load_hosted, score_value)
 
 
 class ComparisonTests(unittest.TestCase):
@@ -66,6 +67,19 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_input_ids({}, enc, allow_unhashed=False)   # a plan from before the hash existed
         self.assertFalse(check_input_ids({}, enc, allow_unhashed=True))   # accepted, recorded as unverified
+
+    def test_local_responses_bind_to_their_planned_request(self):
+        # Position in the file is not identity: a local row names its request and carries the
+        # planned request's hash, or it is accepted only as unbound.
+        row = {"id": "r007", "request_sha256": "a" * 64}
+        self.assertTrue(check_local_binding({"id": "r007", "request_sha256": "a" * 64}, row, allow_unhashed=False))
+        for local in [{"id": "r008", "request_sha256": "a" * 64}, {"id": "r007", "request_sha256": "b" * 64},
+                      {"request_sha256": "a" * 64}]:
+            with self.subTest(local=local), self.assertRaises(ValueError):
+                check_local_binding(local, row, allow_unhashed=False)
+        with self.assertRaises(ValueError):
+            check_local_binding({}, row, allow_unhashed=False)   # captured before the fields existed
+        self.assertFalse(check_local_binding({}, row, allow_unhashed=True))
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")

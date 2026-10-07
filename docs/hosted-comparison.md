@@ -277,7 +277,12 @@ exceed its conservative free budget.
 
 For a local response comparison, add `--local-dir DIR` to the comparison command. That
 directory must contain `clef-flash.jsonl` and `clef.jsonl`, one response per request in plan
-order, with the matching model selector and full input counts. The saved `capture-local.py`
+order, with the matching model selector and full input counts, and each row must carry the
+planned request's `id` and `request_sha256`: position in the file is not identity. The plan
+itself carries an `input_ids_sha256` per request that must equal the FP32 oracle encoding's.
+The 2026-10-04 journal and its local files predate both fields; the comparator refuses them
+unless `--allow-unhashed-plan` is passed, and then records `input_ids_verified: false` and
+`local_bound: false` per model in the summary. The saved `capture-local.py`
 in this run's artifact directory reproduces the sequential local replay and checks for other
 GPU workers first. Local replay is not performed by the hosted collector.
 
