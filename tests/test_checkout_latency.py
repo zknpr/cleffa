@@ -14,9 +14,26 @@ import checkout_latency
 
 class ReportTests(unittest.TestCase):
     def run_main(self, out: Path, measure):
-        with patch.object(checkout_latency, "measure", measure), \
+        identity = lambda path: {"path": path.name, "bytes": 1, "sha256": "0" * 64}   # not the 18 GB files
+        with patch.object(checkout_latency, "measure", measure), patch.object(checkout_latency, "gguf_identity", identity), \
                 patch.object(sys, "argv", ["checkout_latency.py", str(out), "--models", "clef-flash", "clef"]):
             checkout_latency.main()
+
+    def test_report_binds_to_the_measured_gguf(self):
+        # The model name alone does not say which weights ran; the report carries each GGUF's
+        # size and SHA-256, taken before its measurement.
+        import hashlib
+        with tempfile.TemporaryDirectory() as temp:
+            gguf = Path(temp) / "x.gguf"
+            gguf.write_bytes(b"GGUF" + bytes(range(256)) * 10)
+            identity = checkout_latency.gguf_identity(gguf)
+            self.assertEqual(identity["sha256"], hashlib.sha256(gguf.read_bytes()).hexdigest())
+            self.assertEqual(identity["bytes"], gguf.stat().st_size)
+            out = Path(temp) / "latency.json"
+            self.run_main(out, lambda model, rows, args: [{"id": "blog", "median_ms": 1.0}])
+            report = json.loads(out.read_text())
+            self.assertEqual(set(report["gguf"]), {"clef-flash", "clef"})
+            self.assertEqual(report["gguf"]["clef"]["sha256"], "0" * 64)
 
     def test_server_environment_carries_no_engine_overrides(self):
         # A CLEF_* diagnostic inherited from the shell (CLEF_PROFILE serializes the GPU,

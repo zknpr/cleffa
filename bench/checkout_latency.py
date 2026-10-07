@@ -64,6 +64,18 @@ def engine_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
 
 
+def gguf_identity(path: Path) -> dict:
+    """The measured weights, by size and SHA-256 of the GGUF as it is on disk, hashed before
+    the measurement: the model name alone would let a stale or regenerated file pass for the
+    pinned model (review #107). tests/verify_gguf.py ties a hash to the pinned snapshot."""
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(16 << 20), b""):
+            digest.update(chunk)
+    return {"path": str(path.relative_to(ROOT)) if path.is_relative_to(ROOT) else str(path),
+            "bytes": path.stat().st_size, "sha256": digest.hexdigest()}
+
+
 def measure(model: str, rows: list[dict], args: argparse.Namespace) -> list[dict]:
     gguf = ROOT / "gguf" / (model + ".gguf")
     encoded = subprocess.run(
@@ -164,7 +176,7 @@ def main() -> None:
     report = {"source": SOURCE, "padding": "Synthetic filler; not external chart payloads",
               "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "platform": platform.platform(), "passes": args.passes, "long_passes": args.long_passes,
-              "truncation": False, "requested_models": list(args.models), "complete": False, "models": {},
+              "truncation": False, "requested_models": list(args.models), "complete": False, "models": {}, "gguf": {},
               "engine_overrides": "none: CLEF_* variables are removed from the server's environment",
               "engine_sha256": hashlib.sha256((ROOT / "clef-server").read_bytes()).hexdigest()}
     # Progress goes to a checkpoint beside the output; the output path receives the report only
@@ -173,6 +185,7 @@ def main() -> None:
     # for and carries a completion marker (review #92).
     partial = args.out.with_name(args.out.name + ".partial")
     for model in args.models:
+        report["gguf"][model] = gguf_identity(ROOT / "gguf" / (model + ".gguf"))
         result = measure(model, rows, args)
         report["models"][model] = result
         partial.write_text(json.dumps(report, indent=2) + "\n")

@@ -143,10 +143,12 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
               '|'.join(w.capitalize() for w in KEY_WORDS.split('|')) + r')))*')
 # A strongly named credential (password, passphrase, secret, API or key material, not the
 # generic token or the pass/pwd abbreviations) is a credential whatever its value's length:
-# `PASSWORD=hunter2` is a password (review #95). The value must start alphanumerically and run
-# four or more characters to a quote, comma, semicolon or bracket: on the 2026-10-06 tree that
-# form excludes nothing, while any single character excluded three ContractNLI texts on
-# `secret:\`. Only a placeholder is not a value: an empty one, null/none/true/false,
+# `PASSWORD=hunter2` is a password (review #95). The value must start with a letter, a digit or
+# password punctuation (`!hunter2`; review #105), not with a backslash, bracket, brace, `<`, `$`
+# or `/`, and run four or more characters to a quote, comma, semicolon or bracket: on the
+# 2026-10-06 tree that form excludes nothing, while any single character excluded three
+# ContractNLI texts on `secret:\` before an escaped line break, and an opening brace is a
+# schema object. Only a placeholder is not a value: an empty one, null/none/true/false,
 # <redacted>, ${VAR}, {{var}} or a run of asterisks, and the value is on the key's line: prose
 # such as "kept secret:" followed by a new sentence is not an assignment. A YAML block scalar
 # after a sensitive key (`password: |-` with the value on the next lines) is rejected on the
@@ -180,7 +182,7 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:' + TRIPLE + r'|"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
                        r'\b[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX +
-                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[A-Z0-9][^\s"\',;}\]{]{3,}|'
+                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[A-Z0-9!@#%^&*+?._~-][^\s"\',;}\]{]{3,}|'
                        r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
 FORBIDDEN = re.compile(PATH_PATTERNS + '|' + CREDENTIAL_PATTERNS, re.IGNORECASE)
 CREDENTIALS = re.compile(CREDENTIAL_PATTERNS, re.IGNORECASE)
@@ -224,9 +226,9 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
         return 'dotfile'   # .env, .gitignore, editor state: never evidence
     if forbidden_in(rel.as_posix()):   # the same scan as content: FORBIDDEN and Basic (review #73)
         return 'forbidden path'
-    if any(p in EXCLUDE_DIR_PARTS for p in parts):
+    if any(p.lower() in EXCLUDE_DIR_PARTS for p in parts):   # directory names fold case (review #106)
         return 'clone or environment'
-    if any(p.endswith('.trace') or p.endswith('.dSYM') for p in ancestors):
+    if any(p.lower().endswith(('.trace', '.dsym')) for p in ancestors):
         return 'trace or dSYM bundle'
     if any(part.lower().startswith('article-') for part in ancestors):   # any capitalization (review #90)
         return 'private workload directory'

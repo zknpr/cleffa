@@ -972,6 +972,36 @@ class EvidenceArchive(unittest.TestCase):
         for name in ('Usage-20261007.json', 'SUBSCRIPTIONS.json', 'Checkpoint.json', 'MSL.txt', 'Cleffa-Evidence-x.tar.gz'):
             self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_punctuation_leading_short_credentials_are_caught(self):
+        # "!hunter2" is a password; the alphanumeric-start rule missed it. The structures that
+        # rule was keeping out (prose "secret:" before an escaped line break, a schema object,
+        # a bracketed placeholder) must stay out.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'bang.log': 'PASSWORD="!hunter2"\n', 'hash.log': 'secret: #abc123\n',
+                  'at.json': '{"password": "@hunter2"}', 'star.log': 'passwd=*hunter2\n'}
+        kept = {'prose.json': '{"text": "shall be kept secret:\\n5.6.1. The parties"}',
+                'schema.json': '{"password": {"type": "string"}, "secret": [1, 2]}',
+                'bracket.log': 'password: [redacted]\nsecret: <masked>\napi_key: (none)\nsecret: $SECRET\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'punct.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_directory_exclusions_fold_case(self):
+        exp = self.root / 'gemm-probe-20261004'
+        dirs = ('Node_Modules', 'probe.TRACE', 'app.dsym')   # no lowercase twins: the volume folds case
+        for d in dirs:
+            (exp / d).mkdir()
+            (exp / d / 'data.json').write_text('{}')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'dircase.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for d in dirs:
+            self.assertNotIn(f'gemm-probe-20261004/{d}/data.json', names, d)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
