@@ -1062,6 +1062,22 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_credential_values_of_any_length_are_caught(self):
+        # PASSWORD=123 is a password; the four-character floor came from a measurement that the
+        # first-character rule has since made unnecessary.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'n3.log': 'PASSWORD=123\n', 'c3.log': 'API_KEY=xyz\n', 'j2.json': '{"password": "ab"}',
+                  'one.log': 'secret: x\n', 'esc.json': '{"api_key": "\\u0061b"}'}
+        kept = {'empty.log': 'password=\nsecret: ""\napi_key: \'\'\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'tiny.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

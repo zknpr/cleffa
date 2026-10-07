@@ -147,8 +147,9 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 # (`!hunter2`, `/abc123`, `$upersecret`; reviews #105, #111) except an escape or an opening
 # structure: a backslash (`secret:\` before an escaped line break in three ContractNLI texts),
 # a brace (a schema object), a bracket, a parenthesis or an angle bracket (placeholders), and
-# runs four or more characters to a quote, comma, semicolon or bracket; on the 2026-10-06 tree
-# that form excludes nothing. Only a placeholder is not a value: an empty one,
+# runs to a quote, comma, semicolon or bracket, however short (`PASSWORD=123`; review #114);
+# on the 2026-10-06 tree that form excludes nothing. Only a placeholder is not a value: an
+# empty one,
 # null/none/true/false, <redacted>, (none), ${VAR}, {{var}}, {var} or a run of asterisks, and
 # the value is on the key's line: prose
 # such as "kept secret:" followed by a new sentence is not an assignment. A YAML block scalar
@@ -187,7 +188,7 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:' + TRIPLE + r'|"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
                        r'\b[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX +
-                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]{3,}|'
+                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]*|'
                        # a command-line option named for a credential, with its value after whitespace:
                        # `--api-key abcdefghijklmnop`, `--password hunter2` (review #113)
                        r'(?<![A-Z0-9-])--?[A-Z0-9-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX +
@@ -305,7 +306,7 @@ def json_strings(text: str) -> str | None:
             found.append(v)
         elif isinstance(v, dict):
             for k, x in v.items():
-                if isinstance(k, str) and isinstance(x, str) and CREDENTIAL_KEY.search(k) and len(x) >= 16:
+                if isinstance(k, str) and isinstance(x, str) and CREDENTIAL_KEY.search(k) and x:
                     # Rejoined so the credential pattern sees key and value together; whitespace
                     # inside the value becomes '_' so a passphrase counts as one value. This is
                     # a scanning view, never archived.

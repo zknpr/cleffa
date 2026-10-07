@@ -81,11 +81,17 @@ def file_state(path: Path) -> tuple:
     return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
 
 
-def measure_bound(model: str, rows: list[dict], args: argparse.Namespace) -> tuple[dict, list[dict]]:
+def measure_bound(model: str, rows: list[dict], args: argparse.Namespace, engine: tuple) -> tuple[dict, list[dict]]:
     """Hash the GGUF, measure, and require the file to be the same one afterwards: device,
     inode, size, mtime and ctime, which an ordinary writer cannot restore after a rewrite. A
     GGUF regenerated after the hash and before or during the measurement would otherwise leave
-    a report whose digest names bytes the server never ran (review #112)."""
+    a report whose digest names bytes the server never ran (review #112). The server binary,
+    hashed once for the report, must likewise be the one recorded before and after every
+    measurement, or a rebuild between two models would run bytes the report does not describe
+    (review #115)."""
+    server = ROOT / "clef-server"
+    if file_state(server) != engine:
+        raise RuntimeError(f"{server} changed since it was hashed for the report")
     gguf = ROOT / "gguf" / (model + ".gguf")
     before = file_state(gguf)
     identity = gguf_identity(gguf)
@@ -94,6 +100,8 @@ def measure_bound(model: str, rows: list[dict], args: argparse.Namespace) -> tup
     result = measure(model, rows, args)
     if file_state(gguf) != before:
         raise RuntimeError(f"{gguf} changed during the measurement; the report would not describe the weights that ran")
+    if file_state(server) != engine:
+        raise RuntimeError(f"{server} changed during the measurement; the report would not describe the engine that ran")
     return identity, result
 
 
@@ -200,13 +208,14 @@ def main() -> None:
               "truncation": False, "requested_models": list(args.models), "complete": False, "models": {}, "gguf": {},
               "engine_overrides": "none: CLEF_* variables are removed from the server's environment",
               "engine_sha256": hashlib.sha256((ROOT / "clef-server").read_bytes()).hexdigest()}
+    engine = file_state(ROOT / "clef-server")   # the binary the hash above describes; checked around every measurement
     # Progress goes to a checkpoint beside the output; the output path receives the report only
     # once every requested model has finished, so an interrupted two-model run cannot be
     # mistaken for a complete single-model one. The report also names the models it was asked
     # for and carries a completion marker (review #92).
     partial = args.out.with_name(args.out.name + ".partial")
     for model in args.models:
-        report["gguf"][model], result = measure_bound(model, rows, args)
+        report["gguf"][model], result = measure_bound(model, rows, args, engine)
         report["models"][model] = result
         partial.write_text(json.dumps(report, indent=2) + "\n")
         print(model, [(r["id"], round(r["median_ms"], 1)) for r in result], flush=True)

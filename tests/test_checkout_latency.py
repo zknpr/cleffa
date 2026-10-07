@@ -15,7 +15,7 @@ import checkout_latency
 class ReportTests(unittest.TestCase):
     def run_main(self, out: Path, measure):
         # measure_bound() hashes and guards the 18 GB files; the report tests stand in for it.
-        def bound(model, rows, args):
+        def bound(model, rows, args, *engine):
             return {"path": f"gguf/{model}.gguf", "bytes": 1, "sha256": "0" * 64}, measure(model, rows, args)
         with patch.object(checkout_latency, "measure_bound", bound), \
                 patch.object(sys, "argv", ["checkout_latency.py", str(out), "--models", "clef-flash", "clef"]):
@@ -29,10 +29,13 @@ class ReportTests(unittest.TestCase):
             (root / "gguf").mkdir()
             gguf = root / "gguf" / "clef-flash.gguf"
             gguf.write_bytes(b"GGUF" + bytes(range(256)))
+            server = root / "clef-server"
+            server.write_bytes(b"\xcf\xfa\xed\xfe engine")
             rows, args = [], None
             with patch.object(checkout_latency, "ROOT", root), \
                     patch.object(checkout_latency, "measure", lambda m, r, a: [{"id": "blog", "median_ms": 1.0}]):
-                identity, result = checkout_latency.measure_bound("clef-flash", rows, args)
+                engine = checkout_latency.file_state(server)
+                identity, result = checkout_latency.measure_bound("clef-flash", rows, args, engine)
                 self.assertEqual(identity["bytes"], gguf.stat().st_size)
 
                 def regenerate(model, r, a):
@@ -40,7 +43,19 @@ class ReportTests(unittest.TestCase):
                     return [{"id": "blog", "median_ms": 1.0}]
                 with patch.object(checkout_latency, "measure", regenerate), \
                         self.assertRaisesRegex(RuntimeError, "changed"):
-                    checkout_latency.measure_bound("clef-flash", rows, args)
+                    checkout_latency.measure_bound("clef-flash", rows, args, engine)
+
+                # The server binary too: rebuilt between the Flash and 27B measurements, it
+                # would run bytes the recorded engine hash does not describe.
+                gguf.write_bytes(b"GGUF" + bytes(range(256)))
+                engine = checkout_latency.file_state(server)
+
+                def rebuild(model, r, a):
+                    server.write_bytes(b"\xcf\xfa\xed\xfe other!")
+                    return [{"id": "blog", "median_ms": 1.0}]
+                with patch.object(checkout_latency, "measure", rebuild), \
+                        self.assertRaisesRegex(RuntimeError, "clef-server.*changed"):
+                    checkout_latency.measure_bound("clef-flash", rows, args, engine)
 
     def test_report_binds_to_the_measured_gguf(self):
         # The model name alone does not say which weights ran; the report carries each GGUF's
