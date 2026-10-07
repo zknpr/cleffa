@@ -831,6 +831,23 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/Article-Workload/result.json', names)
         self.assertNotIn('Article-Review-20261005/result.json', names)
 
+    def test_compound_names_with_trailing_words_are_caught(self):
+        # SECRET_KEY_BASE: the suffix rule consumed _KEY and stopped at _BASE.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'rails.log': 'SECRET_KEY_BASE=0123456789abcdef0123456789abcdef\n',
+                  'rails.json': '{"secret_key_base": "0123456789abcdef0123456789abcdef"}',
+                  'salt.log': 'TOKEN_SALT=abcdefghijklmnopqrstuvwxyz\n',
+                  'seed.json': '{"secretKeySeed": "abcdefghijklmnopqrstuvwxyz"}'}
+        kept = {'base.log': 'key_base_url=https://example.com/base-path-for-keys\nbase_token_count=4096\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'base.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

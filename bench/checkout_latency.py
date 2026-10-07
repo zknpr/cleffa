@@ -155,13 +155,21 @@ def main() -> None:
     report = {"source": SOURCE, "padding": "Synthetic filler; not external chart payloads",
               "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "platform": platform.platform(), "passes": args.passes, "long_passes": args.long_passes,
-              "truncation": False, "models": {},
+              "truncation": False, "requested_models": list(args.models), "complete": False, "models": {},
               "engine_sha256": hashlib.sha256((ROOT / "clef-server").read_bytes()).hexdigest()}
+    # Progress goes to a checkpoint beside the output; the output path receives the report only
+    # once every requested model has finished, so an interrupted two-model run cannot be
+    # mistaken for a complete single-model one. The report also names the models it was asked
+    # for and carries a completion marker (review #92).
+    partial = args.out.with_name(args.out.name + ".partial")
     for model in args.models:
         result = measure(model, rows, args)
         report["models"][model] = result
-        args.out.write_text(json.dumps(report, indent=2) + "\n")
+        partial.write_text(json.dumps(report, indent=2) + "\n")
         print(model, [(r["id"], round(r["median_ms"], 1)) for r in result], flush=True)
+    report["complete"] = True
+    partial.write_text(json.dumps(report, indent=2) + "\n")
+    partial.replace(args.out)
 
 
 if __name__ == "__main__":

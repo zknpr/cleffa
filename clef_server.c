@@ -241,14 +241,20 @@ static bool queue_pending(void) {
  * The queue is rechecked between entries, so a request that arrives mid-round waits for at
  * most one entry's pass rather than the whole table's (review #24); the round resumes at the
  * next idle period. */
+/* An idle round resumes where an arriving request interrupted the previous one: starting at
+ * entry zero every time would let intermittent traffic starve the later entries and the
+ * template entry of their warming pass (review #93). Position CACHE_ENTRIES is the template. */
+static int keep_warm_cursor;
+
 static bool keep_warm_round(char *err, size_t errlen) {
     if (!clef_keep_warm(S.e, err, errlen)) return false;
-    for (int i = 0; i < CACHE_ENTRIES; i++) {
-        if (queue_pending()) return true;
-        if (cache[i].p && !clef_prefix_keep_warm(S.e, cache[i].p, err, errlen)) return false;
+    for (int k = 0; k <= CACHE_ENTRIES; k++) {
+        const int i = (keep_warm_cursor + k) % (CACHE_ENTRIES + 1);
+        if (queue_pending()) { keep_warm_cursor = i; return true; }
+        const clef_prefix *p = i == CACHE_ENTRIES ? template_entry : cache[i].p;
+        if (p && !clef_prefix_keep_warm(S.e, p, err, errlen)) return false;
     }
-    if (queue_pending()) return true;
-    return !template_entry || clef_prefix_keep_warm(S.e, template_entry, err, errlen);
+    return true;
 }
 
 static void *worker(void *arg) {

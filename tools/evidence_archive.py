@@ -114,8 +114,9 @@ REWRITES = [
 # capital (AWS_SECRET_ACCESS_KEY, secretAccessKey, password_hash), drawn from the words such
 # names are built of; "tokenizer" is not a token, and a result field such as
 # token_neuron_estimate or token_negative_control is a measurement, not a credential
-# (review #79). The capital test is case-sensitive inside an otherwise case-insensitive pattern.
-KEY_WORDS = 'access|key|id|secret|token|value|hash|str|string|pass|pwd|auth|private|signing'
+# (review #79); base, salt, seed and material cover SECRET_KEY_BASE and its kin (review #91).
+# The capital test is case-sensitive inside an otherwise case-insensitive pattern.
+KEY_WORDS = 'access|key|id|secret|token|value|hash|str|string|pass|pwd|auth|private|signing|base|salt|seed|material'
 # The words that name a credential: API keys, key material named for its use (private, signing,
 # encryption, access), secrets, tokens and passwords in their abbreviations too (PASS, PWD,
 # PASSWD, PASSPHRASE; reviews #80, #88). Public keys are not secrets.

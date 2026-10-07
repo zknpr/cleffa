@@ -53,9 +53,12 @@ bool test_run(clef_engine *e, const clef_record *recs, int n, float ****probs, c
     (void)e; (void)recs; (void)n; (void)err; (void)errlen; uncached_runs++; *probs = NULL; return true;
 }
 static job arriving;
+static const clef_prefix *warmed[8];   /* the entries of a round, in order */
+static int warmed_n;
 bool test_keep_warm(clef_engine *e, char *err, size_t errlen) { (void)e; (void)err; (void)errlen; return true; }
 bool test_prefix_keep_warm(clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
-    (void)e; (void)p; (void)err; (void)errlen;
+    (void)e; (void)err; (void)errlen;
+    if (warmed_n < 8) warmed[warmed_n++] = p;
     if (++warm_calls == 1) { pthread_mutex_lock(&S.mu); S.head = S.tail = &arriving; pthread_mutex_unlock(&S.mu); }
     return true;
 }
@@ -108,10 +111,24 @@ int main(void) {
     assert(keep_warm_round(kerr, sizeof(kerr)));
     assert(S.head == &arriving);
     if (warm_calls != 1) { fprintf(stderr, "keep-warm round touched %d entries after a request arrived (expected 1)\n", warm_calls); return 1; }
+    /* The next idle round resumes at the entry the arrival skipped, not at entry zero, so
+       intermittent traffic cannot starve the later entries and the template (review #93).
+       The round still covers every position: entries 1 and 2, the template, then entry 0. */
+    S.head = S.tail = NULL;
+    warmed_n = 0;
+    assert(keep_warm_round(kerr, sizeof(kerr)));
+    const clef_prefix *expected[4] = { (clef_prefix *)(fake + 1), (clef_prefix *)(fake + 2), (clef_prefix *)(fake + 3), (clef_prefix *)(fake + 0) };
+    for (int i = 0; i < 4; i++) {
+        if (warmed_n != 4 || warmed[i] != expected[i]) {
+            fprintf(stderr, "keep-warm round after an interruption warmed %d entries, position %d was entry %ld (expected %ld)\n",
+                    warmed_n, i, warmed_n > i ? (long)((const char *)warmed[i] - fake) : -1L, (long)((const char *)expected[i] - fake));
+            return 1;
+        }
+    }
     for (int i = 0; i < 3; i++) cache[i].p = NULL;
     template_entry = NULL;
     S.head = S.tail = NULL;
-    printf("server keep-warm: an arriving request stops the idle round after one entry\n");
+    printf("server keep-warm: an arriving request stops the idle round after one entry; the next round resumes there\n");
 
     /* A full table of populated entries; a new key whose pass overflowed must not take a slot
        (it would evict a populated entry for nothing), and an existing key's overflowing pass

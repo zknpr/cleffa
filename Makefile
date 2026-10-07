@@ -141,6 +141,7 @@ test: clef-tool tests/test-prefix-owner tests/test-prefix-planner tests/test-hea
 	.venv/bin/python -B tests/test_cloudflare_checkout.py
 	.venv/bin/python -B tests/test_cloudflare_corpus.py
 	.venv/bin/python -B tests/test_compare_cloudflare.py
+	.venv/bin/python -B tests/test_checkout_latency.py
 	.venv/bin/python -B tests/test_evidence_archive.py
 
 test-errors: all tests/test-metal-errors tests/test-cli-alloc

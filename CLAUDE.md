@@ -118,7 +118,8 @@ for the HF snapshot, not an engine test. `golden-*.log` files at the root are or
 `make test` runs the head and UTF-8 error unit tests, JSON byte parity, tokenizer parity against
 `gguf/clef-flash.gguf` + `model-flash`, HTTP write-failure handling, snapshot/GGUF verifier and
 numerical parity regressions using tiny generated fixtures, the model-free prefix-cache ownership,
-planner and test-mode checks, and the Cloudflare collector/comparator unit tests.
+planner and test-mode checks, the Cloudflare collector/comparator unit tests, and the checkout
+latency report test.
 `make test-errors` uses the flash GGUF to check CLI allocation/output failures, CLI/HTTP error responses, and
 Metal execution-error propagation and recovery. Everything else is run explicitly, with the model
 and golden directory as arguments. Use clef-flash for iteration; the 27B is for final parity only.
