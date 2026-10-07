@@ -10,7 +10,9 @@ whose probability keys happen to match is an error, never agreement. Each plan
 row's input-ID hash must equal the FP32 oracle encoding's: equal counts and
 spans do not prove equal tokens. A plan collected before the hash existed is
 accepted only with --allow-unhashed-plan, and the summary then records that
-token identity was not verified. Each local response row names its request
+token identity was not verified. The oracle's recorded dtype must be float32;
+a directory that records none is accepted only with the same flag and reported
+as unverified. Each local response row names its request
 (`id`) and carries the planned request's hash (`request_sha256`); position in
 the file is not identity. Rows captured before those fields existed are
 accepted only with the same flag, recorded as unbound in the summary.
@@ -138,6 +140,23 @@ def local_snapshot(path: Path) -> tuple[list[dict], str]:
     return jsonl_rows(data), hashlib.sha256(data).hexdigest()
 
 
+def oracle_dtype(golden: Path, allow_unhashed: bool) -> str | None:
+    """The oracle's recorded dtype, which must be float32: a `*-f32` directory is FP32 by name
+    only. ref/oracle.py records it in latency.json; ref/oracle_f32_stream.py records nothing,
+    and neither records the snapshot revision, so a missing record is accepted only with
+    allow_unhashed and reported as unverified. Binding to the revision needs the oracles to
+    write a manifest, which the existing golden directories do not have."""
+    path = golden / "latency.json"
+    if not path.exists():
+        if not allow_unhashed:
+            raise ValueError(f"{golden} records no oracle dtype; regenerate it or pass --allow-unhashed-plan")
+        return None
+    dtype = json.loads(path.read_bytes()).get("dtype")
+    if dtype != "float32":
+        raise ValueError(f"{golden} was generated with dtype {dtype!r}, not float32")
+    return dtype
+
+
 def oracle_snapshot(golden: Path) -> tuple[list[dict], list[dict], dict, str]:
     """The oracle requests, encodings and logits, the logits parsed from the same bytes that are
     hashed, so the published digest is of the tensors the metrics used."""
@@ -213,6 +232,7 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
         rows = [r for r in plan["requests"] if r["model"] == model]
         golden = ROOT / "golden" / (model + "-f32")
         refs, encoded, logits, logits_sha256 = oracle_snapshot(golden)
+        dtype = oracle_dtype(golden, allow_unhashed)
         if len(refs) != len(rows) or len(encoded) != len(rows):
             raise ValueError("Oracle corpus size differs")
         local = local_sha256 = None
@@ -278,7 +298,7 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
             pairs += [("local", "fp32"), ("local", "hosted")]
         summary["models"][model] = {
             "requests": len(rows), "questions": len(comparisons), "coverage": coverage,
-            "input_ids_verified": ids_verified,
+            "input_ids_verified": ids_verified, "oracle_dtype_verified": dtype == "float32",
             "local_bound": local_bound if local else None,
             "unstable_responses": unstable,
             "comparisons": {a + "_vs_" + b: {

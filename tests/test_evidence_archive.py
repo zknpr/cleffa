@@ -1334,6 +1334,32 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_quoted_tokens_after_a_scheme_and_attached_curl_user_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'q1.log': "Authorization: Token 'abc'\n", 'q2.log': 'Authorization: ApiKey "x"\n',
+                  'q3.json': '{"Authorization": "Bearer \\"ab\\""}', 'curl5.sh': 'curl -ualice:hunter2 https://example.com\n'}
+        kept = {'q4.py': 'headers = {"Authorization": f"Bearer {token}"}\n', 'q5.log': 'Authorization: Bearer <token>\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'quoted2.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_jsonl_records_get_the_strong_key_check(self):
+        # A multi-record JSONL file is not one JSON document; each record is judged like one.
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'recs.jsonl').write_text('{"ok": 1}\n{"password":"[abc"}\n')
+        (exp / 'recs2.jsonl').write_text('{"ok": 1}\n{"api_key":"\\\\hunter2"}\n')
+        (exp / 'recs3.jsonl').write_text('{"ok": 1}\n{"password": "<redacted>", "token_count": 3}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'jsonl.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/recs.jsonl', names)
+        self.assertNotIn('gemm-probe-20261004/recs2.jsonl', names)
+        self.assertIn('gemm-probe-20261004/recs3.jsonl', names)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
