@@ -93,10 +93,18 @@ AGENT_STATE = re.compile(r'^checkpoint[-.a-zA-Z0-9]*\.json$')
 EXCLUDE_EXT = {'.o', '.a', '.dylib', '.inc', '.bin', '.npy', '.npz', '.pt', '.xml', '.pdf',
                '.gz', '.zip', '.tar', '.zst', '.xz', '.bz2', '.7z', '.dmg', '.pkg'}
 
+def path_rewrite(path: str, placeholder: str) -> tuple[re.Pattern, str]:
+    """A rewrite of `path` that applies only where it is a path: not preceded by another
+    slash (the `//root` of `mysql://root:pw@db` is a URL authority, not a home directory)
+    and not followed by a name character (`/rooted/` is another directory). A home of
+    /root would otherwise rewrite the userinfo of a connection string (review #94)."""
+    return re.compile(r'(?<!/)' + re.escape(path) + r'(?![A-Za-z0-9_.-])'), placeholder
+
+
 # Rewrites run in order; the checkout path must precede the home directory.
 REWRITES = [
-    (re.compile(re.escape(str(Path(__file__).resolve().parent.parent))), '<repo>'),
-    (re.compile(re.escape(str(Path.home()))), '<home>'),
+    path_rewrite(str(Path(__file__).resolve().parent.parent), '<repo>'),
+    path_rewrite(str(Path.home()), '<home>'),
     (re.compile(r'Zknpr'), '<cf-account>'),
 ]
 # Anything matching after rewriting excludes the file, and a match in the final scan fails
@@ -128,18 +136,38 @@ SENSITIVE = (r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|AC
              r'PASSPHRASE|PASSWORD|PASSWD|(?:[A-Z0-9]+[_-]|(?-i:[a-z0-9]+))(?:PASS|PWD)')
 KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
               '|'.join(w.capitalize() for w in KEY_WORDS.split('|')) + r')))*')
-FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
-                       re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
-                       r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
-                       r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
+# A strongly named credential (password, passphrase, secret, API or key material, not the
+# generic token or the pass/pwd abbreviations) is a credential whatever its value's length:
+# `PASSWORD=hunter2` is a password (review #95). The value must start alphanumerically and run
+# four or more characters to a quote, comma, semicolon or bracket: on the 2026-10-06 tree that
+# form excludes nothing, while any single character excluded three ContractNLI texts on
+# `secret:\`. Only a placeholder is not a value: an empty one, null/none/true/false,
+# <redacted>, ${VAR}, {{var}} or a run of asterisks, and the value is on the key's line: prose
+# such as "kept secret:" followed by a new sentence is not an assignment. A YAML block scalar
+# after a sensitive key (`password: |-` with the value on the next lines) is rejected on the
+# indicator alone, since the value cannot be matched inline (review #96).
+STRONG = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD'
+PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\})(?![A-Za-z0-9_])'
+# Two groups: paths and names the rewrites replace (scanned on the rewritten text, since a
+# surviving path is a leak) and credentials (scanned on the original text as well, since a
+# rewrite could alter the bytes around a secret before the pattern sees them; review #94).
+PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
+                 re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
+                 r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|Zknpr|session_id|'
+                 r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}')
+CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
                        r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
                        r'Authorization["\']?\s*[=:]\s*(["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!\1)[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
-                       r'["\']?\s*[=:]\s*(?:"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
+                       r'["\']?\s*[=:]\s*(?:"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
+                       r'\b[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX +
+                       r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[A-Z0-9][^\s"\',;}\]{]{3,}|'
+                       r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
+FORBIDDEN = re.compile(PATH_PATTERNS + '|' + CREDENTIAL_PATTERNS, re.IGNORECASE)
+CREDENTIALS = re.compile(CREDENTIAL_PATTERNS, re.IGNORECASE)
 # An Authorization header carries a credential whatever its scheme (Bearer, Basic, token, ApiKey,
 # Digest or none). Unquoted (first form): the value has a run of sixteen or more characters
 # after an optional scheme word, or carries a quote or an '=' followed by eight or more
@@ -303,14 +331,15 @@ def basic_credential(text: str) -> bool:
     return False
 
 
-def forbidden_in(text: str) -> bool:
-    """FORBIDDEN and the Basic-authorization check over the text, over its decoded strings when
-    it is JSON, and over both with character escapes decoded."""
+def forbidden_in(text: str, pattern: re.Pattern = None) -> bool:
+    """FORBIDDEN (or the given pattern) and the Basic-authorization check over the text, over
+    its decoded strings when it is JSON, and over both with character escapes decoded."""
+    pattern = FORBIDDEN if pattern is None else pattern
     views = [text, unescape(text)]
     decoded = json_strings(text)
     if decoded is not None:
         views += [decoded, unescape(decoded)]
-    return any(FORBIDDEN.search(v) or basic_credential(v) for v in views)
+    return any(pattern.search(v) or basic_credential(v) for v in views)
 
 
 FLOAT_DTYPES = {'F64': 8, 'F32': 4, 'F16': 2, 'BF16': 2}   # element sizes in bytes
@@ -403,6 +432,11 @@ def prepare(path: Path, raw: bytes) -> tuple[bytes | None, bool, str]:
         # Evidence files are UTF-8. Anything else cannot be rewritten or scanned reliably, so it
         # is excluded rather than archived raw (review #11).
         return None, False, 'undecodable text'
+    # Credentials are scanned on the original text: a rewrite could alter the bytes around a
+    # secret before the pattern sees them (review #94). Paths are not, since replacing them is
+    # what the rewrites are for; the rewritten text is scanned for everything.
+    if forbidden_in(text, CREDENTIALS):
+        return None, False, 'forbidden content'
     new = text
     for pat, repl in REWRITES:
         new = pat.sub(repl, new)

@@ -123,7 +123,7 @@ test-prefix-model: tests/test-prefix-owner-model
 	tests/test-prefix-owner-model gguf/clef-flash.gguf gguf/clef.gguf tests/owner-model-request.jsonl
 	rm -f tests/owner-model-request.jsonl
 
-test: clef-tool tests/test-prefix-owner tests/test-prefix-planner tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-record-errors tests/test-server-writes
+test: clef-tool clef-server tests/test-prefix-owner tests/test-prefix-planner tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-record-errors tests/test-server-writes
 	tests/test-prefix-owner
 	tests/test-prefix-planner
 	tests/test-head-attend

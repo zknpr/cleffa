@@ -4,6 +4,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import sys
 import tarfile
@@ -847,6 +848,55 @@ class EvidenceArchive(unittest.TestCase):
             self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_credentials_are_scanned_before_paths_are_rewritten(self):
+        # With a home directory of /root, the home rewrite once turned mysql://root:pw@db into
+        # mysql:/<home>:pw@db before the scan, hiding the userinfo. Credentials are scanned on
+        # the original text, and a path rewrite applies only at a path boundary.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'dsn-root.json').write_text('{"dsn": "mysql://root:pw@db:3306/x", "log": "/root/run/x.log"}')
+        (exp / 'home-root.log').write_text('log=/root/x.log and /rooted/path\n')
+        root_home = [ea.path_rewrite('/root', '<home>')]
+        with patch.object(ea, 'REWRITES', root_home):   # as if Path.home() were /root
+            manifest = ea.build(self.root, Path(self.tmp.name) / 'roothome.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/dsn-root.json', names)
+        self.assertIn('gemm-probe-20261004/home-root.log', names)
+        with tarfile.open(Path(self.tmp.name) / 'roothome.tar.gz') as tar:
+            text = tar.extractfile('ev/gemm-probe-20261004/home-root.log').read().decode()
+        self.assertEqual(text, 'log=<home>/x.log and /rooted/path\n')
+        # Even an unconstrained rewrite cannot hide a credential: the scan precedes it.
+        with patch.object(ea, 'REWRITES', [(re.compile('/root'), '<home>')]):
+            manifest = ea.build(self.root, Path(self.tmp.name) / 'roothome2.tar.gz', 'ev')
+        self.assertNotIn('gemm-probe-20261004/dsn-root.json', {e['path'] for e in manifest['files']})
+
+    def test_short_values_of_strongly_named_credentials_are_caught(self):
+        # hunter2 is a password; a length rule alone published it. Placeholders are not.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'short.log': 'PASSWORD=hunter2\n', 'short.json': '{"password":"hunter2"}',
+                  'short-key.log': 'api_key: abc123\n', 'short-base.log': 'SECRET_KEY_BASE=short1\n'}
+        kept = {'placeholders.log': 'password: null\nPASSWORD=<redacted>\napi_key: ${API_KEY}\npassword: ***\nsecret: none\n',
+                'empty.json': '{"password": "", "secret": null, "token": "abc"}'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'short.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_yaml_block_scalar_credentials_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'block.yaml').write_text('password: |-\n  correct horse battery staple\n')
+        (exp / 'fold.yml').write_text('db:\n  api_key: >\n    abcdefghijklmnop\n')
+        (exp / 'steps.yaml').write_text('pipeline: |-\n  build\n  test\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'block.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/block.yaml', names)
+        self.assertNotIn('gemm-probe-20261004/fold.yml', names)
+        self.assertIn('gemm-probe-20261004/steps.yaml', names)
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
