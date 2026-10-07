@@ -146,6 +146,20 @@ one image), the markers and the earlier images before preprocessing each one: 13
 the first of the two images still fitting alone. The schema is not reserved, so nothing the
 reference accepts is refused. `tests/test_record.py` checks both peaks.
 
+The decoders were then fuzzed, since every review round had found something new by reading.
+`tests/fuzz_image.c` is a libFuzzer target over decode, `smart_resize`, the antialiased resize,
+patches and position interpolation, with ASan and UBSan and no recovery, a 4-megapixel source
+limit, a PNG/JPEG token dictionary and 194 seed files (`make fuzz-image`; Apple's clang ships
+without libFuzzer, so it uses Homebrew LLVM 22). The first run, on the decoder before round four
+and with 14 workers for 30 minutes, executed 28.5 million inputs and found nothing, but its
+coverage stopped at 770 edges: a mutated PNG almost always fails a chunk CRC or the zlib trailer,
+so the fuzzer rarely got past them. The harness now also decodes a copy with the zlib header
+check, the Adler-32 trailer and every chunk CRC repaired. The second run, on the decoder as of
+round four, executed 48.7 million inputs in 30 minutes with 14 workers and reached 849 edges, with
+no crash, out-of-memory or timeout. Both logs are in `golden/fuzz-image-2026-10-07/`. Two runs of
+this length bound what was searched, not what is there; the dependency-free PNG inflater, which
+cleffa builds never compile, was not fuzzed.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to
@@ -515,7 +529,7 @@ invalid-byte/position checks also passed ASan. The two command/result ledgers ar
 
 ## Not done
 
-- Videos (`videos`, `<|video_pad|>`, the video processor).
+- Live or unknown-length video streams; video codecs outside H.264, HEVC, ProRes and MJPEG.
 - WebP (the hosted API accepts it); 16-bit, low-bit and interlaced PNGs; CMYK JPEGs.
 - Attention remains quadratic in patches. The large-image FP32 MPP path reduces its cost;
   further tensor-unit work remains open.

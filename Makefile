@@ -6,10 +6,14 @@ OBJCFLAGS = $(CFLAGS) -fobjc-arc
 # ones, so a struct change could link objects built against different layouts (review #4).
 DEPFLAGS = -MMD -MP
 LDLIBS  += -lz
+VIDEO_CFLAGS := $(shell pkg-config --cflags libavformat libavcodec libswscale libavutil)
+LDLIBS += $(shell pkg-config --libs libavformat libavcodec libswscale libavutil)
 LDFLAGS ?=
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
-HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o
+HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o clef_video.o
+
+clef_video.o: CFLAGS += $(VIDEO_CFLAGS)
 
 .PHONY: all clean test test-errors test-attention test-vision-attention test-vision-gemm test-gemm test-gdn test-head-tsan test-prefix-attention test-prefix-model unicode
 
@@ -107,6 +111,13 @@ tests/test-head-parallel-tsan: tests/test_head_parallel.c clef_head.c $(HOST_OBJ
 test-head-tsan: tests/test-head-parallel-tsan
 	tests/test-head-parallel-tsan --init-only
 
+# libFuzzer target for the image decode and preprocessing path (tests/fuzz_image.c). Apple's clang
+# ships without libFuzzer, so this uses the newest Homebrew LLVM; not part of make test.
+FUZZ_CC ?= $(lastword $(sort $(wildcard /opt/homebrew/opt/llvm/bin/clang /opt/homebrew/Cellar/llvm*/*/bin/clang)))
+fuzz-image: tests/fuzz_image.c clef_image.c clef_image.h third_party/iris/jpeg.h third_party/iris/png.h
+	@test -n "$(FUZZ_CC)" || { echo "fuzz-image: no Homebrew LLVM clang found (brew install llvm, or set FUZZ_CC)"; exit 1; }
+	$(FUZZ_CC) -isysroot $$(xcrun --show-sdk-path) -O1 -g -std=c11 -D_DARWIN_C_SOURCE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -o $@ tests/fuzz_image.c -lz
+
 # Includes clef_image.c; crafted JPEGs under UBSan and ASan (each aborted before the jpeg.h fixes).
 tests/test-jpeg-ub: tests/test_jpeg_ub.c clef_image.c clef_image.h third_party/iris/jpeg.h third_party/iris/png.h
 	$(CC) $(CFLAGS) $(DEPFLAGS) -fsanitize=undefined,address -fno-sanitize-recover=all -o $@ tests/test_jpeg_ub.c $(LDFLAGS) $(LDLIBS)
@@ -169,6 +180,7 @@ test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/tes
 	tests/test-server-writes
 	.venv/bin/python -B tests/test_json.py
 	.venv/bin/python -B tests/test_image.py
+	.venv/bin/python -B tests/test_video.py
 	.venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
 	.venv/bin/python -B tests/test_verify_gguf.py
 	.venv/bin/python -B tests/test_verify_snapshot.py
@@ -187,6 +199,6 @@ test-errors: all tests/test-metal-errors tests/test-cli-alloc
 	tests/test-metal-errors gguf/clef-flash.gguf
 
 clean:
-	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
 
 -include $(wildcard *.d tests/*.d)
