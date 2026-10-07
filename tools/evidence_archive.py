@@ -448,6 +448,7 @@ def collect_below(golden: Path, root_fd: int):
     included, excluded = [], {}
     total = 0
     seen: list[tuple[str, frozenset[str], tuple[int, int]]] = []
+    children: list[tuple[str, tuple[int, int]]] = []   # retained child directories, as enumerated
     snapshots: list[tuple[Path, tuple[int, int, int, int]]] = []   # what each enumerated file was when examined
 
     def note(path: Path, st: os.stat_result):
@@ -461,6 +462,14 @@ def collect_below(golden: Path, root_fd: int):
             if reason is not None:
                 dirnames.remove(name)
                 excluded[f'{reason} (directories)'] = excluded.get(f'{reason} (directories)', 0) + 1
+                continue
+            # os.walk() skips a child that becomes a link before the descent, silently and with
+            # no onerror call; the child must later turn up as a visited directory with this
+            # identity (review #77). Keyed the way os.walk() names it.
+            cst = os.stat(os.path.join(dirpath, name), follow_symlinks=False)
+            if not stat.S_ISDIR(cst.st_mode):
+                raise SystemExit(f'{os.path.join(dirpath, name)} changed during collection')
+            children.append((os.path.join(dirpath, name), (cst.st_dev, cst.st_ino)))
         for name in sorted(filenames):
             path = Path(dirpath) / name
             try:
@@ -507,6 +516,10 @@ def collect_below(golden: Path, root_fd: int):
             raise SystemExit(f'{dirpath}: cannot re-list: {e.strerror}')
         if (st.st_dev, st.st_ino) != ident or now != listed:
             raise SystemExit(f'{dirpath} changed during collection')
+    visited = {dirpath: ident for dirpath, _, ident in seen}
+    for child, ident in children:
+        if visited.get(child) != ident:
+            raise SystemExit(f'{child} changed during collection')
     # An in-place overwrite of a file already examined leaves its directory's entries unchanged,
     # so every enumerated file must still have the identity, size and mtime it was read or
     # classified with once the whole tree has been collected (reviews #72, #74). A rewrite that

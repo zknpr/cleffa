@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from compare_cloudflare import decision, distribution, load_hosted, score_value
+from compare_cloudflare import confidence_value, decision, distribution, load_hosted, score_value
 
 
 class ComparisonTests(unittest.TestCase):
@@ -41,6 +41,20 @@ class ComparisonTests(unittest.TestCase):
                 score_value({"type": "score", "score": score}, options)
         self.assertEqual(score_value({"type": "score", "score": 1.25}, options), 1.25)
         self.assertEqual(score_value({"type": "score", "score": 2}, options), 2)
+
+    def test_confidence_must_be_a_finite_number_in_the_unit_interval(self):
+        # Choice and score answers carry a confidence that is recorded as evidence; noul answers
+        # carry none. It must be a finite number in [0, 1], and not a boolean.
+        for conf in ["0.9", True, float("nan"), float("inf"), -0.1, 1.1, 999]:
+            with self.subTest(conf=conf), self.assertRaises(ValueError):
+                confidence_value({"type": "choice", "confidence": conf})
+        with self.assertRaises(ValueError):
+            confidence_value({"type": "score"})   # required for choice and score
+        with self.assertRaises(ValueError):
+            confidence_value({"type": "noul", "noul": 0.6, "confidence": 0.6})   # never for noul
+        self.assertEqual(confidence_value({"type": "choice", "confidence": 0.9608}), 0.9608)
+        self.assertEqual(confidence_value({"type": "score", "confidence": 1}), 1)
+        self.assertIsNone(confidence_value({"type": "noul", "noul": 0.6}))
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")

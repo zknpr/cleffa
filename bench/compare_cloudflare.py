@@ -53,6 +53,22 @@ def score_value(answer: dict, option_ids: list[str]) -> float:
     return score
 
 
+def confidence_value(answer: dict) -> float | None:
+    """A choice or score answer's `confidence`: required, a finite number in [0, 1]; a noul
+    answer carries none. Hosted and local responses in the corpus journals both follow this.
+    Not checked against the probabilities: the local engine reports the maximum probability,
+    while the hosted service's confidence differs from it by up to 0.42 on the corpus, so it is
+    recorded as evidence, not derived."""
+    confidence = answer.get("confidence")
+    if answer.get("type") == "noul":
+        if confidence is not None:
+            raise ValueError("Unexpected confidence on a noul answer")
+        return None
+    if type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
+        raise ValueError("Invalid confidence")
+    return confidence
+
+
 def decision(answer: dict, probs: dict[str, float]) -> str:
     if answer.get("type") == "choice":
         choice = answer["choice"]
@@ -165,12 +181,14 @@ def compare(path: Path, local_dir: Path | None) -> dict:
                               "hosted": hosted[0], "hosted_decision": decision(answers[0], hosted[0]),
                               "hosted_decisions_all_passes": [decision(a, p) for a, p in zip(answers, hosted)],
                               "hosted_max_repeat_delta": max(abs(p[k] - hosted[0][k]) for p in hosted for k in p),
-                              "hosted_confidence": answers[0].get("confidence")}
+                              "hosted_confidence": confidence_value(answers[0])}
+                for a in answers[1:]:
+                    confidence_value(a)   # every pass, like the probabilities
                 if local:
                     answer = local[i]["answers"][qid]
                     comparison["local"] = distribution(answer, options, planned_type)
                     comparison["local_decision"] = decision(answer, comparison["local"])
-                    comparison["local_confidence"] = answer.get("confidence")
+                    comparison["local_confidence"] = confidence_value(answer)
                 if planned_type == "score":
                     for a in answers:
                         score_value(a, options)   # every pass, like the probabilities

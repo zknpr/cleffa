@@ -639,6 +639,26 @@ class EvidenceArchive(unittest.TestCase):
             self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
         self.assertIn('gemm-probe-20261004/cert.txt', names)
 
+    def test_child_directory_swapped_before_descent_aborts(self):
+        # os.walk() skips a child that became a symlink between the parent's enumeration and
+        # the descent, silently and without onerror; the parent's entry names are unchanged.
+        # Every retained child directory must be visited as the directory it was enumerated as.
+        from unittest.mock import patch
+        probe = self.root / 'gemm-probe-20261004'
+        moved = Path(self.tmp.name) / 'moved-probe'
+        real = ea.classify
+
+        def swap_child(golden, path):
+            verdict = real(golden, path)
+            if path == self.root / 'engine_logits.jsonl':   # a root file: classified before the descent
+                shutil.move(probe, moved)
+                probe.symlink_to(moved, target_is_directory=True)
+            return verdict
+        out = Path(self.tmp.name) / 'child.tar.gz'
+        with patch.object(ea, 'classify', swap_child), self.assertRaisesRegex(SystemExit, 'changed during collection'):
+            ea.build(self.root, out, 'ev')
+        self.assertFalse(out.exists())
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
