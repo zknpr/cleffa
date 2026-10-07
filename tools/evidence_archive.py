@@ -174,25 +174,30 @@ PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
 CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
                        r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
-                       # the key is explicitly Authorization: any value that is not a placeholder, however
-                       # short and whatever its first character (`/abc1234`, `_abc1234`; review #108),
+                       # the key is explicitly Authorization: any value that is not a placeholder, of any
+                       # length (`x`; review #116) and whatever its first character (`/abc1234`; review #108),
                        # when it ends the line or the quoted string; prose after the colon runs on,
                        # a `{template}` is a placeholder, and a scheme word standing alone
                        # (`"Bearer " + token` in code) is no value (review #98)
-                       r'Authorization["\']?[ \t]*[=:][ \t]*["\']?(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
-                       r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$|["\']))'
-                       r'[^\s"\']{4,}[ \t]*(?:\r?\n|$|["\'])|'
-                       r'Authorization["\']?\s*[=:]\s*(["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!\1)[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
+                       # quoted: the value closes with the quote that opened it; unquoted: it ends the
+                       # line. An f-string prefix before a quote is then never a one-letter value.
+                       r'Authorization["\']?[ \t]*[=:][ \t]*(?P<aq>["\'])(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
+                       r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?P=aq))'
+                       r'[^\s"\']+[ \t]*(?P=aq)|'
+                       r'Authorization[ \t]*[=:][ \t]*(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
+                       r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$))'
+                       r'[^\s"\']+[ \t]*(?:\r?\n|$)|'
+                       r'Authorization["\']?\s*[=:]\s*(?P<dq>["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!(?P=dq))[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:' + TRIPLE + r'|"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})|'
                        r'\b[A-Z0-9_-]*(?:' + STRONG + r')' + KEY_SUFFIX +
                        r'["\']?[ \t]*[=:][ \t]*["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]*|'
-                       # a command-line option named for a credential, with its value after whitespace:
-                       # `--api-key abcdefghijklmnop`, `--password hunter2` (review #113)
+                       # a command-line option named for a credential, with its value after whitespace, of
+                       # any length: `--api-key abcdefghijklmnop`, `--password x` (reviews #113, #117)
                        r'(?<![A-Z0-9-])--?[A-Z0-9-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX +
-                       r'[ \t]+["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]{3,}|'
+                       r'[ \t]+["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]*|'
                        r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
 FORBIDDEN = re.compile(PATH_PATTERNS + '|' + CREDENTIAL_PATTERNS, re.IGNORECASE)
 CREDENTIALS = re.compile(CREDENTIAL_PATTERNS, re.IGNORECASE)

@@ -1078,6 +1078,24 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_short_authorization_and_option_values_are_caught(self):
+        # Once the key is Authorization or a credential-named option, a value of any length is
+        # a credential; placeholders, prose and lone scheme words are not.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'auth1.log': 'Authorization: x\n', 'auth2.log': 'Authorization: Bearer ab\n',
+                  'auth3.json': '{"Authorization": "Token a"}', 'opt1.log': 'tool --password x\n',
+                  'opt2.log': 'client --api-key ab --verbose\n'}
+        kept = {'ctl.log': 'Authorization: required, see the deployment notes.\nAuthorization: Bearer <token>\n'
+                           '--no-token true\n--token-count 1\nheaders["Authorization"] = "Bearer " + token\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'tinyauth.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

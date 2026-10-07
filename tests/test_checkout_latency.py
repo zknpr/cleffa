@@ -81,6 +81,19 @@ class ReportTests(unittest.TestCase):
         self.assertFalse([k for k in env if k.startswith("CLEF_")], env)
         self.assertIn("PATH", env)
 
+    def test_engine_hash_describes_one_snapshot(self):
+        # The binary's identity is taken before the hash and must hold afterwards; a rebuild
+        # between the two would record a hash of bytes the measurements never ran.
+        with tempfile.TemporaryDirectory() as temp:
+            server = Path(temp) / "clef-server"
+            server.write_bytes(b"\xcf\xfa\xed\xfe engine")
+            digest, state = checkout_latency.engine_identity(server)
+            self.assertEqual(state, checkout_latency.file_state(server))
+            states = [checkout_latency.file_state(server), (0, 0, 0, 0, 0)]   # changed between the two looks
+            with patch.object(checkout_latency, "file_state", side_effect=states), \
+                    self.assertRaisesRegex(RuntimeError, "changed"):
+                checkout_latency.engine_identity(server)
+
     def test_report_is_published_only_after_every_model(self):
         def fail_on_second(model, rows, args):
             if model == "clef":
