@@ -21,6 +21,11 @@ Included
 Excluded
   - Mach-O binaries, objects, dSYMs, .inc, Instruments .trace bundles and their exported
     counter tables (.xml, .npz), .bin/.npy tensors, archives, PDFs, .git clones, virtualenvs
+  - documentation pages saved from Apple's developer site (recognized by their terms link)
+  - the engine source inside copied engine trees (a directory holding clef.c or
+    clef_engine.h: its tests/, bench/, tools/, metal/, ref/ and docs/ directories and its root
+    clef* sources, Makefile and documents), since the repository holds the source; result
+    files and an experiment's own probe programs stored beside it stay
   - the ds4 upstream `source/` tree, every `article-*` directory at any depth (private
     workload), any path that itself matches a FORBIDDEN pattern, and the
     text extracts of Apple's Metal Shading Language specification
@@ -34,7 +39,8 @@ Excluded
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
     including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
 Rewritten (text files only, recorded per file in the manifest)
-  - the local checkout path and home directory become <repo> and <home>
+  - the local checkout path and home directory become <repo> and <home>; an agent's scratchpad
+    path under /private/tmp, which carries the checkout path with dashes, becomes <scratch>
   - the Cloudflare account name becomes <cf-account>
 
 The archive is deterministic for a given tree: sorted entries, source mtimes, a manifest
@@ -57,6 +63,7 @@ import argparse
 import base64
 import binascii
 import datetime
+import functools
 import gzip
 import hashlib
 import io
@@ -84,6 +91,18 @@ ORACLE_DIR = re.compile(r'^clef(-flash)?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-att
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
 
 EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
+# Experiments copy the engine tree (engine/, reviewed/, builds/baseline/, or the experiment root
+# itself). A directory holding either marker is such a copy; inside it the engine's own
+# directories and root files are source the repository already holds, while result files
+# stored beside them (qualification logs, build manifests) are evidence and stay.
+ENGINE_MARKERS = ('clef.c', 'clef_engine.h')
+ENGINE_DIRS = {'tests', 'bench', 'tools', 'metal', 'ref', 'docs', 'golden', 'gguf', 'model', 'model-flash'}
+ENGINE_ROOT_FILES = {'Makefile', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'CLAUDE.md', 'AGENTS.md',
+                     'pyrightconfig.json', 'smoke_test.py', 'download_models.sh', 'release.sh'}
+ENGINE_ROOT_EXT = {'.d', '.o'}
+# The engine's own root sources are all named clef*; an experiment's probe program beside them
+# (scorer.c, timed_head.c) is that experiment's evidence and stays.
+ENGINE_ROOT_SOURCE = re.compile(r'^clef[A-Za-z0-9_]*\.(c|h|m|inc)$')
 # Text extracts of Apple's Metal Shading Language specification kept beside some experiments.
 THIRD_PARTY_DOC = re.compile(r'^(msl|metal-spec|Metal-Shading-Language-Specification)\.(txt|pdf)$', re.IGNORECASE)
 # Cloudflare account subscription and usage dumps: budget bookkeeping, not evidence.
@@ -108,8 +127,15 @@ def path_rewrite(path: str, placeholder: str) -> tuple[re.Pattern, str]:
     return re.compile(path_pattern(path)), placeholder
 
 
-# Rewrites run in order; the checkout path must precede the home directory.
+# Claude Code keeps a per-session scratchpad at /private/tmp/claude-<uid>/<checkout with the
+# slashes turned into dashes>/<session uuid>/scratchpad; experiment scripts embed it. The path
+# rewrites do not see the mangled checkout, so it is rewritten whole, and any mangled home that
+# survives, or another session's scratchpad, is forbidden (hand skim of the 2026-10-06 tree).
+MANGLED_REPO = '-' + str(Path(__file__).resolve().parent.parent).strip('/').replace('/', '-')
+MANGLED_HOME = '-' + str(Path.home()).strip('/').replace('/', '-')
+# Rewrites run in order; the scratchpad precedes the checkout path, which precedes the home.
 REWRITES = [
+    (re.compile(r'/private/tmp/claude-\d+/' + re.escape(MANGLED_REPO) + r'/[0-9a-f-]{36}/scratchpad'), '<scratch>'),
     path_rewrite(str(Path(__file__).resolve().parent.parent), '<repo>'),
     path_rewrite(str(Path.home()), '<home>'),
     (re.compile(r'Zknpr'), '<cf-account>'),
@@ -173,7 +199,8 @@ PLACEHOLDER = (r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*
 # Two groups: paths and names the rewrites replace (scanned on the rewritten text, since a
 # surviving path is a leak) and credentials (scanned on the original text as well, since a
 # rewrite could alter the bytes around a secret before the pattern sees them; review #94).
-PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
+PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|/private/tmp/claude-\d+/|' +
+                 r'(?<![A-Za-z0-9_])' + re.escape(MANGLED_HOME) + r'(?![A-Za-z0-9_])|' +
                  path_pattern(str(Path.home())) + '|' + path_pattern(str(Path(__file__).resolve().parent.parent)) + '|'
                  r'squid|\.personal|pop_v22|Zknpr|session_id|accounts/[0-9a-f]{32}|'
                  # a 32-hex value under any account label: account, account_id, accountId,
@@ -236,6 +263,28 @@ def is_text(path: Path) -> bool:
     return path.suffix.lower() in TEXT_EXT or path.name in TEXT_NAMES
 
 
+@functools.lru_cache(maxsize=None)
+def engine_copy(directory: str) -> bool:
+    return any(os.path.lexists(os.path.join(directory, marker)) for marker in ENGINE_MARKERS)
+
+
+def copied_source(golden: Path, parts: tuple[str, ...], directory: bool) -> bool:
+    """True for a path that is engine source inside a copied engine tree: an engine directory
+    (tests/, bench/, ...) directly under the copy's root, or a root file of the engine by name
+    or extension. Everything else in the copy is a result and stays."""
+    for depth in range(len(parts) - 1, -1, -1):   # the copy's root is the nearest marker directory
+        root = golden.joinpath(*parts[:depth])
+        if engine_copy(str(root)):
+            inside = parts[depth:]
+            if len(inside) == 1:
+                name = inside[0]
+                return (directory and name in ENGINE_DIRS) or (not directory and (
+                    name in ENGINE_ROOT_FILES or ENGINE_ROOT_SOURCE.match(name) is not None
+                    or Path(name).suffix.lower() in ENGINE_ROOT_EXT))
+            return inside[0] in ENGINE_DIRS
+    return False
+
+
 def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
     """The exclusion reason the relative path alone decides, for a file or for a directory. The
     walk prunes a directory with a reason before listing it, so an excluded subtree is never
@@ -262,6 +311,8 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
         return 'private workload directory'
     if top.lower().startswith('ds4-') and len(ancestors) >= 2 and parts[1].lower() == 'source':
         return 'upstream clone'
+    if copied_source(golden, parts, directory):
+        return 'copied engine source'
     if ancestors and not EXPERIMENT.match(top):
         # Only the oracle directories ref/oracle.py writes, and of those the small files, never
         # layers/ or dumps (size-checked in classify). Any other undated directory is not evidence.
@@ -507,6 +558,10 @@ def prepare(path: Path, raw: bytes) -> tuple[bytes | None, bool, str]:
     # what the rewrites are for; the rewritten text is scanned for everything.
     if forbidden_in(text, CREDENTIALS):
         return None, False, 'forbidden content'
+    if path.suffix.lower() == '.md' and 'apple.com/legal/internet-services/terms/site.html' in text:
+        # A documentation page saved from Apple's developer site beside an experiment, like the
+        # Metal specification extracts: third-party text, not evidence (hand skim).
+        return None, False, 'third-party document'
     new = text
     for pat, repl in REWRITES:
         new = pat.sub(repl, new)
@@ -719,7 +774,7 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
         # Derived from the tree, not the wall clock, so rebuilding the same tree gives the same bytes.
         'built': max((e['mtime'] for e in entries), default='1970-01-01T00:00:00+00:00'),
         'rules': (__doc__ or '').split('\n', 2)[2].strip(),
-        'rewrites': ['<repo>', '<home>', '<cf-account>'],
+        'rewrites': ['<scratch>', '<repo>', '<home>', '<cf-account>'],
         'files': entries,
         'excluded_counts': dict(sorted(excluded.items())),
     }
@@ -786,7 +841,8 @@ Curated evidence for the reports in `docs/` of the cleffa repository: {n} files 
 the local `golden/` tree by `tools/evidence_archive.py`, with the SHA-256 of the archived
 bytes in `manifest.json`. {rewritten} text files were rewritten to replace the local
 checkout path, home directory and Cloudflare account name with `<repo>`, `<home>` and
-`<cf-account>`; nothing else was edited, and they are flagged `rewritten`. No digest of a
+`<cf-account>`, and an agent scratchpad path with `<scratch>`; nothing else was edited, and
+they are flagged `rewritten`. No digest of a
 file's original bytes is published: the replaced values are low-entropy, and such a digest
 would let a reader confirm guesses offline. Each report names the directories it relies on.
 

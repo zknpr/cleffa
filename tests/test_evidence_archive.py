@@ -1199,6 +1199,71 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_copied_engine_source_is_excluded_but_results_beside_it_are_kept(self):
+        # Experiments copy the engine tree (engine/, reviewed/, builds/...), and some are an
+        # engine copy at their root with result logs beside the source. The source is in git;
+        # the archive keeps the results only.
+        exp = self.root / 'gemm-probe-20261004'
+        engine = exp / 'engine'
+        for rel in ('clef.c', 'clef_engine.h', 'clef_metal.m', 'metal/clef.metal', 'Makefile', 'README.md', 'CLAUDE.md',
+                    'smoke_test.py', 'download_models.sh', 'tests/test_json.py', 'bench/gemm_bench.m', 'tools/convert.py',
+                    'ref/corpus.py', 'docs/README.md'):
+            (engine / rel).parent.mkdir(parents=True, exist_ok=True)
+            (engine / rel).write_text('int main(void) { return 0; }\n' if rel.endswith(('.c', '.h', '.m', '.metal')) else 'x\n')
+        (engine / 'qualification.log').write_text('all 46 pass\n')       # a result stored inside the copy: kept
+        (engine / 'timed_head.c').write_text('/* the experiment\'s probe */\n')   # not an engine file: kept
+        (engine / 'manifest.json').write_text('{"commit": "abc"}')         # provenance of the copy: kept
+        root_copy = self.root / 'head-score-20261004'                     # an engine copy at the experiment root
+        for rel in ('clef.c', 'clef_engine.h', 'Makefile', 'tests/test_json.py'):
+            (root_copy / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root_copy / rel).write_text('x\n')
+        (root_copy / 'asan-flash.log').write_text('no leaks\n')
+        (root_copy / 'asan-flash.jsonl').write_text('{"ok": true}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'engine.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for rel in ('clef.c', 'clef_engine.h', 'clef_metal.m', 'metal/clef.metal', 'Makefile', 'README.md', 'CLAUDE.md',
+                    'smoke_test.py', 'download_models.sh', 'tests/test_json.py', 'bench/gemm_bench.m', 'tools/convert.py',
+                    'ref/corpus.py', 'docs/README.md'):
+            self.assertNotIn(f'gemm-probe-20261004/engine/{rel}', names, rel)
+        self.assertIn('gemm-probe-20261004/engine/qualification.log', names)
+        self.assertIn('gemm-probe-20261004/engine/manifest.json', names)
+        self.assertIn('gemm-probe-20261004/engine/timed_head.c', names)
+        for rel in ('clef.c', 'clef_engine.h', 'Makefile', 'tests/test_json.py'):
+            self.assertNotIn(f'head-score-20261004/{rel}', names, rel)
+        self.assertIn('head-score-20261004/asan-flash.log', names)
+        self.assertIn('head-score-20261004/asan-flash.jsonl', names)
+        self.assertIn('copied engine source', manifest['excluded_counts'])
+        self.assertIn('gemm-probe-20261004/run.py', names)   # a script in an experiment that is no engine copy stays
+
+    def test_agent_scratch_paths_are_rewritten_and_mangled_home_is_forbidden(self):
+        # Claude Code's scratchpad path carries the checkout path with slashes turned into
+        # dashes and a session UUID; the path rewrites did not see it, and six experiment
+        # scripts in the 2026-10-06 tree embedded it.
+        exp = self.root / 'gemm-probe-20261004'
+        scratch = f'/private/tmp/claude-501/{ea.MANGLED_REPO}/b5f3ee06-9330-405b-aac2-eb8d8821d98a/scratchpad'
+        (exp / 'scratch.py').write_text(f'BUILD = "{scratch}/main-both"\n')
+        (exp / 'mangled.log').write_text(f'session dir {ea.MANGLED_HOME} seen\n')
+        (exp / 'other-scratch.log').write_text('/private/tmp/claude-502/-Users-other/x/scratchpad\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'scratch.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertIn('gemm-probe-20261004/scratch.py', names)
+        self.assertNotIn('gemm-probe-20261004/mangled.log', names)
+        self.assertNotIn('gemm-probe-20261004/other-scratch.log', names)   # another agent session's path: not ours to publish
+        with tarfile.open(Path(self.tmp.name) / 'scratch.tar.gz') as tar:
+            text = tar.extractfile('ev/gemm-probe-20261004/scratch.py').read().decode()
+        self.assertEqual(text, 'BUILD = "<scratch>/main-both"\n')
+
+    def test_scraped_apple_documentation_is_excluded(self):
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'contentionrelief.md').write_text('<!-- { "availability" : [ "macOS: 27.0.0 -" ] } -->\n# Contention relief\n'
+                                                'Copyright. https://www.apple.com/legal/internet-services/terms/site.html\n')
+        (exp / 'notes.md').write_text('# Notes\nSee https://developer.apple.com/metal/ for the specification.\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'apple.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/contentionrelief.md', names)
+        self.assertIn('gemm-probe-20261004/notes.md', names)
+        self.assertIn('third-party document', manifest['excluded_counts'])
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
