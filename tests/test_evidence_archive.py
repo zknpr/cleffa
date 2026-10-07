@@ -547,6 +547,19 @@ class EvidenceArchive(unittest.TestCase):
         with patch.object(ea, 'classify', add_late), self.assertRaisesRegex(SystemExit, 'changed during collection'):
             ea.build(self.root, Path(self.tmp.name) / 'late.tar.gz', 'ev')
 
+    def test_basic_auth_credentials_are_caught(self):
+        # `Basic <base64>` carries user:password; the colon in the decoded value is what makes it
+        # a credential, so the word "basic" before a word that happens to be valid base64 stays.
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'basic.log').write_text('Authorization: Basic dXNlcjpwYXNzd29yZA==\n')
+        (exp / 'basic.json').write_text('{"headers": {"authorization": "basic dXNlcjpwYXNzd29yZA=="}}')
+        (exp / 'prose.md').write_text('Basic test of the basic setup: a Basic auth note, basic abcd done.\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'basic.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/basic.log', names)
+        self.assertNotIn('gemm-probe-20261004/basic.json', names)
+        self.assertIn('gemm-probe-20261004/prose.md', names)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

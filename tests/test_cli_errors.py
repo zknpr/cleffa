@@ -96,6 +96,28 @@ class CliErrors(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0, "lost output was reported as success")
                 self.assertIn(b"stdout", p.stderr)
 
+    def test_stage_time_counts_fallback_heads(self):
+        # CLEF_STAGE_TIME reports the batch's CPU head time. A record that overflows FP16 skips
+        # the first head pass and runs its head after its BF16 rerun, so the head line must come
+        # after the rerun's GPU stage line and include that head.
+        base = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+        base["CLEF_STAGE_TIME"] = "1"
+        line = json.dumps({**REQUEST, "state": "a short checkout state for stage timing"}) + "\n"
+        plain = subprocess.run([ROOT / "clef", "-m", MODEL], input=line, capture_output=True, text=True,
+                               env=base, timeout=120, check=True)
+        env = {**base, "CLEF_DEBUG_F16_LIMIT": "1"}   # every record overflows and reruns in BF16
+        p = subprocess.run([ROOT / "clef", "-m", MODEL], input=line, capture_output=True, text=True,
+                           env=env, timeout=120, check=True)
+        stages = [l for l in p.stderr.splitlines() if l.startswith("clef: stage ")]
+        gpu = [i for i, l in enumerate(stages) if l.startswith("clef: stage T=")]
+        head = [i for i, l in enumerate(stages) if l.startswith("clef: stage head ")]
+        self.assertEqual(len(gpu), 2, stages)   # the flagged pass and the BF16 rerun
+        self.assertEqual(len(head), 1, stages)
+        self.assertGreater(head[0], gpu[1], "head stage reported before the fallback head ran")
+        # The two head times are printed for the record, not asserted: timing is not a test oracle.
+        heads = lambda out: [l for l in out.stderr.splitlines() if l.startswith("clef: stage head ")]
+        print("head stage, plain:", heads(plain), "forced overflow:", heads(p))
+
     def test_unicode_errors_are_json_over_cli_and_http(self):
         requests = [{**REQUEST, "questions": {prefix + ch * 100: {"type": "unknown"}}}
                     for ch in ("é", "界", "🚀") for prefix in ("", "x", "xx")]

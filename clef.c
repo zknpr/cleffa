@@ -252,8 +252,7 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
             ok = false;
         }
     }
-    /* CLEF_STAGE_TIME=1 (with the GPU stage line in clef_metal.m): CPU head time for the batch */
-    if (ok && getenv("CLEF_STAGE_TIME")) fprintf(stderr, "clef: stage head n=%d: %.2f ms\n", n, wall_ms() - t_head);
+    double head_ms = wall_ms() - t_head;
     /* A record whose FP16 GEMM operands left FP16's range is recomputed alone with BF16
      * activations (the pre-FP16 precision, and the reference's). Overflow depends only on the
      * record's own rows, so its result is the same in any batch. */
@@ -266,6 +265,7 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
         ok = clef_gpu_forward(e->gpu, e, ids + bounds[r], pos + bounds[r], ss0, b1, 1, len, true, NULL, &in,
                               r == 0 ? dump : NULL, dump_rows, err, errlen);
         free(ss0);
+        const double t_rerun_head = wall_ms();
         if (ok && !clef_head_run(e->head, &e->cfg, e->w.output, &in, 0, &recs[r], probs[r])) {
             snprintf(err, errlen, "head failed (out of memory)");
             ok = false;
@@ -273,7 +273,11 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
             snprintf(err, errlen, "record %d: non-finite logits", r);
             ok = false;
         }
+        head_ms += wall_ms() - t_rerun_head;
     }
+    /* CLEF_STAGE_TIME=1 (with the GPU stage line in clef_metal.m): CPU head time for the batch,
+     * including the heads of rerun records, which run after their BF16 pass (review #67) */
+    if (ok && getenv("CLEF_STAGE_TIME")) fprintf(stderr, "clef: stage head n=%d: %.2f ms\n", n, head_ms);
     for (int r = 0; ok && !raw && r < n; r++)
         for (int q = 0; q < recs[r].nq; q++) softmax_f32(probs[r][q], recs[r].q[q].n_opt);
     free(ovf);

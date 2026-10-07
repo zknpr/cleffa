@@ -28,7 +28,8 @@ Excluded
     `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
   - dotfiles and extensionless files other than Makefile and LICENSE, key=value assignments
-    that look like credentials, hard-linked files and anything that is not a regular file
+    that look like credentials, Bearer and Basic authorization values, hard-linked files and
+    anything that is not a regular file
   - any file with "private" in any component of its path, and any text file that still matches a
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
     including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
@@ -53,6 +54,8 @@ by MAX_TOTAL in total.
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import datetime
 import gzip
 import hashlib
@@ -107,6 +110,9 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
+# `Basic <base64>` authorization: the value decodes to user:password. Only a decoded colon makes
+# it a credential; "basic test" is the word before a word that happens to be valid base64 (review #66).
+BASIC_AUTH = re.compile(r'\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
 CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)$', re.IGNORECASE)
 
@@ -243,14 +249,26 @@ def unescape(text: str) -> str:
     return ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
 
 
+def basic_credential(text: str) -> bool:
+    """True when a `Basic <base64>` value decodes to something with a colon: user:password."""
+    for m in BASIC_AUTH.finditer(text):
+        try:
+            decoded = base64.b64decode(m.group(1), validate=True)
+        except (binascii.Error, ValueError):
+            continue
+        if b':' in decoded:
+            return True
+    return False
+
+
 def forbidden_in(text: str) -> bool:
-    """FORBIDDEN over the text, over its decoded strings when it is JSON, and over both with
-    character escapes decoded."""
+    """FORBIDDEN and the Basic-authorization check over the text, over its decoded strings when
+    it is JSON, and over both with character escapes decoded."""
     views = [text, unescape(text)]
     decoded = json_strings(text)
     if decoded is not None:
         views += [decoded, unescape(decoded)]
-    return any(FORBIDDEN.search(v) for v in views)
+    return any(FORBIDDEN.search(v) or basic_credential(v) for v in views)
 
 
 FLOAT_DTYPES = {'F64': 8, 'F32': 4, 'F16': 2, 'BF16': 2}   # element sizes in bytes
