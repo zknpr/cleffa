@@ -313,6 +313,16 @@ branch, and two PNGs with empty IDATs, first and between data chunks, are parity
 15-minute `make fuzz-image` run on the result (ASan and UBSan, 30.6 million inputs, 971 edges)
 found nothing. Evidence: `golden/fuzz-image-2026-10-07/review8/`.
 
+A ninth round (Codex on `ed8abd7`) raised one point. (29) Confirmed for a crafted model file:
+`vis_qkv_rope` zeroes the attention kernels' 32 tail rows with one thread per head and patch, so a
+four-patch image (the smallest) covers the tail only with at least 8 heads. A GGUF with 4 heads of
+72 passed every load check, and its stale tail rows would meet masked zero probabilities, where a
+NaN poisons the output. This was inferred from the dispatch, not run end to end, since it needs a
+whole crafted tower. Both released towers have 16 heads, the reads stay inside the 128-row slack,
+and a model file already controls its outputs, so the impact is limited to a malformed model. The
+loader now requires at least 8 vision heads, as it enforces the kernels' other shape assumptions;
+`tests/test_vision_config.c` adds a 4-head header, which loaded before and is now refused.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to

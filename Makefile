@@ -180,7 +180,8 @@ test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/tes
 	.venv/bin/python -B tests/vision_config_fixture.py gguf/clef-flash.gguf tests/vision-config
 	tests/test-vision-config tests/vision-config/vision-ok.gguf ok tests/vision-config/vision-patch-2p24.gguf "unsupported vision shape" tests/vision-config/vision-temporal-2p24.gguf "unsupported vision shape" \
 	    tests/vision-config/vision-mrope-16-8-8.gguf "unsupported M-RoPE layout" tests/vision-config/vision-mrope-missing.gguf "unsupported M-RoPE layout" \
-	    tests/vision-config/vision-image-id-vocab.gguf "below the vocabulary size" tests/vision-config/vision-video-id-2p31.gguf "below the vocabulary size"
+	    tests/vision-config/vision-image-id-vocab.gguf "below the vocabulary size" tests/vision-config/vision-video-id-2p31.gguf "below the vocabulary size" \
+	    tests/vision-config/vision-4-heads.gguf "unsupported vision shape"
 	rm -rf tests/vision-config
 	tests/test-prefix-owner
 	tests/test-prefix-planner

@@ -53,7 +53,10 @@ def main() -> None:
     write(out / "vision-mrope-missing.gguf", kvs, {}, frozenset({"clef.rope.mrope_section"}))
     write(out / "vision-image-id-vocab.gguf", kvs, {"clef.vision.image_token_id": vocab})
     write(out / "vision-video-id-2p31.gguf", kvs, {"clef.vision.video_token_id": 1 << 31})
-    print(f"wrote 7 fixtures with {len(kvs)} clef.* keys to {out}")
+    # Codex on ed8abd7: four heads of 72 pass the head-size checks, but too few threads clear the
+    # attention tail of a four-patch image
+    write(out / "vision-4-heads.gguf", kvs, {"clef.vision.embedding_length": 288, "clef.vision.attention.head_count": 4})
+    print(f"wrote 8 fixtures with {len(kvs)} clef.* keys to {out}")
 
 
 if __name__ == "__main__":

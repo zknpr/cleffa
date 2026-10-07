@@ -240,8 +240,9 @@ internal GPU/head entry points. `clef_main.c` (CLI) and `clef_server.c` (HTTP) a
 `clef.*` keys and `bind_weights` binds every tensor by name with an exact type+shape check, so a
 converter change and the engine must move together. Shape assumptions baked into the kernels are
 enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...), including, for a vision model,
-interleaved M-RoPE section `[11, 11, 10]` (the kernels' `lane % 3`; text cannot reveal a mismatch)
-and vision token ids below the vocabulary. The GGUF is mmap'd and wrapped as a
+interleaved M-RoPE section `[11, 11, 10]` (the kernels' `lane % 3`; text cannot reveal a mismatch),
+vision token ids below the vocabulary, and at least 8 vision heads (`vis_qkv_rope` clears the
+attention tail with one thread per head and patch, and the smallest image has 4 patches). The GGUF is mmap'd and wrapped as a
 single `MTLBuffer` with no copy; weight tensors are addressed by file offset.
 
 Converter layout decisions the engine depends on: per-layer projections fused into one GEMM each

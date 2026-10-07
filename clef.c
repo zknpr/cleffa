@@ -92,9 +92,13 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
         c->v_eps = 1e-6f;   /* nn.LayerNorm(eps=1e-6) in every vision block and the merger */
         c->v_hd = c->v_heads ? c->v_E / c->v_heads : 0;
         c->v_pos_side = (int)sqrt((double)pos_n);
+        /* vis_qkv_rope clears the attention kernels' 32 tail rows with one thread per head and patch,
+         * so the smallest image (one merge window, 4 patches) needs at least 8 heads; with fewer,
+         * stale rows met masked zero probabilities and a NaN there poisoned the output (Codex on
+         * ed8abd7). Both released towers have 16. */
         if (c->v_layers > CLEF_MAX_VLAYERS || c->v_hd != 72 || c->v_hd * c->v_heads != c->v_E || c->v_E % 32 ||
-            c->v_patch != 16 || c->v_merge != 2 || c->v_temporal != 2 || c->v_pos_side * c->v_pos_side != pos_n ||
-            c->v_pos_side < 2) {
+            c->v_heads < 8 || c->v_patch != 16 || c->v_merge != 2 || c->v_temporal != 2 ||
+            c->v_pos_side * c->v_pos_side != pos_n || c->v_pos_side < 2) {
             snprintf(err, errlen, "model: unsupported vision shape (E=%d heads=%d patch=%d merge=%d)", c->v_E, c->v_heads, c->v_patch, c->v_merge);
             return false;
         }
