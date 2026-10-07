@@ -250,10 +250,12 @@ def unescape(text: str) -> str:
 
 
 def basic_credential(text: str) -> bool:
-    """True when a `Basic <base64>` value decodes to something with a colon: user:password."""
+    """True when a `Basic <base64>` value decodes to something with a colon: user:password.
+    Padding is restored before the strict decode: clients and logs drop it (review #68)."""
     for m in BASIC_AUTH.finditer(text):
+        value = m.group(1).rstrip('=')
         try:
-            decoded = base64.b64decode(m.group(1), validate=True)
+            decoded = base64.b64decode(value + '=' * (-len(value) % 4), validate=True)
         except (binascii.Error, ValueError):
             continue
         if b':' in decoded:
@@ -325,6 +327,11 @@ def safetensors_header(raw: bytes) -> str | None:
         return None
     n = int.from_bytes(raw[:8], 'little')
     if n == 0 or 8 + n > len(raw):
+        return None
+    if raw[8:9] != b'{':
+        # The format requires the header to begin with '{' (trailing space padding only), and
+        # the reference loader refuses anything else; json.loads alone would accept leading
+        # whitespace and archive a tensor its consumers cannot load (review #69).
         return None
     try:
         text = raw[8:8 + n].decode('utf-8')

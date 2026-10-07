@@ -16,9 +16,21 @@ class ComparisonTests(unittest.TestCase):
         for probs in [{"a": 1}, {"a": True, "b": 0}, {"a": float("nan"), "b": 1},
                       {"a": 0.8, "b": 0.8}, {"a": 1.1, "b": -0.1}]:
             with self.subTest(probs=probs), self.assertRaises(ValueError):
-                distribution({"type": "choice", "probabilities": probs}, ["a", "b"])
-        self.assertEqual(distribution({"type": "noul", "noul": 0.6}, ["false", "true"]),
+                distribution({"type": "choice", "probabilities": probs}, ["a", "b"], "choice")
+        self.assertEqual(distribution({"type": "noul", "noul": 0.6}, ["false", "true"], "noul"),
                          {"false": 0.4, "true": 0.6})
+
+    def test_answer_type_must_match_the_planned_question(self):
+        # A structurally valid answer of another type, whose probability keys happen to match
+        # the options, must not count as agreement: the planned question's type is the oracle.
+        probs = {"a": 0.6, "b": 0.4}
+        for answer, planned in [({"type": "score", "probabilities": probs}, "choice"),
+                                ({"type": "choice", "choice": "a", "probabilities": probs}, "score"),
+                                ({"type": "noul", "noul": 0.6}, "choice"),
+                                ({"probabilities": probs}, "choice")]:
+            with self.subTest(answer=answer, planned=planned), self.assertRaises(ValueError):
+                distribution(answer, list(probs), planned)
+        self.assertEqual(distribution({"type": "score", "probabilities": probs}, ["a", "b"], "score"), probs)
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")

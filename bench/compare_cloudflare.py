@@ -4,7 +4,9 @@
 
 Local files are DIR/{clef,clef-flash}.jsonl, in corpus order. Agreement with the
 hosted service is not labeled accuracy. A reported token count match does not
-prove token identity; differing counts are summarized separately.
+prove token identity; differing counts are summarized separately. Every answer
+must carry the type the planned question declares; an answer of another type
+whose probability keys happen to match is an error, never agreement.
 """
 
 from __future__ import annotations
@@ -22,8 +24,10 @@ from safetensors.numpy import load_file
 from cloudflare_corpus import ROOT, RATES, hosted_payload
 
 
-def distribution(answer: dict, option_ids: list[str]) -> dict[str, float]:
-    if answer.get("type") == "noul":
+def distribution(answer: dict, option_ids: list[str], planned_type: str) -> dict[str, float]:
+    if answer.get("type") != planned_type:
+        raise ValueError("Answer type differs from the planned question")
+    if planned_type == "noul":
         p = answer["noul"]
         if type(p) not in (int, float):
             raise ValueError("Invalid noul probability")
@@ -138,6 +142,7 @@ def compare(path: Path, local_dir: Path | None) -> dict:
                 raise ValueError("Local response has incomplete questions or input")
             for question in row["questions"]:
                 qid, options = question["id"], question["option_ids"]
+                planned_type = row["request"]["questions"][qid]["type"]
                 raw = logits[row["id"] + "/" + qid].astype(np.float64)
                 if raw.shape != (len(options),) or not np.isfinite(raw).all():
                     raise ValueError("Invalid oracle logits")
@@ -145,7 +150,7 @@ def compare(path: Path, local_dir: Path | None) -> dict:
                 probs /= probs.sum()
                 fp32 = dict(zip(options, map(float, probs), strict=True))
                 answers = [s["answer"]["answers"][qid] for s in samples]
-                hosted = [distribution(a, options) for a in answers]
+                hosted = [distribution(a, options, planned_type) for a in answers]
                 comparison = {"id": row["id"], "question": qid, "counts_match": equal_count,
                               "fp32": fp32, "fp32_decision": max(fp32, key=fp32.get),
                               "hosted": hosted[0], "hosted_decision": decision(answers[0], hosted[0]),
@@ -154,10 +159,10 @@ def compare(path: Path, local_dir: Path | None) -> dict:
                               "hosted_confidence": answers[0].get("confidence")}
                 if local:
                     answer = local[i]["answers"][qid]
-                    comparison["local"] = distribution(answer, options)
+                    comparison["local"] = distribution(answer, options, planned_type)
                     comparison["local_decision"] = decision(answer, comparison["local"])
                     comparison["local_confidence"] = answer.get("confidence")
-                if answers[0]["type"] == "score":
+                if planned_type == "score":
                     comparison["hosted_score"] = answers[0]["score"]
                     comparison["fp32_score"] = sum(int(k) * p for k, p in fp32.items())
                     if local:

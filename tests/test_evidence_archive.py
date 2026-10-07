@@ -79,6 +79,8 @@ def make_tree(root: Path):
     doc += b' ' * (-len(doc) % 4)   # trailing spaces keep it valid JSON and a whole number of floats
     hdrj = json.dumps({'l': {'dtype': 'F32', 'shape': [len(doc) // 4], 'data_offsets': [0, len(doc)]}}).encode()
     (exp / 'jsonpayload.safetensors').write_bytes(len(hdrj).to_bytes(8, 'little') + hdrj + doc)
+    lead = b'\n' + json.dumps({'l': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}).encode()
+    (exp / 'leadingws.safetensors').write_bytes(len(lead).to_bytes(8, 'little') + lead + b'\0' * 16)   # header not starting with {
     (exp / 'macho.log').write_bytes(b'\xcf\xfa\xed\xfe' + b'1' * 12)   # Mach-O magic, no NUL, text name
     (exp / 'escaped.log').write_text('Authorization: Bearer abcdefgh\\u002dijklmnopqrstuvwxyz0123\n')   # escape in plain text
     hdr8 = json.dumps({'blob': {'dtype': 'U8', 'shape': [len(secret)], 'data_offsets': [0, len(secret)]}}).encode()
@@ -177,6 +179,7 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/jsonpayload.safetensors', names)  # JSON-escaped token in a payload
         self.assertNotIn('gemm-probe-20261004/escaped.log', names)  # \\u002d escape in plain text
         self.assertNotIn('gemm-probe-20261004/macho.log', names)  # Mach-O magic under a text name
+        self.assertNotIn('gemm-probe-20261004/leadingws.safetensors', names)  # header must start with {
         self.assertNotIn('gemm-probe-20261004/late.log', names)  # UTF-16 text after a clean 4 KiB prefix
         self.assertNotIn('gemm-probe-20261004/.env', names)  # dotfiles never
         self.assertNotIn('gemm-probe-20261004/notes', names)  # extensionless only when allowlisted
@@ -552,11 +555,13 @@ class EvidenceArchive(unittest.TestCase):
         # a credential, so the word "basic" before a word that happens to be valid base64 stays.
         exp = self.root / 'gemm-probe-20261004'
         (exp / 'basic.log').write_text('Authorization: Basic dXNlcjpwYXNzd29yZA==\n')
+        (exp / 'basic-unpadded.log').write_text('Authorization: Basic dXNlcjpwYXNzd29yZA\n')   # padding stripped
         (exp / 'basic.json').write_text('{"headers": {"authorization": "basic dXNlcjpwYXNzd29yZA=="}}')
         (exp / 'prose.md').write_text('Basic test of the basic setup: a Basic auth note, basic abcd done.\n')
         manifest = ea.build(self.root, Path(self.tmp.name) / 'basic.tar.gz', 'ev')
         names = {e['path'] for e in manifest['files']}
         self.assertNotIn('gemm-probe-20261004/basic.log', names)
+        self.assertNotIn('gemm-probe-20261004/basic-unpadded.log', names)
         self.assertNotIn('gemm-probe-20261004/basic.json', names)
         self.assertIn('gemm-probe-20261004/prose.md', names)
 
