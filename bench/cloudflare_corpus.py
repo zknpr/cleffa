@@ -64,6 +64,9 @@ def plan(passes: int) -> dict:
             rows.append({"model": model, "id": request["id"], "request": payload,
                          "request_sha256": hashlib.sha256(json.dumps(payload).encode()).hexdigest(),
                          "full_input_tokens": len(enc["input_ids"]),
+                         # The comparator requires this to equal the FP32 oracle encoding's:
+                         # equal counts and spans do not prove equal tokens.
+                         "input_ids_sha256": hashlib.sha256(json.dumps(enc["input_ids"]).encode()).hexdigest(),
                          "questions": enc["questions"]})
     estimates = {}
     for model, rate in RATES.items():

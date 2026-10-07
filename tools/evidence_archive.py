@@ -101,9 +101,12 @@ REWRITES = [
 ]
 # Anything matching after rewriting excludes the file, and a match in the final scan fails
 # the build. Case-insensitive: bearer schemes and variable names vary in case. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
-# A credential value is a quoted string of sixteen or more characters, spaces included, or an
-# unquoted run of sixteen or more characters that are not whitespace or a quote: passwords carry
-# punctuation and spaces, base64 tokens carry + / = (reviews #59, #63). The key accepts the
+# A credential value is a quoted string of sixteen or more characters, spaces and line breaks
+# included up to a bound that keeps an unterminated quote from spanning a file, or an unquoted
+# run of sixteen or more characters that are not whitespace or a quote: passwords carry
+# punctuation and spaces, base64 tokens carry + / = (reviews #59, #63, #86). A URL whose userinfo
+# has a password (scheme://user:password@host, any key name) is a credential too (review #85);
+# a user alone or a port is not. The key accepts the
 # spellings CREDENTIAL_KEY does (api-key, apiKey, x-api-key) so the rejoined JSON pair and plain
 # text match alike (review #75). PEM private-key delimiters of every kind are forbidden outright
 # (review #76); certificates and public keys are not secrets. The sensitive word may be followed
@@ -127,8 +130,9 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
                        r'Authorization["\']?\s*[=:]\s*(["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!\1)[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
+                       r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
-                       r'["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
+                       r'["\']?\s*[=:]\s*(?:"[^"]{16,256}"|\'[^\']{16,256}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
 # An Authorization header carries a credential whatever its scheme (Bearer, Basic, token, ApiKey,
 # Digest or none). Unquoted (first form): the value has a run of sixteen or more characters
 # after an optional scheme word, or carries a quote or an '=' followed by eight or more

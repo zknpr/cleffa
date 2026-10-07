@@ -6,7 +6,11 @@ Local files are DIR/{clef,clef-flash}.jsonl, in corpus order. Agreement with the
 hosted service is not labeled accuracy. A reported token count match does not
 prove token identity; differing counts are summarized separately. Every answer
 must carry the type the planned question declares; an answer of another type
-whose probability keys happen to match is an error, never agreement.
+whose probability keys happen to match is an error, never agreement. Each plan
+row's input-ID hash must equal the FP32 oracle encoding's: equal counts and
+spans do not prove equal tokens. A plan collected before the hash existed is
+accepted only with --allow-unhashed-plan, and the summary then records that
+token identity was not verified.
 """
 
 from __future__ import annotations
@@ -42,6 +46,21 @@ def distribution(answer: dict, option_ids: list[str], planned_type: str) -> dict
     if abs(sum(result.values()) - 1) > len(result) * 0.000051 + 1e-6:
         raise ValueError("Probabilities do not sum to one within response rounding")
     return {k: result[k] for k in option_ids}
+
+
+def check_input_ids(row: dict, enc: dict, allow_unhashed: bool) -> bool:
+    """True when the plan row's input-ID hash equals the oracle encoding's. A plan without the
+    hash is accepted only with allow_unhashed, and the summary then says token identity was not
+    verified; a hash that differs is an error, since the local responses and the FP32 logits
+    would describe different token sequences."""
+    digest = hashlib.sha256(json.dumps(enc["input_ids"]).encode()).hexdigest()
+    if "input_ids_sha256" not in row:
+        if not allow_unhashed:
+            raise ValueError("Plan has no input-ID hash; regenerate it or pass --allow-unhashed-plan")
+        return False
+    if row["input_ids_sha256"] != digest:
+        raise ValueError("Planned token IDs differ from the oracle encoding")
+    return True
 
 
 def score_value(answer: dict, option_ids: list[str]) -> float:
@@ -129,7 +148,7 @@ def metrics(rows: list[dict], left: str, right: str) -> dict:
                           if r[left + "_decision"] != r[right + "_decision"]]}
 
 
-def compare(path: Path, local_dir: Path | None) -> dict:
+def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) -> dict:
     plan, calls = load_hosted(path)
     summary = {"hosted_journal": str(path), "hosted_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                "timestamp": plan["timestamp"], "passes": plan["passes"],
@@ -149,11 +168,13 @@ def compare(path: Path, local_dir: Path | None) -> dict:
             if len(local) != len(rows):
                 raise ValueError("Local response count differs")
         comparisons, coverage, unstable = [], [], []
+        ids_verified = True
         for i, (row, ref, enc) in enumerate(zip(rows, refs, encoded, strict=True)):
             if ref["id"] != row["id"] or hosted_payload(ref, model) != row["request"]:
                 raise ValueError("Oracle and hosted requests differ")
             if enc["questions"] != row["questions"] or len(enc["input_ids"]) != row["full_input_tokens"]:
                 raise ValueError("Oracle and hosted plan encodings differ")
+            ids_verified = check_input_ids(row, enc, allow_unhashed) and ids_verified
             samples = [calls[model, row["id"], rep] for rep in range(plan["passes"])]
             counts = [s["reported_input_tokens"] for s in samples]
             equal_count = all(n == row["full_input_tokens"] for n in counts)
@@ -202,6 +223,7 @@ def compare(path: Path, local_dir: Path | None) -> dict:
             pairs += [("local", "fp32"), ("local", "hosted")]
         summary["models"][model] = {
             "requests": len(rows), "questions": len(comparisons), "coverage": coverage,
+            "input_ids_verified": ids_verified,
             "unstable_responses": unstable,
             "comparisons": {a + "_vs_" + b: {
                 "all": metrics(comparisons, a, b),
@@ -218,8 +240,10 @@ def main() -> None:
     parser.add_argument("hosted", type=Path)
     parser.add_argument("out", type=Path)
     parser.add_argument("--local-dir", type=Path)
+    parser.add_argument("--allow-unhashed-plan", action="store_true",
+                        help="accept a plan collected before input-ID hashes existed; recorded in the summary")
     args = parser.parse_args()
-    summary = compare(args.hosted, args.local_dir)
+    summary = compare(args.hosted, args.local_dir, args.allow_unhashed_plan)
     with args.out.open("x") as out:
         out.write(json.dumps(summary, indent=2, allow_nan=False) + "\n")
     for model, result in summary["models"].items():

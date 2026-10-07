@@ -774,6 +774,32 @@ class EvidenceArchive(unittest.TestCase):
         with patch.object(ea, 'classify', rewrite_earlier), self.assertRaisesRegex(SystemExit, 'changed after it was examined'):
             ea.build(self.root, Path(self.tmp.name) / 'ctime.tar.gz', 'ev')
 
+    def test_url_userinfo_credentials_are_caught(self):
+        # A connection string carries user:password before the host; a URL with a user alone, a
+        # port, or no userinfo is not a credential.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'dsn.log': 'DATABASE_URL=postgresql://alice:SuperSecretPassword@example.com/db\n',
+                  'dsn.json': '{"dsn": "mysql://root:pw@db:3306/x"}',
+                  'redis.log': 'cache: redis://:s3cret@cache:6379/0\n'}
+        kept = {'urls.log': 'https://api.cloudflare.com/client/v4/x\nssh://git@example.com/repo\npostgresql://example.com:5432/db\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'dsn.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_quoted_credentials_spanning_lines_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'multi.yaml').write_text('PASSWORD="correct\nhorse battery staple"\n')
+        (exp / 'multi.log').write_text("api_key: 'line one\nline two of the key'\n")
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'multi.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/multi.yaml', names)
+        self.assertNotIn('gemm-probe-20261004/multi.log', names)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from compare_cloudflare import confidence_value, decision, distribution, load_hosted, score_value
+from compare_cloudflare import check_input_ids, confidence_value, decision, distribution, load_hosted, score_value
 
 
 class ComparisonTests(unittest.TestCase):
@@ -55,6 +55,17 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(confidence_value({"type": "choice", "confidence": 0.9608}), 0.9608)
         self.assertEqual(confidence_value({"type": "score", "confidence": 1}), 1)
         self.assertIsNone(confidence_value({"type": "noul", "noul": 0.6}))
+
+    def test_planned_token_ids_must_equal_the_oracle_encoding(self):
+        # Equal counts and spans do not prove equal tokens; the plan carries a hash of its IDs.
+        enc = {"input_ids": [1, 2, 3, 4], "questions": []}
+        digest = hashlib.sha256(json.dumps(enc["input_ids"]).encode()).hexdigest()
+        self.assertTrue(check_input_ids({"input_ids_sha256": digest}, enc, allow_unhashed=False))
+        with self.assertRaises(ValueError):
+            check_input_ids({"input_ids_sha256": digest}, {"input_ids": [1, 2, 3, 5]}, allow_unhashed=False)
+        with self.assertRaises(ValueError):
+            check_input_ids({}, enc, allow_unhashed=False)   # a plan from before the hash existed
+        self.assertFalse(check_input_ids({}, enc, allow_unhashed=True))   # accepted, recorded as unverified
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")
