@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and two progressive JPEGs with a DC scan per component) | 65/65 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2) | 70/70 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
