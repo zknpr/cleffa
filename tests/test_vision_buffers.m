@@ -19,7 +19,7 @@ static void require(bool ok, const char *why) {
 }
 static NSArray *vision_buffers(clef_gpu *g) {
     return @[g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv,
-             g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit];
+             g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat];
 }
 int main(void) {
     @autoreleasepool {
@@ -29,8 +29,16 @@ int main(void) {
         g->vis_f32 = g->vis_comp = true;
         clef_config c = {0}; c.v_E = 1152; c.v_ff = 4304; c.v_in = 1536; c.v_merge = 2;
         char err[256];
+        // Text-only capacity must not allocate image features: a [capacity][H] FP32 buffer per
+        // growth cost 256 MiB on Flash (320 MiB on the 27B) at 16,384 tokens with no image in
+        // sight (review #3). Small text shapes; the vision fields above are what has_vision needs.
+        c.has_vision = true; c.H = 64; c.W = 64; c.ffn = 64; c.nh = 1; c.nkv = 1; c.hd = 64;
+        c.Hk = 1; c.Hv = 1; c.dk = 16; c.dv = 16;
+        require(ensure_capacity(g, &c, 1024, 1, err, sizeof(err)), "text capacity");
+        require(g->feat == nil, "text-only capacity allocated an image feature buffer");
         require(ensure_vision_capacity(g, &c, 4, 4, err, sizeof(err)), "initial capacity");
         require(g->vsplit.length == (size_t)g->vcap * c.v_in * 4, "compensation scratch size");
+        require(g->feat.length == (size_t)g->vcap_total / 4 * c.H * 4, "feature rows follow the pass's patches");
         NSArray *old = vision_buffers(g); const int cap = g->vcap, total = g->vcap_total;
         for (int fail = 1; fail <= (int)old.count; fail++) {
             dev.calls = 0; dev.fail_at = fail;
@@ -74,7 +82,8 @@ int main(void) {
                 "text replacement retained image features");
         clef_gpu_prefix_free(px);
         clef_gpu_close(g);
-        puts("vision buffers: 16 allocation failures/recovery, cache feature growth/budget and maximum keep-warm buffer list PASS");
+        puts("vision buffers: text-only capacity without image features, 17 allocation failures/recovery, "
+             "cache feature growth/budget and maximum keep-warm buffer list PASS");
     }
     return 0;
 }

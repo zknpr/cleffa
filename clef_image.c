@@ -29,15 +29,20 @@ static uint32_t clef_png_crc(uint32_t crc, const uint8_t *data, size_t len) {
 /* Single-header decoders imported from ds4's copy of iris (third_party/iris, MIT), which
  * carries ds4's decode limits and its JPEG fixes for libjpeg agreement (centered chroma
  * upsampling, rounded YCbCr). Limits are set here so the decoders refuse oversized input
- * before allocating. */
+ * before allocating. The pixel limit is a per-call value, not the compile-time cap: the server
+ * bounds source images below it (review #3), and the decoders compare it at the exact point they
+ * read each header, so a separate pre-parse cannot disagree with what they allocate (the JPEG
+ * decoder takes every SOF it meets). Thread-local, because server connection threads decode
+ * concurrently; every thread starts at the hard cap. */
+static _Thread_local size_t clef_decode_max_pixels = CLEF_IMAGE_MAX_PIXELS;
 #define PNG_MAX_INPUT_BYTES CLEF_IMAGE_MAX_ENCODED
 #define PNG_MAX_DIMENSION CLEF_IMAGE_MAX_DIMENSION
-#define PNG_MAX_PIXELS CLEF_IMAGE_MAX_PIXELS
+#define PNG_MAX_PIXELS clef_decode_max_pixels
 #define PNG_INFLATE clef_png_inflate
 #define PNG_UPDATE_CRC clef_png_crc
 #define JPEG_MAX_INPUT_BYTES CLEF_IMAGE_MAX_ENCODED
 #define JPEG_MAX_DIMENSION CLEF_IMAGE_MAX_DIMENSION
-#define JPEG_MAX_PIXELS CLEF_IMAGE_MAX_PIXELS
+#define JPEG_MAX_PIXELS clef_decode_max_pixels
 #define PNG_IMPLEMENTATION
 #define JPEG_IMPLEMENTATION
 #include "third_party/iris/jpeg.h"
@@ -139,6 +144,48 @@ static bool to_rgb(clef_rgb *out, const uint8_t *px, int w, int h, int channels,
     out->height = h;
     out->rgb = rgb;
     return true;
+}
+
+/* Width and height as the header states them, for the error message only: PNG's first chunk
+ * (the format requires IHDR there) or the first JPEG SOF0/SOF2 along the decoder's own marker
+ * walk. Enforcement stays in the decoders; a file this misreads is still held to the limit. */
+static bool header_dimensions(const uint8_t *d, size_t len, uint32_t *w, uint32_t *h) {
+    if (len >= 24 && !memcmp(d, "\x89PNG\r\n\x1a\n", 8) && !memcmp(d + 12, "IHDR", 4)) {
+        *w = (uint32_t)d[16] << 24 | (uint32_t)d[17] << 16 | (uint32_t)d[18] << 8 | d[19];
+        *h = (uint32_t)d[20] << 24 | (uint32_t)d[21] << 16 | (uint32_t)d[22] << 8 | d[23];
+        return true;
+    }
+    if (len < 4 || d[0] != 0xff || d[1] != 0xd8) return false;
+    for (size_t pos = 2; pos + 1 < len;) {
+        if (d[pos] != 0xff) { pos++; continue; }
+        const uint8_t m = d[pos + 1];
+        pos += 2;
+        if (m == 0x00 || m == 0xff || (m >= 0xd0 && m <= 0xd8)) continue;   /* fill, RSTn, SOI */
+        if (m == 0xd9 || pos + 2 > len) return false;                        /* EOI, truncated */
+        const size_t seg = (size_t)d[pos] << 8 | d[pos + 1];
+        if (pos + seg > len) return false;
+        if ((m == 0xc0 || m == 0xc2) && seg >= 7) {
+            *h = (uint32_t)d[pos + 3] << 8 | d[pos + 4];
+            *w = (uint32_t)d[pos + 5] << 8 | d[pos + 6];
+            return true;
+        }
+        pos += seg;
+    }
+    return false;
+}
+
+bool clef_image_decode_limited(const uint8_t *data, size_t len, long max_pixels, clef_rgb *out, char *err, size_t errlen) {
+    const size_t limit = max_pixels > 0 && (unsigned long)max_pixels < CLEF_IMAGE_MAX_PIXELS ? (size_t)max_pixels : CLEF_IMAGE_MAX_PIXELS;
+    uint32_t w = 0, h = 0;
+    memset(out, 0, sizeof(*out));
+    if (limit < CLEF_IMAGE_MAX_PIXELS && data && header_dimensions(data, len, &w, &h) && (size_t)w * h > limit) {
+        snprintf(err, errlen, "image: %ux%u is %zu pixels, above the limit of %zu per image", w, h, (size_t)w * h, limit);
+        return false;
+    }
+    clef_decode_max_pixels = limit;
+    const bool ok = clef_image_decode(data, len, out, err, errlen);
+    clef_decode_max_pixels = CLEF_IMAGE_MAX_PIXELS;
+    return ok;
 }
 
 bool clef_image_decode(const uint8_t *data, size_t len, clef_rgb *out, char *err, size_t errlen) {

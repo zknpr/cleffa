@@ -246,7 +246,7 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
             clef_rgb rgb = {0};
             out->n_images = (int)i + 1;   /* freed by clef_record_free even when this one fails */
             if (!image_bytes(im, i, &bytes, &n, err, errlen)) return false;
-            bool ok = clef_image_decode(bytes, n, &rgb, ierr, sizeof(ierr));
+            bool ok = clef_image_decode_limited(bytes, n, opts.vision.max_image_pixels, &rgb, ierr, sizeof(ierr));
             free(bytes);
             const int width = rgb.width, height = rgb.height;
             /* Bound the work before doing it. The resize buffer and the f32 patches scale with the

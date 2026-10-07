@@ -107,6 +107,10 @@ tests/test-head-parallel-tsan: tests/test_head_parallel.c clef_head.c $(HOST_OBJ
 test-head-tsan: tests/test-head-parallel-tsan
 	tests/test-head-parallel-tsan --init-only
 
+# Includes clef.c; UBSan aborts on signed overflow while crafted GGUF headers are validated.
+tests/test-vision-config: tests/test_vision_config.c clef.c clef_head.o clef_metal.o $(HOST_OBJS)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -fsanitize=undefined -fno-sanitize-recover=undefined -o $@ tests/test_vision_config.c clef_head.o clef_metal.o $(HOST_OBJS) $(LDFLAGS) $(LDLIBS) $(FRAMEWORKS)
+
 tests/test-record-errors: tests/test_record_errors.o $(HOST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
 
@@ -146,8 +150,11 @@ test-prefix-model: tests/test-prefix-owner-model
 	tests/test-prefix-owner-model gguf/clef-flash.gguf gguf/clef.gguf tests/owner-model-request.jsonl
 	rm -f tests/owner-model-request.jsonl
 
-test: clef-tool clef-server tests/test-base64 tests/test-prefix-owner tests/test-prefix-planner tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-record-errors tests/test-server-writes
+test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/test-prefix-owner tests/test-prefix-planner tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-record-errors tests/test-server-writes
 	tests/test-base64
+	.venv/bin/python -B tests/vision_config_fixture.py gguf/clef-flash.gguf tests/vision-config
+	tests/test-vision-config tests/vision-config/vision-ok.gguf ok tests/vision-config/vision-patch-2p24.gguf "unsupported vision shape" tests/vision-config/vision-temporal-2p24.gguf "unsupported vision shape"
+	rm -rf tests/vision-config
 	tests/test-prefix-owner
 	tests/test-prefix-planner
 	tests/test-head-attend
@@ -175,6 +182,6 @@ test-errors: all tests/test-metal-errors tests/test-cli-alloc
 	tests/test-metal-errors gguf/clef-flash.gguf
 
 clean:
-	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
 
 -include $(wildcard *.d tests/*.d)

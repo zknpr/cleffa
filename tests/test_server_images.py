@@ -26,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -159,6 +160,22 @@ with tempfile.TemporaryDirectory() as t:
             fail(f"tiny image with huge bounds took {huge_s:.1f} s: the token check ran after the resize")
         st, body = plain.post(dict(small, images=[tiny], media_kwargs={"min_pixels": 99999999999999999999, "max_pixels": 99999999999999999999}))
         expect(st, body, 400, "must be a positive integer", "out-of-range media_kwargs")
+        # review #3: a source image over --max-image-pixels (default 16,777,216) is refused at its
+        # header. A compressible 8192x8192 PNG is ~0.4 MB as base64 but decoded first to several
+        # times its 192 MiB of RGB (4.1 GB above baseline for eight such requests before the fix).
+        buf = io.BytesIO()
+        Image.new("RGB", (8192, 8192)).save(buf, format="PNG")
+        huge_src = base64.b64encode(buf.getvalue()).decode()
+        t0 = time.monotonic()
+        st, body = plain.post(dict(small, images=[huge_src]))
+        src_s = time.monotonic() - t0
+        expect(st, body, 400, "8192x8192 is 67108864 pixels, above the limit of 16777216 per image", "huge source image")
+        if src_s > 1.0:
+            fail(f"huge source image took {src_s:.2f} s: it was decoded before the pixel limit applied")
+        at_limit = png(4096, 4096, 2, smooth=True)   # exactly 16,777,216 pixels: allowed, resized by media_kwargs
+        st, body = plain.post(dict(small, images=[at_limit], media_kwargs={"min_pixels": 65536, "max_pixels": 1048576}))
+        if st != 200:
+            fail(f"source image at the pixel limit: {st} {body[:200]!r}")
         st, body = plain.post(dict(small, images=[tiny] * 5))
         expect(st, body, 400, "too many images", "five images")
         st, body = plain.post(dict(small, images=[tiny] * 4))
@@ -183,13 +200,46 @@ with tempfile.TemporaryDirectory() as t:
             fail(f"strict mode: placeholder text was not served: {st} {body[:200]!r}")
         print("limits and errors: five images, 2,304-token image, lone media_kwargs bound, bad base64, truncated PNG, video, WebP and a mislabeled "
               "object rejected; mislabeled and WebP data URLs rejected; a tiny image with huge bounds refused in %.2f s before any resize; "
-              "out-of-range media_kwargs rejected; data URL, object and bare forms equal; placeholder text served" % huge_s)
+              "out-of-range media_kwargs rejected; an 8192x8192 source refused at its header in %.2f s, a 4096x4096 one served; "
+              "data URL, object and bare forms equal; placeholder text served" % (huge_s, src_s))
     finally:
         plain.stop()
     log = plain.log_path.read_text()
     if "warm-up image pass" not in log:
         fail("the server did not warm the vision path at startup (review #3)")
     print("startup: " + next(l for l in log.splitlines() if "warm-up image pass" in l).strip())
+
+    # review #3: image requests take one of --max-image-requests slots from before decoding until
+    # their patches are freed. With a single slot, a burst mixing answered requests and every
+    # rejection path must all finish (a leaked slot would block the rest) with the same bytes.
+    one = Server(["--max-image-requests", "1", "--no-warmup"], tmp, "one-slot")
+    try:
+        mix = [(r, want[r["id"]]) for r in corpus[:6]]
+        mix += [(dict(small, images=["not base64!"]), None), (dict(small, images=[tiny] * 5), None),
+                (dict(small, images=[huge_src]), None), (dict(small, images=[big]), None)]
+        mix += [(r, want[r["id"]]) for r in corpus[6:9]]
+        results: list = [None] * len(mix)
+
+        def run(k: int) -> None:
+            results[k] = one.post(mix[k][0])
+
+        threads = [threading.Thread(target=run, args=(k,), daemon=True) for k in range(len(mix))]
+        for t in threads:
+            t.start()
+        deadline = time.monotonic() + 180
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+        if any(t.is_alive() for t in threads):
+            fail("one-slot server: requests still blocked after 180 s (an image slot leaked)")
+        for (req, expected), (st, body) in zip(mix, results):
+            if expected is None:
+                if st != 400:
+                    fail(f"one-slot server: rejection answered {st} {body[:120]!r}")
+            elif st != 200 or body != expected:
+                fail(f"one-slot server: {req.get('id')} {st} differs from the unbounded server")
+        print(f"one image slot: {len(mix)} concurrent requests (9 answered, 4 rejected) finished, bytes unchanged")
+    finally:
+        one.stop()
 
     raised = Server(["--max-images", "5", "--max-image-tokens", "4096", "--no-strict"], tmp, "raised")
     try:

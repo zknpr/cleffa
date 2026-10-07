@@ -46,6 +46,12 @@ bool clef_base64_decode(const char *s, size_t len, uint8_t **out, size_t *out_le
 
 /* PNG or JPEG by signature, to 8-bit RGB. */
 bool clef_image_decode(const uint8_t *data, size_t len, clef_rgb *out, char *err, size_t errlen);
+
+/* The same with a source-pixel limit below CLEF_IMAGE_MAX_PIXELS (max_pixels <= 0: that cap).
+ * The decoders enforce it where they read the header (PNG IHDR, every JPEG SOF), before any
+ * pixel buffer exists: decoding allocates several times the image's RGB size, so a limit
+ * checked after decoding bounds nothing. */
+bool clef_image_decode_limited(const uint8_t *data, size_t len, long max_pixels, clef_rgb *out, char *err, size_t errlen);
 void clef_rgb_free(clef_rgb *img);
 
 /* Qwen2VLImageProcessor.smart_resize: both sides rounded to the factor, scaled into the pixel

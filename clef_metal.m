@@ -351,12 +351,14 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
     // later requests that fit the old capacity then ran against nil bindings and returned
     // silently wrong logits (tests/test_grow_fail.sh).
     id<MTLBuffer> ids, pos, seq_start, seq_bounds, x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32, ovf, attn_blk;
-    id<MTLBuffer> img_row, feat;
+    id<MTLBuffer> img_row;
     id<MTLBuffer> kv[16] = { nil };
     @autoreleasepool {
         ids = buf(g, Tc * 4); pos = buf(g, Tc * 12); seq_start = buf(g, Tc * 4); seq_bounds = buf(g, (Tc + 1) * 4); ovf = buf(g, Tc * 4);
-        // image features replace at most every token's embedding
-        img_row = buf(g, Tc * 4); feat = buf(g, c->has_vision ? Tc * c->H * 4 : 0);
+        // image features live in the vision scratch, sized by the pass's image rows: a
+        // [capacity][H] FP32 buffer here cost every text-only workload 256 MiB on Flash at
+        // 16,384 tokens (review #3); embed binds img_row in its place when there are no images
+        img_row = buf(g, Tc * 4);
         attn_blk = buf(g, Tc * 32);
         x = buf(g, Tc * c->H * 4); xn = buf(g, Tc * c->H * 2);
         P = buf(g, Tc * maxN * 4);
@@ -379,7 +381,7 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
         mn32 = buf(g, h32 * Tc * c->W * 4);
         for (int i = 0; i < g->n_kv; i++) kv[i] = buf(g, Tc * 2 * c->W * 4);
     }
-    id<MTLBuffer> all[] = { ids, pos, seq_start, seq_bounds, x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32, ovf, attn_blk, img_row, feat };
+    id<MTLBuffer> all[] = { ids, pos, seq_start, seq_bounds, x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32, ovf, attn_blk, img_row };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         if (!all[i]) return gerr(err, errlen, "cannot allocate activation buffers (previous buffers kept)");
     }
@@ -389,15 +391,16 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
     g->Q = Q; g->K = K; g->V = V; g->G = G; g->A = A; g->Xc = Xc; g->beta = beta; g->gate = gate; g->O = O;
     g->hfin = hfin; g->nh32 = nh32; g->nh16 = nh16; g->mem = mem; g->mem16 = mem16; g->mn16 = mn16; g->mn32 = mn32; g->ovf = ovf;
     g->attn_blk = attn_blk;
-    g->img_row = img_row; g->feat = feat;
+    g->img_row = img_row;
     for (int i = 0; i < g->n_kv; i++) g->kv[i] = kv[i];
     g->cap = cap;
     return true;
 }
 
 // Vision scratch: the pass's patch uploads (every image, each [P][in] f32 plus the 16-bit operand
-// and the position interpolation) and one image's activations at the largest patch count. Grown
-// by doubling and committed only when every allocation succeeded, like ensure_capacity.
+// and the position interpolation), the merged features of every image (one row per merge window,
+// total patches / merge^2) and one image's activations at the largest patch count. Grown by
+// doubling and committed only when every allocation succeeded, like ensure_capacity.
 static bool ensure_vision_capacity(clef_gpu *g, const clef_config *c, int max_patches, int total_patches, char *err, size_t errlen) {
     if (max_patches <= g->vcap && total_patches <= g->vcap_total) return true;
     int cap = g->vcap ? g->vcap : 1024, total = g->vcap_total ? g->vcap_total : 1024;
@@ -406,8 +409,9 @@ static bool ensure_vision_capacity(clef_gpu *g, const clef_config *c, int max_pa
     const size_t Pc = (size_t)cap, Tp = (size_t)total, E = (size_t)c->v_E, F = (size_t)c->v_ff, In = (size_t)c->v_in;
     const size_t M = E * (size_t)c->v_merge * c->v_merge;   // merger width, four patches per row
     const size_t ob = g->vis_f32 ? 4 : 2;                     // bytes per GEMM operand element
-    id<MTLBuffer> vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit;
+    id<MTLBuffer> vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit, feat;
     @autoreleasepool {
+        feat = buf(g, Tp / ((size_t)c->v_merge * c->v_merge) * c->H * 4);
         vpatch = buf(g, Tp * In * 4); vpatch16 = buf(g, g->vis_f32 ? 0 : Tp * In * 2); vposidx = buf(g, Tp * 16); vposw = buf(g, Tp * 16);
         vx = buf(g, Pc * E * 4); vxn = buf(g, Pc * E * ob); vqkv = buf(g, Pc * 3 * E * 4);
         vq = buf(g, Pc * E * 4 + 128 * 72 * 4); vk = buf(g, Pc * E * 4 + 128 * 72 * 4); vv = buf(g, Pc * E * 4 + 128 * 72 * 4); va = buf(g, Pc * E * ob);
@@ -417,10 +421,11 @@ static bool ensure_vision_capacity(clef_gpu *g, const clef_config *c, int max_pa
         // same high/residual planes directly into their existing four-byte buffers.
         vsplit = buf(g, g->vis_f32 && g->vis_comp ? Pc * In * 4 : 0);
     }
-    id<MTLBuffer> all[] = { vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit };
+    id<MTLBuffer> all[] = { vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit, feat };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         if (!all[i]) return gerr(err, errlen, "cannot allocate vision buffers (previous buffers kept)");
     }
+    g->feat = feat;
     g->vpatch = vpatch; g->vpatch16 = vpatch16; g->vposidx = vposidx; g->vposw = vposw;
     g->vx = vx; g->vxn = vxn; g->vqkv = vqkv; g->vq = vq; g->vk = vk; g->vv = vv; g->va = va;
     g->vff = vff; g->vff16 = vff16; g->vm = vm; g->vm16 = vm16; g->vsplit = vsplit;
@@ -1087,10 +1092,9 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
                     memset_pattern4(scratch[i].contents, &nan, scratch[i].length);
             }
             for (int i = 0; i < g->n_kv; i++) memset_pattern4(g->kv[i].contents, &nan, g->kv[i].length);
-            if (c->has_vision) memset_pattern4(g->feat.contents, &nan, g->feat.length);
             if (g->vcap) {
                 id<MTLBuffer> vis[] = { g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv, g->vq, g->vk, g->vv,
-                                        g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit };
+                                        g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat };
                 for (size_t i = 0; i < sizeof(vis) / sizeof(vis[0]); i++) memset_pattern4(vis[i].contents, &nan, vis[i].length);
             }
         }
@@ -1164,7 +1168,9 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             [enc setBuffer:g->weights offset:woff(e->w.token_embd) atIndex:2];
             [enc setBuffer:g->x offset:0 atIndex:3];
             [enc setBuffer:g->img_row offset:0 atIndex:4];
-            [enc setBuffer:reuse_images ? px->vision : g->feat offset:0 atIndex:5];
+            // without images every img_row is -1 and embed never reads this binding; img_row
+            // stands in so a text-only engine needs no feature buffer at all
+            [enc setBuffer:reuse_images ? px->vision : n_img ? g->feat : g->img_row offset:0 atIndex:5];
             [enc dispatchThreads:MTLSizeMake(H, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         if (dump_layers) {

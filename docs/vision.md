@@ -91,6 +91,31 @@ features; it now requires the `image cache reused` count on every hit; (7) the
 `tests/test-vision-buffers` rule lacked `$(DEPFLAGS)`. Regressions: `tests/test_record.py`,
 `tests/test_server_images.py` (including the timed huge-bounds case) and `tests/test_cli_errors.py`.
 
+The review of that fix commit raised three more, each reproduced before the change. (8) The
+geometry check still ran after decoding, and decoding a PNG holds its inflated rows and the
+decoded image: eight requests carrying a compressible 8192x8192 PNG (1.4 MB bodies) took the server
+4.1 GB above its idle footprint in 0.16 s, each then refused by the token limit. Source images are
+now limited to 16,777,216 pixels on the server (`--max-image-pixels`), enforced inside the
+decoders where they read the PNG IHDR or each JPEG SOF, through a thread-local limit rather than a
+separate pre-parse that could disagree with the decoder. The same probe showed a second
+amplification the review did not name: an encoded 1,024-token image holds 24 MiB of f32 patches,
+so sixteen requests of four one-pixel PNGs upscaled through `media_kwargs` (about 1 KB each) held
+2.1 GB while queued. Connection threads encode concurrently, so per-image bounds multiply by
+`--max-conn`; the server now admits at most `--max-image-requests` (8) image requests to decoding
+and the queue at once, and frees their patches before writing the response. (9) A crafted GGUF
+with a vision patch or temporal size of 2^24 overflowed `int` in the patch-width product before
+the shape check rejected it (UBSan abort at `clef.c:95`); the product now follows the check, and
+`tests/test_vision_config.c` runs crafted headers under UBSan in `make test`. (10) The image
+feature buffer was sized with every activation-capacity growth, so a 16,347-token text request
+allocated 256 MiB of features it never used; it now belongs to the vision scratch, sized by the
+pass's image rows, and `tests/test_vision_buffers.m` checks that text-only capacity allocates none.
+Logits are byte-identical to the previous build on the text and vision corpora (Flash) and the
+27B vision corpus. After the change the eight huge-source requests are refused at the header
+10 MB above the idle footprint (was 4.1 GB), the sixteen-request burst peaks 1.18 GB above idle
+(was 2.07 GB; peak RSS 2.49 GB against 3.24 GB, and the idle footprint now includes the vision
+scratch the startup warm-up allocates), and the 16,347-token text request's peak footprint falls
+from 6.72 to 6.44 GB. Probe script and logs: `golden/review3-memory-2026-10-07/`.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to

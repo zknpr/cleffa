@@ -92,13 +92,16 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
         c->v_eps = 1e-6f;   /* nn.LayerNorm(eps=1e-6) in every vision block and the merger */
         c->v_hd = c->v_heads ? c->v_E / c->v_heads : 0;
         c->v_pos_side = (int)sqrt((double)pos_n);
-        c->v_in = 3 * c->v_temporal * c->v_patch * c->v_patch;
         if (c->v_layers > CLEF_MAX_VLAYERS || c->v_hd != 72 || c->v_hd * c->v_heads != c->v_E || c->v_E % 32 ||
             c->v_patch != 16 || c->v_merge != 2 || c->v_temporal != 2 || c->v_pos_side * c->v_pos_side != pos_n ||
             c->v_pos_side < 2) {
             snprintf(err, errlen, "model: unsupported vision shape (E=%d heads=%d patch=%d merge=%d)", c->v_E, c->v_heads, c->v_patch, c->v_merge);
             return false;
         }
+        /* Only after the fixed geometry is confirmed: cfg_u32 admits each factor up to 2^24, and
+         * this product overflowed int (undefined behavior) on a crafted file before the check
+         * above rejected it (review #3, tests/test_vision_config.c). */
+        c->v_in = 3 * c->v_temporal * c->v_patch * c->v_patch;
     }
     return true;
 }

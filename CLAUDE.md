@@ -253,8 +253,9 @@ attention (`vis_attention_mpp` at 2,048 patches or more, FP32 Metal matrix primi
 32-query/128-key tiles; smaller images use `vis_attention_mma`, simdgroup matrices after
 `attention_fa`; `vis_attention` is the lane-per-key reference behind `CLEF_ATTN_REF=1`) -> out GEMM + bias -> `layernorm_act` -> up GEMM -> `vis_bias_gelu`
 (tanh) -> down GEMM + bias; merger `layernorm_act` -> fc1 GEMM over four patches per row ->
-`vis_bias_gelu` (erf; `erf_f32` is musl's erff, Metal has none) -> fc2 GEMM into the batch's feature
-buffer `feat`. Residual biases are folded into the following `layernorm_bias_act`, which writes
+`vis_bias_gelu` (erf; `erf_f32` is musl's erff, Metal has none) -> fc2 GEMM into the pass's feature
+buffer `feat`, part of the vision scratch (one row per image token; a text-only pass has none and
+`embed` binds `img_row` in its place, never reading it). Residual biases are folded into the following `layernorm_bias_act`, which writes
 the rounded sum back before computing the norm; this removes 54 standalone passes per image
 without changing the arithmetic. The `embed` kernel reads `feat[img_row[t]]` for placeholder tokens.
 **Tower producers compute in f32 by default.** Non-residual projections use high/residual
@@ -581,7 +582,11 @@ mode) are there and in `docs/vision.md`.
 - Treat GGUF files and requests as untrusted. Every count, offset, type and shape is bounds-checked at
   load; JSON depth is capped at 512; duplicate-key and NFC handling must stay linear-time. Images are
   capped before decoding (64 MiB encoded, 16,384 px a side, 64 Mpx decoded) and the decoders check
-  every chunk and index; the server caps images per request and tokens per image.
+  every chunk and index; the server caps images per request, tokens per image, source pixels per
+  image (enforced inside the decoders at the header through a thread-local limit, never by a
+  separate pre-parse: the JPEG decoder takes every SOF it meets) and image requests decoded or
+  queued at once (slots held from before decoding until the patches are freed). Every image limit
+  is a memory bound; check that a new one applies before the allocation it is meant to prevent.
 - `ref/corpus_vision.py` is the fixed 16-request vision corpus. Changing it invalidates every
   `golden/*vision*` directory.
 - The comment density is high and explains *why* (precision choices, parity reasoning, security).

@@ -55,6 +55,8 @@ typedef struct {
     int32_t image_token_id, start_token_id, end_token_id, video_token_id;
     int max_images;                 /* 0: unlimited (the reference) */
     long max_image_tokens;          /* per image after resizing; 0: unlimited (the reference) */
+    long max_image_pixels;          /* per source image, enforced before decoding allocates;
+                                       0: the decoders' cap, CLEF_IMAGE_MAX_PIXELS */
 } clef_vision_opts;
 
 typedef struct {

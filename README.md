@@ -75,7 +75,11 @@ tokens: shrink images before sending, or pass the reference's own bounds as
 `"media_kwargs": {"min_pixels": 65536, "max_pixels": 1048576}` (both are required; the processor
 silently ignores one alone, which the engine rejects instead). The server accepts at most 4 images
 per request and 1,024 tokens per image by default (`--max-images`, `--max-image-tokens`; 0 = the
-reference's limits) and rejects an image over the limit with the `max_pixels` that would fit.
+reference's limits) and rejects an image over the limit with the `max_pixels` that would fit. It
+also refuses a source image above 16,777,216 pixels at its header, before decoding
+(`--max-image-pixels`; that is the processor's own `max_pixels`, and the hosted API's cap is
+16 megapixels), and decodes or holds at most 8 image requests at a time (`--max-image-requests`);
+the rest wait with only their request body in memory. The security notes give the reasoning.
 Measured parity, costs and the unsupported formats are in [docs/vision.md](docs/vision.md).
 
 Missing files, extra files and symbolic links fail verification; only `.cache/huggingface/`
@@ -227,8 +231,9 @@ for the full-input comparisons, memory costs and validation scope.
 
 `--batch N` packs N requests per forward pass, `--time` prints latency to stderr,
 `--logits` prints raw logits, and `--dump FILE` writes per-layer residuals for the first request.
-`--max-images N` and `--max-image-tokens N` apply the server's image limits (the CLI, as the test
-harness, defaults to the reference's).
+`--max-images N`, `--max-image-tokens N` and `--max-image-pixels N` apply the server's image
+limits (the CLI, as the test harness, defaults to the reference's, and to the decoders' 64-megapixel
+cap for source images).
 For diagnostics, `CLEF_PROFILE=1` reports GPU time per kernel category (it serializes the GPU,
 so don't use it for latency) and `CLEF_ATTN_REF=1` switches to the simple reference attention
 kernel. `CLEF_ATTN_TU=0` selects the prior tiled FP32 attention path; the
@@ -663,8 +668,20 @@ Requests and GGUF files are treated as untrusted:
   into another tenant's response; that bug is fixed and `tests/test_batch.sh` guards it.
 - **Images:** encoded images are capped at 64 MiB, decoded ones at 16,384 pixels a side and 64
   megapixels, with every chunk, length and index bounds-checked in the decoders; the server
-  further caps images per request (4) and tokens per image (1,024). Image tokens cost the same
-  prefill as text, and a request's image bytes live on the connection thread until it is answered.
+  further caps images per request (4), tokens per image (1,024) and source pixels per image
+  (16,777,216, enforced by the decoders where they read the header). Memory is the reason for the
+  last two bounds. Decoding a PNG holds the inflated rows and the decoded image, several times the
+  image's RGB size, and a compressible 8192x8192 PNG is about 0.4 MB of base64: eight such
+  requests took a server 4.1 GB above its idle footprint in 0.16 s before the pixel limit existed.
+  An encoded 1,024-token image keeps 24 MiB of f32 patches until it is answered, from a request
+  of about 1 KB, so sixteen small requests held 2.1 GB while queued. Each connection thread
+  encodes its own request, so the server admits at most `--max-image-requests` (8) image requests
+  to decoding and the queue at once and frees their patches before writing the response. With
+  the defaults, queued patches are bounded by eight requests of four 1,024-token images (768 MiB)
+  plus one decode of at most 16,777,216 pixels per slot. Measured after the change, the
+  huge-PNG burst stays 10 MB above idle and the sixteen-request burst peaks 1.18 GB above idle
+  instead of 2.07 GB; the remainder is the GPU passes' own vision scratch. Image tokens cost the
+  same prefill as text.
   The vendored JPEG decoder got two extra input checks here (scan-header bounds, sampling layout)
   after crafted files overflowed the unmodified copy under AddressSanitizer
   ([docs/vision.md](docs/vision.md)); both files are regression cases.

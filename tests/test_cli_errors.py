@@ -36,8 +36,12 @@ class CliErrors(unittest.TestCase):
         # negatives, non-numbers, suffixes, empty and out-of-range values: atoi would have read "foo"
         # as 0, which means unlimited, so a typo silently lifted the cap (review #3)
         for args in (["--max-images", "-1"], ["--max-image-tokens", "-5"], ["--max-images", "foo"], ["--max-image-tokens", "1k"],
-                     ["--max-images", ""], ["--max-image-tokens", "99999999999999999999"]):
+                     ["--max-images", ""], ["--max-image-tokens", "99999999999999999999"],
+                     ["--max-image-pixels", "16M"], ["--max-image-pixels", "-1"], ["--max-image-requests", "x"],
+                     ["--max-image-requests", "99999999999"]):
             for binary in ("clef", "clef-server"):
+                if args[0] == "--max-image-requests" and binary == "clef":
+                    continue   # the server's admission bound; the CLI encodes one request at a time
                 with self.subTest(binary=binary, args=args):
                     p = subprocess.run([ROOT / binary, "-m", "/nonexistent", *args, *(["--port", "1"] if binary == "clef-server" else [])],
                                        capture_output=True, text=True, timeout=10)
