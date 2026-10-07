@@ -106,19 +106,28 @@ REWRITES = [
 # punctuation and spaces, base64 tokens carry + / = (reviews #59, #63). The key accepts the
 # spellings CREDENTIAL_KEY does (api-key, apiKey, x-api-key) so the rejoined JSON pair and plain
 # text match alike (review #75). PEM private-key delimiters of every kind are forbidden outright
-# (review #76); certificates and public keys are not secrets.
+# (review #76); certificates and public keys are not secrets. The sensitive word may be followed
+# by further segments of a compound credential name, separated by _ or - or by a camel-case
+# capital (AWS_SECRET_ACCESS_KEY, secretAccessKey, password_hash), drawn from the words such
+# names are built of; "tokenizer" is not a token, and a result field such as
+# token_neuron_estimate or token_negative_control is a measurement, not a credential
+# (review #79). The capital test is case-sensitive inside an otherwise case-insensitive pattern.
+KEY_WORDS = 'access|key|id|secret|token|value|hash|str|string|pass|pwd|auth|private|signing'
+KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
+              '|'.join(w.capitalize() for w in KEY_WORDS.split('|')) + r')))*')
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
-                       r'\b[A-Z0-9_-]*(API[_-]?KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
+                       r'\b[A-Z0-9_-]*(API[_-]?KEY|SECRET|TOKEN|PASSWORD)' + KEY_SUFFIX +
+                       r'["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
 # `Basic <base64>` authorization: the value decodes to user:password. Only a decoded colon makes
 # it a credential; "basic test" is the word before a word that happens to be valid base64 (review #66).
 BASIC_AUTH = re.compile(r'\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
-CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)$', re.IGNORECASE)
+CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)' + KEY_SUFFIX + '$', re.IGNORECASE)
 
 
 def is_text(path: Path) -> bool:

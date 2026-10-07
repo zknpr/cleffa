@@ -659,6 +659,27 @@ class EvidenceArchive(unittest.TestCase):
             ea.build(self.root, out, 'ev')
         self.assertFalse(out.exists())
 
+    def test_compound_credential_names_are_caught(self):
+        # The sensitive word may sit inside a compound name (AWS_SECRET_ACCESS_KEY,
+        # secretAccessKey); a word that merely begins with it (tokenizer) is not a credential.
+        exp = self.root / 'gemm-probe-20261004'
+        secret = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY'
+        caught = {'aws.log': f'AWS_SECRET_ACCESS_KEY={secret}\n',
+                  'aws.json': f'{{"aws_secret_access_key": "{secret}"}}',
+                  'camel.log': f'secretAccessKey={secret}\n',
+                  'camel.json': f'{{"awsSecretAccessKey": "{secret}"}}',
+                  'hash.log': 'password_hash: $2b$12$abcdefghijklmnopqrstuv\n'}
+        kept = {'tok.log': 'tokenizer=<repo>/model-flash-9b-snapshot\nTOKENIZER_PATH=/opt/models/clef-flash-9b\n',
+                'tok.json': '{"tokenizer_class": "Qwen2TokenizerFast", "max_tokens": 4096, "pad_token": "<|endoftext|>"}'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'compound.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
