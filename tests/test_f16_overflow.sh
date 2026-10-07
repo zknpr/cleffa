@@ -6,7 +6,8 @@
 # overflow would be (act16 in metal/clef.metal).
 #   1. each producer class flags its own overflow: with only class m in FP16 and a limit below
 #      every activation, every record equals the BF16-activation run (CLEF_ACT_F16=0), for the
-#      flash and the reference (CLEF_ATTN_REF=1) attention kernels;
+#      tensor-unit attention kernel (whose operand split in attn_prep flags too), the FP32
+#      kernels (CLEF_ATTN_TU=0) and the reference kernel (CLEF_ATTN_REF=1);
 #   2. all classes, limit below every activation: every record equals the BF16 run, batch 1 and 8;
 #   3. limits that split the corpus: batch 1 == batch 8, each record equals either its FP16 or its
 #      BF16 result, and some batch of 8 mixes both kinds. The DeltaNet-only arm overflows early in
@@ -35,12 +36,18 @@ for m in 1 2 4 8; do
     CLEF_ACT_F16=$m CLEF_DEBUG_F16_LIMIT=1e-6 "$clef" -m "$model" --logits --batch 8 "$requests" > "$tmp/lim$m"
     if ! cmp -s "$tmp/lim$m" "$tmp/bf16"; then echo "class $m: FAIL (an overflow in this class is not flagged)"; exit 1; fi
 done
+# BF16 passes never take the tensor-unit kernel, so $tmp/bf16 is the FP32 kernels' reference too
+CLEF_ATTN_TU=0 CLEF_ACT_F16=2 "$clef" -m "$model" --logits --batch 8 "$requests" > "$tmp/fa_only2"
+if cmp -s "$tmp/fa_only2" "$tmp/bf16"; then echo "FP32 attention kernels in FP16 equal BF16: their flag cannot be tested"; exit 1; fi
+if cmp -s "$tmp/fa_only2" "$tmp/only2"; then echo "CLEF_ATTN_TU=0 did not change the attention kernel"; exit 1; fi
+CLEF_ATTN_TU=0 CLEF_ACT_F16=2 CLEF_DEBUG_F16_LIMIT=1e-6 "$clef" -m "$model" --logits --batch 8 "$requests" > "$tmp/fa_lim2"
+if ! cmp -s "$tmp/fa_lim2" "$tmp/bf16"; then echo "FP32 attention kernels: FAIL (their overflow is not flagged)"; exit 1; fi
 CLEF_ATTN_REF=1 CLEF_ACT_F16=0 "$clef" -m "$model" --logits --batch 8 "$requests" > "$tmp/ref_bf16"
 CLEF_ATTN_REF=1 CLEF_ACT_F16=2 "$clef" -m "$model" --logits --batch 8 "$requests" > "$tmp/ref_only2"
 if cmp -s "$tmp/ref_only2" "$tmp/ref_bf16"; then echo "reference attention in FP16 equals BF16: its flag cannot be tested"; exit 1; fi
 CLEF_ATTN_REF=1 CLEF_ACT_F16=2 CLEF_DEBUG_F16_LIMIT=1e-6 "$clef" -m "$model" --logits --batch 8 "$requests" > "$tmp/ref_lim2"
 if ! cmp -s "$tmp/ref_lim2" "$tmp/ref_bf16"; then echo "reference attention: FAIL (its overflow is not flagged)"; exit 1; fi
-echo "each producer class flags its own overflow (rmsnorm, attention flash/reference, DeltaNet, SwiGLU)"
+echo "each producer class flags its own overflow (rmsnorm, attention tensor-unit/FP32/reference, DeltaNet, SwiGLU)"
 
 for b in 1 8; do
     CLEF_DEBUG_F16_LIMIT=1e-6 "$clef" -m "$model" --logits --batch "$b" "$requests" > "$tmp/all$b"

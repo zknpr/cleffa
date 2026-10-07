@@ -284,6 +284,7 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     }
     if (n_state > (size_t)opts.max_length - fixed) n_state = (size_t)opts.max_length - fixed;
     int32_t offset = (int32_t)(prefix.len + n_state);
+    out->schema_start = offset;
 
     for (size_t i = 0; ok && i < prefix.len; i++) ok = clef_tokens_push(&out->ids, prefix.ids[i]);
     for (size_t i = 0; ok && i < n_state; i++) ok = clef_tokens_push(&out->ids, state_ids.ids[i]);

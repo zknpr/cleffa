@@ -5,6 +5,7 @@ The HTTP arm starts its own localhost server and stops it before exiting.
 
 import http.client
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -19,6 +20,68 @@ REQUEST = {"model": "clef", "state": "test", "questions": {"q": {"type": "noul"}
 
 
 class CliErrors(unittest.TestCase):
+    def test_template_flags_are_rejected_before_model_open(self):
+        for flags in (["--prefix-cache", "--template-cache"],
+                      ["--template-cache", "--prefix-cache"],
+                      ["--template-cache", "--batch", "2"],
+                      ["--template-cache", "--dump", "/unused"]):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", "/nonexistent", *flags],
+                                   text=True, capture_output=True, timeout=10)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn("--template-cache", p.stderr)
+                self.assertNotIn("cannot open", p.stderr)
+
+    def test_server_size_flags_are_validated_before_model_open(self):
+        # strtoull accepts "-1" (wrapping to ULLONG_MAX) and trailing junk, and the MiB shift can
+        # overflow; each size flag must be a whole number that fits, or the server exits 2.
+        for flag, value in (("--prefix-cache-mb", "-1"), ("--prefix-cache-mb", "17592186044416"),
+                            ("--prefix-cache-mb", "12x"), ("--prefix-cache-mb", ""),
+                            ("--max-body", "-1"), ("--batch-tokens", "4096k")):
+            with self.subTest(flag=flag, value=value):
+                p = subprocess.run([ROOT / "clef-server", "-m", "/nonexistent", flag, value, "--port", "1"],
+                                   capture_output=True, text=True)
+                self.assertEqual(p.returncode, 2, p.stderr)
+                self.assertIn(flag, p.stderr)
+        p = subprocess.run([ROOT / "clef-server", "-m", "/nonexistent", "--prefix-cache-mb", "4096", "--port", "1"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1, p.stderr)   # the flag is fine; opening the model is what fails
+
+    def test_simd_width_guard_covers_every_rescaling_pipeline(self):
+        # rescale_fragment reads a SIMDgroup's two local fragment elements; every pipeline that
+        # uses it must refuse to open on a device reporting another width, including the cached
+        # FP32 attention path. The hook fakes one pipeline's reported width.
+        for name in ("attention_reuse_4", "attention_prefetch_64", "attention_prefix_64"):
+            with self.subTest(pipeline=name):
+                env = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+                env["CLEF_DEBUG_SIMD_WIDTH_FOR"] = name
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, "--time"], input="", capture_output=True, text=True, env=env)
+                self.assertNotEqual(p.returncode, 0, f"{name} opened on a 16-lane SIMDgroup")
+                self.assertIn(f"{name} requires a 32-lane SIMDgroup", p.stderr)
+
+    def test_truncation_requires_explicit_opt_in(self):
+        request = {**REQUEST, "state": "alpha " * 20000}
+        # A failed first command buffer detects whether encoding reached inference,
+        # without spending GPU time on an input the default must reject intact.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+        env["CLEF_DEBUG_NIL_CMDBUF"] = "1"
+        for flags in ([], ["--no-truncate"], ["--truncate", "--no-truncate"]):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, "--time", *flags],
+                                   input=json.dumps(request) + "\n", text=True,
+                                   capture_output=True, timeout=60, env=env)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertIn("the reference would silently drop the rest", json.loads(p.stdout)["error"])
+                self.assertNotIn("batch of", p.stderr)
+        for flags in (["--truncate"], ["--no-truncate", "--truncate"]):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, "--time", *flags],
+                                   input=json.dumps(request) + "\n", text=True,
+                                   capture_output=True, timeout=60, env=env)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("command buffer", json.loads(p.stdout)["error"])
+                self.assertIn("(16384 tokens)", p.stderr)
+
     def test_unwritable_stdout_is_an_error(self):
         # Small responses fail on fflush; the long model name also exercises a write
         # during printf. Both successful responses and validation errors must propagate it.
@@ -32,6 +95,28 @@ class CliErrors(unittest.TestCase):
                                        stderr=subprocess.PIPE, timeout=60)
                 self.assertNotEqual(p.returncode, 0, "lost output was reported as success")
                 self.assertIn(b"stdout", p.stderr)
+
+    def test_stage_time_counts_fallback_heads(self):
+        # CLEF_STAGE_TIME reports the batch's CPU head time. A record that overflows FP16 skips
+        # the first head pass and runs its head after its BF16 rerun, so the head line must come
+        # after the rerun's GPU stage line and include that head.
+        base = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+        base["CLEF_STAGE_TIME"] = "1"
+        line = json.dumps({**REQUEST, "state": "a short checkout state for stage timing"}) + "\n"
+        plain = subprocess.run([ROOT / "clef", "-m", MODEL], input=line, capture_output=True, text=True,
+                               env=base, timeout=120, check=True)
+        env = {**base, "CLEF_DEBUG_F16_LIMIT": "1"}   # every record overflows and reruns in BF16
+        p = subprocess.run([ROOT / "clef", "-m", MODEL], input=line, capture_output=True, text=True,
+                           env=env, timeout=120, check=True)
+        stages = [l for l in p.stderr.splitlines() if l.startswith("clef: stage ")]
+        gpu = [i for i, l in enumerate(stages) if l.startswith("clef: stage T=")]
+        head = [i for i, l in enumerate(stages) if l.startswith("clef: stage head ")]
+        self.assertEqual(len(gpu), 2, stages)   # the flagged pass and the BF16 rerun
+        self.assertEqual(len(head), 1, stages)
+        self.assertGreater(head[0], gpu[1], "head stage reported before the fallback head ran")
+        # The two head times are printed for the record, not asserted: timing is not a test oracle.
+        heads = lambda out: [l for l in out.stderr.splitlines() if l.startswith("clef: stage head ")]
+        print("head stage, plain:", heads(plain), "forced overflow:", heads(p))
 
     def test_unicode_errors_are_json_over_cli_and_http(self):
         requests = [{**REQUEST, "questions": {prefix + ch * 100: {"type": "unknown"}}}

@@ -70,6 +70,13 @@ budget runs alone, so short requests never share a forward pass with a long one
 (`tests/test_server_hol.py`). Requests queued *behind* a long one still wait for it: one GPU, no
 preemption.
 
+The worker keeps model and activation buffers active while idle using read-only GPU passes
+every 500 ms. This removes the measured delay before GPU execution for sparse traffic;
+`--no-keep-warm` disables it. On a 248-token request after five seconds idle, median HTTP
+latency falls from 220.5 to 104.8 ms on Flash and from 535.7 to 263.3 ms on 27B, with identical
+responses. These are three samples per arm on the M5 Max; power cost is not established.
+See [the idle-latency report](docs/performance-history.md#keep-warm-for-sparse-traffic-2026-10-04) for scope and validation.
+
 Limits:
 
 | Limit | Value |
@@ -84,13 +91,109 @@ Chunked bodies and duplicate `Content-Length` headers are refused. Error respons
 close so they aren't lost to a TCP reset. `tests/test_server.py` checks HTTP output byte for byte
 against the CLI, 32 concurrent clients, and each limit.
 
+### Reuse the fixed prompt for short requests
+
+`--template-cache` reuses the first 32 tokens of Clef's fixed system prompt and
+user header, including across unrelated inputs. The first eligible request fills
+the entry. It reuses that entry at measured beneficial lengths up to 2,048 full
+tokens; other lengths take the ordinary full-input path. All request content
+remains included. Above 1,056 tokens, reuse requires that removing 32 prompt
+tokens saves a padded 64-row matrix tile. Flash also bypasses shorter lengths
+where reuse would switch to a slower tile; the linked report lists the rule.
+
+```sh
+./clef -m gguf/clef-flash.gguf --template-cache --time requests.jsonl
+./clef-server -m gguf/clef-flash.gguf --template-cache
+```
+
+It defaults off. The CLI requires batch one and no dump; choose either
+`--template-cache` or `--prefix-cache`. The server can enable both: keyed requests
+use their own prefix entries, unkeyed single requests use the fixed prompt, and
+packed requests use the ordinary batch path. No client key is needed for the
+fixed prompt because only public template state is reused.
+
+This adds up to about 275 MiB on Flash or 504 MiB on 27B, beyond the ordinary
+engine buffers and any `--prefix-cache-mb` budget. Its buffers also retain the
+current request's suffix as scratch space, overwritten before reuse. In the
+measured 346- and 594-token cases, warmed template hits were about 4–6% faster.
+At eligible 1–2K padding boundaries, the final paired comparison measured about
+3–6% reductions. This does not speed up the first fill or fresh long contexts. See the
+[template qualification and timing report](docs/prefix-cache.md#fixed-template-entry).
+
+### Repeated, growing and edited contexts
+
+Prefix caching reuses the backbone state of an identical token prefix. It retains
+the full accepted context, including the tokens before the reused boundary. New
+questions and the remaining suffix are evaluated against that state. Fresh,
+unrelated contexts still need a full forward pass.
+
+Entries keep periodic recurrent-state checkpoints and a checkpoint before an
+observed edit. A changed tail or middle can resume from the last matching
+checkpoint instead of recomputing the whole request. The saved states belong to
+exact token prefixes; no input is omitted or summarized.
+
+For successive JSONL requests in one CLI process:
+
+```sh
+./clef -m gguf/clef-flash.gguf --prefix-cache --batch 1 --time requests.jsonl
+```
+
+For the server, enable a retained-cache budget and send a key with each request:
+
+```sh
+./clef-server -m gguf/clef-flash.gguf --prefix-cache-mb 4096
+curl -s localhost:8080/v1/systemone \
+  -H 'Content-Type: application/json' -H 'X-Clef-Prefix-Cache: conversation-1' \
+  --data-binary @request.json
+```
+
+The server cache is off by default. Keyed requests run individually; requests
+without a key continue through ordinary micro-batching. A key has 1–64 ASCII
+letters, digits, dots, underscores or hyphens; the server validates the header whether or
+not caching is enabled, so a malformed key is HTTP 400 either way. An authenticating proxy should
+assign keys per tenant and conversation: callers sharing a key can observe one
+another's cache hits through latency. Keys are not authentication credentials.
+
+The server retains at most 32 entries and evicts least recently used entries
+after a request exceeds the budget. The budget uses MiB and limits the cache's buffers:
+a request whose entry would exceed it is served uncached without allocating one, and an
+entry that would grow past it is dropped first. It does not bound total process memory, and
+capacity growth copies an entry's planes, so a growing entry transiently needs up to twice
+its size. Each entry
+can retain up to twelve recurrent-state checkpoints, adding 50.25 MiB per
+checkpoint on Flash or 149.625 MiB on 27B, plus attention and head-memory buffers.
+A 16K Flash entry with eight checkpoints measured about 2.14 GiB, beyond the
+engine's own buffers; changing prefixes can allocate more checkpoints. All
+retained buffers count toward the budget. Allocation failures fall back to an uncached
+server request. See the [checkpoint measurements](docs/prefix-cache.md#recurrent-state-checkpoints)
+for shared-prefix speedups, memory costs and qualification.
+
+Measured full-input versus matching-prefix-hit medians on the M5 Max:
+
+| Full input tokens | Flash full → hit | 27B full → hit |
+|---:|---:|---:|
+| 1,382 | 444 → 130 ms | 1,500 → 413 ms |
+| 2,235 | 725 → 113 ms | 2,462 → 355 ms |
+| 8,072 | 3,088 → 154 ms | 10,139 → 466 ms |
+| 16,347 | 7,376 → 210 ms | 23,830 → 650 ms |
+
+These are warm engine plus CPU-head times, excluding encoding, loading and HTTP,
+with four measured calls per arm and length on the earlier FP32-attention build.
+Every cached output has the same logit bits as that build's full-input result. Initial fills take roughly a full pass; these hit timings do not
+describe first-use latency. Uncached comparisons did not demonstrate a speedup;
+the 27B 2,235-token medians were 0.36–1.15% slower in two runs, so a small cost
+remains possible. See the [qualification and timing report](docs/prefix-cache.md#exact-fp32-prefix-reuse)
+for the full-input comparisons, memory costs and validation scope.
+
+
 ### CLI options
 
 `--batch N` packs N requests per forward pass, `--time` prints latency to stderr,
 `--logits` prints raw logits, and `--dump FILE` writes per-layer residuals for the first request.
 For diagnostics, `CLEF_PROFILE=1` reports GPU time per kernel category (it serializes the GPU,
 so don't use it for latency) and `CLEF_ATTN_REF=1` switches to the simple reference attention
-kernel.
+kernel. `CLEF_ATTN_TU=0` selects the prior tiled FP32 attention path; the
+default uses compensated tensor-unit attention with FP32 accumulation.
 
 The model snapshots are pinned to revisions `2f3de3dd` (clef) and `17f0b0ad` (clef-flash).
 `joint_schema_model.py` from those revisions has been reviewed, and only the oracle imports it.
@@ -100,21 +203,27 @@ The engine never runs Python.
 
 The reference is Cloudflare's PyTorch code (`joint_schema_model.py` on `transformers` 5.10.2),
 which runs in BF16. The ground truth is the same code in FP32: the same BF16 weights with every
-op in f32. The engine computes in f32 except for the activation operand of each backbone matmul,
-which is FP16. That is 8× finer than the BF16 the reference feeds its Linears, at the same
-tensor-op rate (`bench/mixed_bench.m`). Weights are the exact BF16 values.
+op in f32. Backbone matmuls use FP16 activation operands with FP32 accumulation.
+Those operands are 8× finer than the BF16 the reference feeds its Linears, at the
+same tensor-op rate (`bench/mixed_bench.m`). Attention uses high and residual FP16
+planes with FP32 accumulation; the omitted residual-times-residual products make
+this an approximation. `CLEF_ATTN_TU=0` restores tiled FP32 attention. The residual
+stream and CPU head remain FP32. Weights are the exact BF16 values.
 
 Measured over the 22-request / 46-question corpus in `ref/corpus.py`. Inputs range from 146 to
 16,347 tokens and cover all question types and tokenizer edge cases.
+The mean probability-error column averages each question's largest option error, as in
+`tests/compare3.py`.
 
 **clef-flash**
 
 | vs FP32 reference | argmax agreement | mean \|Δp\| | max \|Δp\| |
 |---|---|---|---|
-| **this engine** | **46/46** | **0.00004** | **0.0002** |
+| **default compensated attention** | **46/46** | **0.00004576** | **0.00023393** |
+| FP32 attention control | 46/46 | 0.00003576 | 0.00024937 |
 | HF BF16 (the shipped path) | 44/46 | 0.0098 | 0.0956 |
 
-The engine's hidden states are 28–289× closer to FP32 than the BF16 reference at every layer
+With the FP32 attention control, hidden states are 28–289× closer to FP32 than the BF16 reference at every layer
 (final norm: 7.4e-4 vs 1.8e-1 relative L2). Both questions where the BF16 reference disagrees with
 FP32 are answered correctly by the engine.
 
@@ -122,13 +231,24 @@ FP32 are answered correctly by the engine.
 
 | vs FP32 reference | argmax agreement | mean \|Δp\| | max \|Δp\| |
 |---|---|---|---|
-| **this engine** | **46/46** | **0.00009** | **0.0010** |
+| **default compensated attention** | **46/46** | **0.00009400** | **0.00113585** |
+| FP32 attention control | 46/46 | 0.00007982 | 0.00073920 |
 | HF BF16 (the shipped path) | 46/46 | 0.0072 | 0.0437 |
 
-The closest call is `r019/service`, where FP32's top two logits are 0.004 apart. The engine is
+For the FP32 attention control, the closest call is `r019/service`, where the oracle's
+top two logits are 0.004 apart. That control is
 0.0002 from FP32 there; BF16 is 0.025 away and lands on the right answer by margin, not
 precision. On `r000`, the engine's hidden states are 44–351× closer to FP32 than BF16's at every
 layer (final norm: 2.4e-3 vs 3.0e-1).
+
+The compensated path increases mean error against this small FP32 corpus while
+keeping all decisions within the existing numerical bounds. In the separate
+frozen ContractNLI development and test evaluation, all 6,256 predictions across
+both models remain unchanged, with small mixed probability-score shifts. This is
+observed task stability, not equal probabilities or an accuracy guarantee on
+unseen inputs. See [the integration report](docs/attention.md#adoption-as-the-default)
+for paired fresh-input timings and [the task evaluation](docs/attention.md#labeled-evaluation-on-contractnli)
+for labeled accuracy and cohort limits.
 
 **Why FP16 activations.** With BF16 activations, the engine scored 45/46 on the 27B, with
 mean |Δp| 0.0007, and missed `r019/service`. Rounding each backbone matmul's input to BF16 was
@@ -166,7 +286,8 @@ f32 activations.
   - `--dump`.
 
 `CLEF_ACT_F16=0` (BF16 activations) together with `CLEF_HEAD_BF16=1` (BF16-rounded head input)
-reproduces the previous engine bitwise.
+selects the reference's operand rounding. Long 27B requests still use the chunked FP32
+DeltaNet recurrence described below.
 
 **The PyTorch reference is wrong on long 27B inputs unless run with `--safe-attn`.**
 `scaled_dot_product_attention` on MPS (torch 2.11) returns wrong output for every head whose
@@ -196,7 +317,53 @@ Host-side pieces must match Python byte for byte, and they do:
 | Request encoding (`encode_record`) | 3,027 requests |
 | Response building (`systemone_answer`) | 1,293 responses |
 
-## Speed (clef-flash, warm, single request)
+## Speed
+
+All timings are from the one tested machine, an M5 Max (40 GPU cores, 128 GB), one GPU job at a time. Unless stated otherwise they are engine time including the CPU head and
+excluding request encoding, model load and HTTP. The retained optimizations and the
+measurements behind each one are in [docs/performance-history.md](docs/performance-history.md);
+[docs/README.md](docs/README.md) indexes the other reports.
+
+### Current build
+
+Medians of eight warm calls per length on 2026-10-05, measured against the FP32 attention
+control in the same process, in paired ABBA quartets
+([details](docs/attention.md#adoption-as-the-default)):
+
+| Full input tokens | clef-flash | Clef 27B |
+|---:|---:|---:|
+| 346 | 122 ms | 439 ms |
+| 594 | 210 ms | 715 ms |
+| 1,382 | 476 ms | 1,580 ms |
+| 2,235 | 771 ms | 2,525 ms |
+| 4,510 | 1,645 ms | 5,353 ms |
+| 8,072 | 3,237 ms | 10,170 ms |
+| 16,347 | 7,370 ms | 22,512 ms |
+
+The 346, 594, 2,235, 8,072 and 16,347-token rows are corpus requests; 1,382 and 4,510 are
+the synthetic checkout fixtures from the history. Over localhost HTTP, which adds encoding
+and transport, the blog's three-question checkout example (346 tokens) measured 112.5 ms on
+Flash and 389.4 ms on 27B as medians of 12 back-to-back calls on 2026-10-04, before the
+attention change.
+
+Each optimization was qualified only against its own paired baseline, because absolute times
+move by several percent with GPU clock and temperature. For scale, the `db38cfc` baseline
+measured 13.40 s (Flash) and 40.97 s (27B) at 16,347 tokens on 2026-10-03, in a different run
+from the table above. The gap to Cloudflare's hosted API on long inputs is not closed; see
+[the hosted comparison](docs/hosted-comparison.md).
+
+With the opt-in prefix cache, a request whose tokens match a cached prefix pays only for its
+suffix; the measured hit times are under
+[Repeated, growing and edited contexts](#repeated-growing-and-edited-contexts).
+
+### Against PyTorch
+
+Measured on 2026-10-03 with the `db38cfc` baseline build and BF16 activations, as the median
+of three warm back-to-back passes per side in the same sitting. The engine column predates
+every optimization above; the comparison is kept because it is the only like-for-like
+PyTorch measurement.
+
+**clef-flash, single request**
 
 | tokens | engine | PyTorch MPS (BF16) | Jev (Cloudflare README) |
 |---|---|---|---|
@@ -208,29 +375,7 @@ Host-side pieces must match Python byte for byte, and they do:
 | 16,347 | 12.6 s | 19.1 s | |
 | **median (corpus)** | **116 ms** | 199 ms | 524 ms |
 
-Measured as the median of three warm passes, with BF16 activations. FP16 activations (the
-default since) measure the same within noise: 96.9 vs 96.2 ms median for a 260-token request.
-The Jev figure is Cloudflare's published median for its own corpus and hardware, so it's a
-target, not a like-for-like comparison. A same-corpus measurement against Jev's API is in
-[Against Jev's hosted API](#against-jevs-hosted-api).
-
-**Idle traffic is slower.** Both columns were measured back to back. After the GPU has been idle
-for about a second its clocks ramp down, and the next request pays for it. On clef-flash with a
-~260-token request:
-
-| Gap since the previous request | Latency |
-|---|---|
-| back to back | 95 ms |
-| 0.2–0.5 s | 117–120 ms |
-| 1–3 s | 209–287 ms |
-
-This is GPU power management, not cold weights: a startup warm-up pass does not remove it.
-Plan for the idle number when traffic is sparse.
-
-Where the time goes at T=260: BF16 tensor-op GEMMs at ~49 TFLOPS take ~75%, and the DeltaNet
-scan ~5%. At 8k tokens: GEMM ~60%, attention ~30%.
-
-## Speed (Clef 27B, single request)
+**Clef 27B, single request**
 
 | tokens | engine | PyTorch MPS (BF16) |
 |---|---|---|
@@ -242,44 +387,39 @@ scan ~5%. At 8k tokens: GEMM ~60%, attention ~30%.
 | 16,347 | 41.3 s | 51.8 s |
 | **median (corpus)** | **389 ms** | 579 ms |
 
-Both columns are the median of three back-to-back passes over the corpus, measured in the same
-sitting. Jev's published median is 524 ms.
+The Jev figure is Cloudflare's published median for its own corpus and hardware, so it is a
+target, not a like-for-like comparison. On the 27B the engine was 1.3–1.6× faster than
+PyTorch up to ~360 tokens and 1.25–1.3× faster from 594 tokens up. FP16 activations, the
+default since, measured the same as BF16 within noise: `bench/mixed_bench.m` runs FP16 at
+the BF16 rate, and a 260-token 27B request measured 308 ms in FP16 against 311 ms in BF16 as
+best times from alternating runs.
 
-These were measured with BF16 activations. FP16 activations, the default since, cost no measurable
-time:
-- In `bench/mixed_bench.m`, FP16 runs at the BF16 rate.
-- On a 260-token request, the best time is 308 ms in FP16 and 311 ms in BF16, from alternating
-  runs.
-- Over three corpus passes, the median depends on run order:
+### Where the time goes
 
-  | Order | FP16 | BF16 |
-  |---|---|---|
-  | FP16 first | 363 ms | 414 ms |
-  | BF16 first | 437 ms | 408 ms |
-  | **mean of both orders** | **403 ms** | **411 ms** |
+GEMMs dominate at every length. Serialized profiles (`CLEF_PROFILE=1`, which changes
+scheduling and is not a latency measurement) put them at about 84% of GPU time for a
+1,382-token 27B request, 70% for a 13,876-token Flash request (attention 18%, recurrent scan
+6%), and 87.5% for a batch of eight ~1.3K-token 27B records. On the FP32 attention path,
+attention's share grows from 4–8% near 1–2K tokens to 28–32% near 16K. Instruments counters
+show 97–98% median neural-accelerator utilization on the large expansion GEMM, and a
+full-request trace finds less than 0.8% scheduling gaps inside the GPU span. See
+[profiles](docs/performance-history.md#profiles-and-gpu-activity).
 
-  The order-balanced per-request ratios are 0.975–0.992. The one outlier, the 594-token request,
-  is equal when timed alone (best 606 vs 605 ms). Its GEMMs also run at the same rate at T=594.
+### Heat soak and idle gaps
 
-On the 27B, these passes are slower than a cool GPU. After the 8k and 16k requests, a
-260-token request takes 360–450 ms. It recovers once the GPU has been idle for a while, in the
-same process, so it isn't engine state; it behaves like thermal or power limiting.
-
-Idle gaps cost more on the 27B, for the same 260-token request:
-
-| Gap since the previous request | Latency |
-|---|---|
-| back to back | 306–311 ms |
-| 0.3 s | 309–313 ms |
-| 2 s | 572–600 ms |
-
-Under sparse traffic the 27B is slower than Jev's median. The engine is 1.3–1.6× faster than
-PyTorch up to ~360 tokens and 1.25–1.3× faster from 594 tokens up. The 27B hasn't been profiled,
-so where its long-input time goes is not yet measured.
+Long requests heat-soak the GPU: on the 27B, a 260-token request takes ~310 ms on a cool GPU
+and 360–450 ms after the corpus's 8k/16k requests, recovering after idle time in the same
+process. GPU clocks measured during sustained runs ranged from about 1.05 to 1.38 GHz, and a
+13.9K-token Flash request varied between −5% and +8% across matched quartets
+([long-request timing](docs/long-request-timing.md)). Idle gaps used to add roughly 100–290 ms
+before the next pass; the server's keep-warm default removes that delay (after five seconds
+idle, median HTTP latency 220.5 → 104.8 ms on Flash and 535.7 → 263.3 ms on 27B, identical
+responses). Say which regime a number comes from.
 
 ## Against Jev's hosted API
 
-Jev is Typesafe's own model behind the same SystemOne API, not Clef. On 2026-10-03 the corpus ran
+Jev is Typesafe's own model behind the same SystemOne API, not Clef. The cleffa columns below are
+from the 2026-10-03 baseline build; current engine timings are under [Speed](#speed). On 2026-10-03 the corpus ran
 against Jev's API (`jev-latest`, which answered as `jev-1.13.0`) and against `clef-server` on
 localhost, with `bench/jev_compare.py`. Each endpoint got one warm-up request, then three
 back-to-back passes on one keep-alive connection, from an M5 Max in Italy.
@@ -336,16 +476,24 @@ length: 3× (flash) to 11× (27B) at 2k tokens, 39× to 127× at 16k.
 - **`clef_record.c`:** `encode_record`, `systemone()` validation and `systemone_answer`,
   including CPython 3.12's Neumaier `sum()`.
 - **`metal/clef.metal`:**
-  - MPP tensor-op GEMM, BF16 weights × FP16 activations with f32 accumulation, 32×128 tiles.
-  - Flash attention on f32 simdgroup matrices, with GQA K/V sharing and key blocks aligned
-    per record.
-  - Gated DeltaNet: conv, prep, a sequential scan (8 lanes per value column) and the gated
-    norm.
+  - MPP tensor-op GEMM, BF16 weights × FP16 activations with f32 accumulation. Tiles are
+    32×128, 32×256 or 64×128 by packed token count and matrix shape, with identical
+    per-element reductions so results do not depend on batching.
+  - Attention: compensated tensor-unit attention by default (high and residual FP16 planes,
+    FP32 accumulation, record-aligned tiles), or the tiled FP32 kernels with `CLEF_ATTN_TU=0`.
+    Both share K/V across the GQA group and align key blocks per record
+    ([docs/attention.md](docs/attention.md)).
+  - Gated DeltaNet: conv, prep, a sequential scan (8 lanes per value column) or, for 27B
+    records of at least 4,096 tokens, a 32-token FP32 block recurrence, and the gated norm.
   - RMSNorm, LayerNorm, SwiGLU.
-- **`clef_head.c`:** the joint schema head, in f32 on the CPU via Accelerate. The memory-side
-  K/V projections run on the GPU, on f32 activations.
+- **`clef_head.c`:** the joint schema head, in f32 on the CPU via Accelerate, with packed
+  transposed weight copies, per-record option batching in the residual scorer and two workers
+  for large projections and attention calls. The memory-side K/V projections run on the GPU,
+  on f32 activations.
 - **Batching:** packed variable-length batches. Results are bitwise independent of batch
   composition (`tests/test_batch.sh`).
+- **Caches:** an opt-in exact prefix cache with recurrent-state checkpoints, and an opt-in
+  fixed-template entry ([docs/prefix-cache.md](docs/prefix-cache.md)).
 
 ## Tests
 
@@ -353,8 +501,11 @@ The tests need `gguf/clef-flash.gguf` and `model-flash/` (`./download_models.sh 
 parity tests also need golden data from the PyTorch oracles (below).
 
 ```sh
-make test                                            # host parity, HTTP write failures, verifier/parity regressions
+make test                                            # host parity, HTTP write failures, verifier/parity, cache-planner and collector regressions
 make test-errors                                     # CLI allocation/output errors, HTTP errors, Metal failures
+make test-attention                                  # production attention vs float64 samples, packing and tail guards; no model needed
+make test-gemm                                       # production GEMM tile/packing parity, float64 and NaN guards; no model needed
+make test-gdn                                        # chunked recurrence, offsets/tails, float64, NaN guards and allocation recovery
 .venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
 .venv/bin/python -B tests/test_record.py gguf/clef-flash.gguf model-flash model-flash
 .venv/bin/python -B ref/oracle.py model-flash --name clef-flash                  # BF16 oracle (MPS)
@@ -377,7 +528,20 @@ tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl  # 
 .venv/bin/python -B tests/test_server_retry.py PORT golden/clef-flash/requests.jsonl gguf/clef-flash.gguf
 .venv/bin/python -B tests/test_server_slow.py PORT           # trickling clients are dropped at the request deadline
 tests/test_lingering_close.sh gguf/clef-flash.gguf        # starts its own server: an error response drains a half-closed client's body
+make test-prefix-attention                           # exact full vs resumed attention, poisoned guards, float64 bounds; no model needed
+make test-prefix-model                               # both models: a populated cache entry is refused by another engine and by a reopened one
+make test-head-tsan                                  # ThreadSanitizer check of the CPU head's first-use configuration
+.venv/bin/python -B tests/test_gemm_dispatch.py gguf/clef-flash.gguf     # exact logits across the Flash 768-1,024 tile boundaries
+.venv/bin/python -B tests/test_prefix_cache.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    # cache transitions, overflow, bypass, allocation recovery
+.venv/bin/python -B tests/test_prefix_public.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # poisoned fill/hit pairs keep the uncached logits
+.venv/bin/python -B tests/test_prefix_checkpoints.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl --attention tu   # tails, edits, shrinkage, eviction; repeat with --attention fp32
+.venv/bin/python -B tests/test_template_cache.py gguf/clef-flash.gguf    # template reuse: exact logits, eligibility boundaries, HTTP fallback
+.venv/bin/python -B tests/test_server_prefix.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # starts its own servers: HTTP bytes, key isolation, budget eviction
+.venv/bin/python -B tests/test_keep_warm.py gguf/clef-flash.gguf         # starts its own servers: idle delay removed, identical responses
 ```
+
+The GPU tests assume one GPU job at a time on the machine. Run them for both models before
+a release; clef-flash is enough while iterating.
 
 `test_parity.py` requires exact token ids and argmax agreement, finite logits/residuals, maximum
 absolute logit error <= 0.05, maximum probability error <= 0.002, and (with `--dump`) per-layer
@@ -402,6 +566,11 @@ Debug hooks for tests:
 - `CLEF_DEBUG_F16_LIMIT=X` treats FP16 operands above X as overflow.
 - `CLEF_DEBUG_NIL_CMDBUF=N` makes the Nth Metal command-buffer creation fail.
 - `CLEF_DEBUG_IO_TIMEOUT=S` shortens the server's request deadline to S seconds.
+- `CLEF_STAGE_TIME=1` logs host encoding, commit-to-completion wait, GPU execution and CPU head time per request.
+- `CLEF_DEBUG_KEEPWARM_MS=N` sets the idle-pass interval (0 disables); `CLEF_DEBUG_KEEPWARM_NOWEIGHTS=1` omits the weights from idle passes.
+- `CLEF_DEBUG_PREFIX_FAIL_ABOVE=N` fails cache-capacity growth above N tokens; `CLEF_DEBUG_PREFIX_CKPT_FAIL=N` fails the Nth new checkpoint allocation.
+- `CLEF_DEBUG_HEAD_SPLIT_MIN=N` sets the CPU head's two-worker threshold (0 disables the linear split).
+- `CLEF_DEBUG_SIMD_WIDTH_FOR=NAME` makes the named attention pipeline report a 16-lane SIMDgroup at open, which must be refused.
 
 Golden directories written before `ref/oracle_f32_stream.py` produced `encoded.jsonl` can get one
 with `ref/write_encoded.py MODEL_DIR GOLDEN_DIR`, which uses the tokenizer only.
@@ -420,7 +589,7 @@ Requests and GGUF files are treated as untrusted:
 - **Batching:** batch items own their input buffers. A shared buffer leaked one tenant's strings
   into another tenant's response; that bug is fixed and `tests/test_batch.sh` guards it.
 - **Server exposure:** the server binds to localhost by default. Exposing it with `--host` puts
-  the GPU behind one FIFO queue. A long request (16k tokens takes ~12 s on clef-flash) is never
+  the GPU behind one FIFO queue. A long request (16k tokens takes ~7 s on clef-flash) is never
   co-batched with short ones, but it does delay everything queued behind it. Connection slots
   are not protected either. The 30 s deadline bounds a request, not a connection, so a client that
   sends a valid request on a keep-alive connection more often than that (a `GET /health` will
@@ -459,7 +628,11 @@ ones lost. Whoever controls early text can also pad it to push later content out
 | | over-long state | reference behavior |
 |---|---|---|
 | `clef-server` | **rejected** (HTTP 400, with token counts) | `--truncate` |
-| `clef` CLI | truncated (reference) | default; `--no-truncate` rejects instead |
+| `clef` CLI | **rejected** (JSON error, with token counts) | `--truncate` |
+
+Both interfaces preserve the full state of every accepted request by default. The CLI's
+`--no-truncate` remains an explicit alias for that default. `--truncate` opts into the
+reference's lossy behavior; performance and accuracy qualification runs never use it.
 
 `tests/test_truncation.py` checks the boundary against Python's `encode_record`. A request is
 rejected exactly when the reference would drop state tokens, so a state that fits to the last
@@ -477,11 +650,9 @@ differently:
 
 ## Not done yet
 
-- Keeping the GPU clocked up between sparse requests. Idle clock-down costs about +270 ms per
-  request on the 27B.
 - Vision.
-- Chunked (WY) DeltaNet prefill.
-- Tensor-op attention.
+- Full-input latency parity with Cloudflare's hosted API on long inputs
+  ([hosted comparison](docs/hosted-comparison.md)).
 
 ## Acknowledgements
 

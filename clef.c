@@ -1,9 +1,17 @@
 #include <math.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "clef_engine.h"
+
+static double wall_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
 
 static bool cfg_u32(const gguf_file *f, const char *key, int *out, char *err, size_t errlen) {
     uint32_t v;
@@ -124,9 +132,24 @@ static bool bind_weights(const gguf_file *f, const clef_config *c, clef_weights 
     return true;
 }
 
+/* An engine address may be recycled after close. A monotonic identity prevents an old
+ * cache entry from being accepted by a newly opened model at that same address. */
+static atomic_uint_fast64_t next_engine_id = 1;
+
+static bool claim_engine_id(uint64_t *id) {
+    uint_fast64_t current = atomic_load_explicit(&next_engine_id, memory_order_relaxed);
+    do {
+        if (current == UINT64_MAX) return false;  /* never wrap into an earlier identity */
+    } while (!atomic_compare_exchange_weak_explicit(&next_engine_id, &current, current + 1,
+                                                    memory_order_relaxed, memory_order_relaxed));
+    *id = (uint64_t)current;
+    return true;
+}
+
 clef_engine *clef_open(const char *path, char *err, size_t errlen) {
     clef_engine *e = calloc(1, sizeof(*e));
     if (!e) { snprintf(err, errlen, "out of memory"); return NULL; }
+    if (!claim_engine_id(&e->instance_id)) { snprintf(err, errlen, "engine identity exhausted"); free(e); return NULL; }
     if (!gguf_open(&e->gguf, path, err, errlen)) { free(e); return NULL; }
     if (!load_config(&e->gguf, &e->cfg, err, errlen) || !bind_weights(&e->gguf, &e->cfg, &e->w, err, errlen)) {
         clef_close(e);
@@ -214,6 +237,7 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
     bool *ovf = calloc((size_t)n, sizeof(bool));
     if (ok && !ovf) { snprintf(err, errlen, "out of memory (batch of %d)", n); ok = false; }
     if (ok) ok = clef_gpu_forward(e->gpu, e, ids, pos, ss, bounds, n, T, false, ovf, &in, dump, dump_rows, err, errlen);
+    const double t_head = wall_ms();
     for (int r = 0; ok && r < n; r++) {
         probs[r] = calloc((size_t)recs[r].nq, sizeof(float *));
         ok = probs[r] != NULL;
@@ -228,6 +252,7 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
             ok = false;
         }
     }
+    double head_ms = wall_ms() - t_head;
     /* A record whose FP16 GEMM operands left FP16's range is recomputed alone with BF16
      * activations (the pre-FP16 precision, and the reference's). Overflow depends only on the
      * record's own rows, so its result is the same in any batch. */
@@ -240,6 +265,7 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
         ok = clef_gpu_forward(e->gpu, e, ids + bounds[r], pos + bounds[r], ss0, b1, 1, len, true, NULL, &in,
                               r == 0 ? dump : NULL, dump_rows, err, errlen);
         free(ss0);
+        const double t_rerun_head = wall_ms();
         if (ok && !clef_head_run(e->head, &e->cfg, e->w.output, &in, 0, &recs[r], probs[r])) {
             snprintf(err, errlen, "head failed (out of memory)");
             ok = false;
@@ -247,7 +273,11 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
             snprintf(err, errlen, "record %d: non-finite logits", r);
             ok = false;
         }
+        head_ms += wall_ms() - t_rerun_head;
     }
+    /* CLEF_STAGE_TIME=1 (with the GPU stage line in clef_metal.m): CPU head time for the batch,
+     * including the heads of rerun records, which run after their BF16 pass (review #67) */
+    if (ok && getenv("CLEF_STAGE_TIME")) fprintf(stderr, "clef: stage head n=%d: %.2f ms\n", n, head_ms);
     for (int r = 0; ok && !raw && r < n; r++)
         for (int q = 0; q < recs[r].nq; q++) softmax_f32(probs[r][q], recs[r].q[q].n_opt);
     free(ovf);
@@ -255,6 +285,279 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
     if (!ok) { clef_free_probs(recs, n, probs); return false; }
     *out = probs;
     return true;
+}
+
+/* ---- prefix cache ---- */
+
+struct clef_prefix {
+    clef_gpu_prefix *gpu;
+    uint64_t engine_id;  /* bound before any model-dependent buffer can be allocated */
+    int32_t *ids;   /* the tokens the entry holds state for */
+    int len;        /* how many: the snapshot row, a multiple of 32; 0 = nothing usable */
+    int cls;        /* clef_gpu_prefix_class of the record that produced the state */
+    /* Checkpoints: the rows of the record whose DeltaNet state the entry holds, by slot of the GPU
+     * entry; 0 = free. While the entry is usable, `len` is one of them. ck_use orders them by the
+     * last pass that stored or resumed from each, for eviction. */
+    int ck_row[CLEF_PREFIX_CKPT];
+    unsigned ck_use[CLEF_PREFIX_CKPT], use;
+};
+
+/* The attention K/V and head memory rows of an entry are per token, so any leading part of them
+ * serves a record that starts with the same tokens. The DeltaNet layers are recurrent: their
+ * state exists only at the rows where a pass stored it. So an entry keeps it at several rows,
+ * and a record resumes from the last one inside the tokens it shares with the entry:
+ *   - the snapshot before the schema, as always;
+ *   - every CLEF_PREFIX_PERIOD tokens, so that a state which differs from the entry's somewhere
+ *     recomputes fewer than that many of the tokens they share;
+ *   - the block where a record left the entry's tokens, so that the next record leaving them
+ *     there, a fixed preamble with another tail, recomputes only its own part.
+ * Each is one copy of the state: 50 MB on clef-flash, 151 MB on the 27B. Below CLEF_PREFIX_MIN
+ * tokens nothing is cached: every request shares the template tokens, and a checkpoint there
+ * would cost a state copy to save a few milliseconds. */
+#define CLEF_PREFIX_PERIOD 2048
+#define CLEF_PREFIX_MIN 128
+
+/* A longer state usually re-tokenizes the last tokens of a shorter one, so the snapshot stays
+ * this far before the schema. Reuse is decided by token equality; the margin only makes a match
+ * likely when a state grows. */
+#define CLEF_PREFIX_MARGIN 8
+
+clef_prefix *clef_prefix_new(void) {
+    clef_prefix *p = calloc(1, sizeof(*p));
+    if (p && !(p->gpu = clef_gpu_prefix_new())) { free(p); p = NULL; }
+    return p;
+}
+
+void clef_prefix_free(clef_prefix *p) {
+    if (!p) return;
+    clef_gpu_prefix_free(p->gpu);
+    free(p->ids);
+    free(p);
+}
+
+size_t clef_prefix_bytes(const clef_prefix *p) { return p ? clef_gpu_prefix_bytes(p->gpu) : 0; }
+/* False after a failed or overflowing pass: the buffers may be allocated, but len is 0. */
+bool clef_prefix_usable(const clef_prefix *p) { return p && p->len > 0; }
+
+static bool prefix_owner_ok(const clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
+    if (!e || !p || !e->instance_id) {
+        snprintf(err, errlen, "invalid prefix cache owner");
+        return false;
+    }
+    if (p->engine_id && p->engine_id != e->instance_id) {
+        snprintf(err, errlen, "prefix cache belongs to another engine");
+        return false;
+    }
+    return true;
+}
+
+bool clef_prefix_keep_warm(clef_engine *e, const clef_prefix *p, char *err, size_t errlen) {
+    if (!prefix_owner_ok(e, p, err, errlen)) return false;
+    return clef_gpu_prefix_keepalive(e->gpu, p->gpu, err, errlen);
+}
+
+/* Template reuse (clef_run_template). Every request begins with the same 36 template tokens: the
+ * system prompt and the header of the user turn (clef_record.c). An entry pinned to their first
+ * 32, one attention query block, can reuse only public template state across requests. Its
+ * buffers also retain request-dependent suffix rows, which each pass overwrites before
+ * reading. Like any entry it keeps K/V rows for the whole record, so CLEF_TEMPLATE_MAX bounds
+ * its capacity. Eligibility also accounts for GEMM tile padding below. All eligible records
+ * are in one DeltaNet class on both models. */
+#define CLEF_TEMPLATE_TOKENS 32
+#define CLEF_TEMPLATE_MAX 2048
+
+/* One record through an entry whose snapshot row for this record is Ls (0: do not use it).
+ * `multi` adds the periodic and divergence checkpoints; without it the entry has its snapshot only. */
+static bool run_entry(clef_engine *e, clef_prefix *p, const clef_record *rec, int Ls, bool multi, float ****out, bool raw,
+                      int *reused, char *err, size_t errlen) {
+    if (errlen) err[0] = '\0';
+    if (reused) *reused = 0;
+    if (!prefix_owner_ok(e, p, err, errlen)) return false;
+    p->engine_id = e->instance_id;
+    const int T = rec->ids.len <= (size_t)(1 << 20) ? (int)rec->ids.len : 0;
+    /* Every row the head reads from the pass (schema spans, the last token) must lie past the snapshot. */
+    bool spans_ok = Ls > 0 && Ls < T;
+    for (int q = 0; spans_ok && q < rec->nq; q++) {
+        spans_ok = rec->q[q].span[0] >= Ls;
+        for (int k = 0; spans_ok && k < rec->q[q].n_opt; k++) spans_ok = rec->q[q].opt_span[k][0] >= Ls;
+    }
+    /* nothing to keep, or a configuration the entry cannot serve: the plain path, entry untouched */
+    if (!spans_ok || !clef_gpu_prefix_supported(e->gpu)) return clef_run_ex(e, rec, 1, out, raw, NULL, 0, err, errlen);
+    for (int i = 0; i < T; i++) {
+        const int32_t id = rec->ids.ids[i];
+        if (id < 0 || id >= e->cfg.vocab) { snprintf(err, errlen, "token id %d out of range", id); return false; }
+    }
+    const int cls = clef_gpu_prefix_class(e, T);
+    /* The leading tokens this record shares with the entry, up to both snapshots. */
+    int same = 0;
+    if (p->len > 0 && p->cls == cls) {
+        const int n = p->len < Ls ? p->len : Ls;
+        while (same < n && p->ids[same] == rec->ids.ids[same]) same++;
+    }
+    const bool left = p->len > 0 && p->cls == cls && same < p->len && same < Ls;   /* it leaves the entry's tokens midway */
+    /* Resume from the last checkpoint inside the shared tokens. A later one describes tokens this
+     * record does not have, and the pass overwrites the rows it belongs to. */
+    clef_prefix_plan plan = { .load = -1 };
+    int L = 0;
+    for (int i = 0; i < CLEF_PREFIX_CKPT; i++) {
+        if (p->ck_row[i] > same) p->ck_row[i] = 0;
+        else if (p->ck_row[i] > L) { L = p->ck_row[i]; plan.load = i; }
+    }
+    /* The rows this pass stores, ascending: the periodic ones it crosses, the block where the record
+     * left the entry's tokens, and its snapshot. At most CLEF_PREFIX_CKPT - 1, so a slot is left for
+     * the checkpoint being read: the period doubles for a record too long for that. */
+    if (multi) {
+        int period = CLEF_PREFIX_PERIOD;
+        while ((Ls - 1) / period > CLEF_PREFIX_CKPT - 3) period *= 2;
+        const int at = same / 32 * 32;
+        const bool anchor = left && at > L && at >= CLEF_PREFIX_MIN && at % period;
+        for (int r = (L / period + 1) * period; r < Ls; r += period) {
+            if (anchor && at < r && (plan.n == 0 || plan.row[plan.n - 1] < at)) plan.row[plan.n++] = at;
+            plan.row[plan.n++] = r;
+        }
+        if (anchor && at < Ls && (plan.n == 0 || plan.row[plan.n - 1] < at)) plan.row[plan.n++] = at;
+    }
+    if (Ls > L) plan.row[plan.n++] = Ls;
+    /* The pass rewrites the entry in place from row L. It holds nothing usable until it succeeds. */
+    p->len = 0;
+    /* A slot for each stored row: a free one, else the least recently used of the checkpoints that
+     * stay valid. The counts above leave a slot for every row, so a miss is a bug here, not input. */
+    bool taken[CLEF_PREFIX_CKPT] = { false };
+    for (int i = 0; i < plan.n; i++) {
+        int s = -1;
+        for (int j = 0; j < CLEF_PREFIX_CKPT; j++) {
+            if (j == plan.load || taken[j]) continue;
+            if (p->ck_row[j] == 0) { s = j; break; }
+            if (s < 0 || p->ck_use[j] < p->ck_use[s]) s = j;
+        }
+        if (s < 0) { snprintf(err, errlen, "prefix cache entry: no checkpoint slot for row %d", plan.row[i]); return false; }
+        taken[s] = true;
+        p->ck_row[s] = 0;
+        plan.slot[i] = s;
+    }
+    int32_t *ids = realloc(p->ids, (size_t)Ls * sizeof(int32_t));
+    if (!ids) { snprintf(err, errlen, "out of memory (prefix cache tokens)"); return false; }
+    p->ids = ids;
+    clef_head_inputs in = {0};
+    bool ovf = false;
+    if (!clef_gpu_forward_prefix(e->gpu, e, p->gpu, rec->ids.ids, T, L, &plan, &ovf, &in, err, errlen)) return false;
+    /* FP16 overflow: the entry now holds a discarded pass. The plain path reruns the record in BF16. */
+    if (ovf) return clef_run_ex(e, rec, 1, out, raw, NULL, 0, err, errlen);
+    const double t_head = wall_ms();
+    float ***probs = calloc(1, sizeof(*probs));
+    bool ok = probs && (probs[0] = calloc((size_t)rec->nq, sizeof(float *))) != NULL;
+    for (int q = 0; ok && q < rec->nq; q++) ok = (probs[0][q] = calloc((size_t)rec->q[q].n_opt, sizeof(float))) != NULL;
+    if (!ok) snprintf(err, errlen, "out of memory (logits)");
+    if (ok && !clef_head_run(e->head, &e->cfg, e->w.output, &in, 0, rec, probs[0])) {
+        snprintf(err, errlen, "head failed (out of memory)");
+        ok = false;
+    } else if (ok && !logits_finite(rec, probs[0])) {
+        snprintf(err, errlen, "record 0: non-finite logits");
+        ok = false;
+    }
+    if (!ok) { clef_free_probs(rec, 1, probs); return false; }
+    if (getenv("CLEF_STAGE_TIME")) fprintf(stderr, "clef: stage head n=1: %.2f ms\n", wall_ms() - t_head);
+    for (int q = 0; !raw && q < rec->nq; q++) softmax_f32(probs[0][q], rec->q[q].n_opt);
+    memcpy(p->ids, rec->ids.ids, (size_t)Ls * sizeof(int32_t));
+    p->len = Ls;
+    p->cls = cls;
+    p->use++;
+    if (plan.load >= 0) p->ck_use[plan.load] = p->use;
+    for (int i = 0; i < plan.n; i++) {
+        p->ck_row[plan.slot[i]] = plan.row[i];
+        p->ck_use[plan.slot[i]] = p->use;
+    }
+    if (reused) *reused = L;
+    *out = probs;
+    return true;
+}
+
+/* The snapshot row clef_run_prefix uses for a record, 0 when it takes the plain path. */
+static int snapshot_row(const clef_record *rec) {
+    const int Ls = rec->schema_start > CLEF_PREFIX_MARGIN ? (rec->schema_start - CLEF_PREFIX_MARGIN) / 32 * 32 : 0;
+    return Ls >= CLEF_PREFIX_MIN ? Ls : 0;
+}
+
+size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const clef_record *rec) {
+    if (!e || !p || !rec || !e->gpu) return 0;
+    const int Ls = snapshot_row(rec);
+    const int T = rec->ids.len <= (size_t)(1 << 20) ? (int)rec->ids.len : 0;
+    /* The same plain-path conditions as run_entry: nothing would be allocated. */
+    bool spans_ok = Ls > 0 && Ls < T;
+    for (int q = 0; spans_ok && q < rec->nq; q++) {
+        spans_ok = rec->q[q].span[0] >= Ls;
+        for (int k = 0; spans_ok && k < rec->q[q].n_opt; k++) spans_ok = rec->q[q].opt_span[k][0] >= Ls;
+    }
+    if (!spans_ok || !clef_gpu_prefix_supported(e->gpu)) return 0;
+    /* run_entry's resume point, read-only: checkpoints past the shared tokens would be invalidated. */
+    const int cls = clef_gpu_prefix_class(e, T);
+    int same = 0;
+    if (p->len > 0 && p->cls == cls) {
+        const int n = p->len < Ls ? p->len : Ls;
+        while (same < n && p->ids[same] == rec->ids.ids[same]) same++;
+    }
+    const bool left = p->len > 0 && p->cls == cls && same < p->len && same < Ls;
+    /* Checkpoints past the shared tokens are invalid for this pass, as run_entry zeroes them. */
+    int row[CLEF_PREFIX_CKPT];
+    int L = 0, load = -1;
+    for (int i = 0; i < CLEF_PREFIX_CKPT; i++) {
+        row[i] = p->ck_row[i] <= same ? p->ck_row[i] : 0;
+        if (row[i] > L) { L = row[i]; load = i; }
+    }
+    /* The rows the pass would store, enumerated as run_entry does. */
+    int period = CLEF_PREFIX_PERIOD, n = 0, last = 0;
+    while ((Ls - 1) / period > CLEF_PREFIX_CKPT - 3) period *= 2;
+    const int at = same / 32 * 32;
+    const bool anchor = left && at > L && at >= CLEF_PREFIX_MIN && at % period;
+    for (int r = (L / period + 1) * period; r < Ls; r += period) {
+        if (anchor && at < r && (n == 0 || last < at)) { n++; last = at; }
+        n++; last = r;
+    }
+    if (anchor && at < Ls && (n == 0 || last < at)) n++;
+    if (Ls > L) n++;
+    /* The slot each store takes, chosen as run_entry does (a free slot first, else the least
+       recently used valid one); only a slot without buffers costs an allocation (review #44). */
+    bool taken[CLEF_PREFIX_CKPT] = { false };
+    int fresh = 0;
+    for (int i = 0; i < n; i++) {
+        int s = -1;
+        for (int j = 0; j < CLEF_PREFIX_CKPT; j++) {
+            if (j == load || taken[j]) continue;
+            if (row[j] == 0) { s = j; break; }
+            if (s < 0 || p->ck_use[j] < p->ck_use[s]) s = j;
+        }
+        if (s < 0) break;   /* run_entry reports this as an error; nothing more is allocated */
+        taken[s] = true;
+        if (!clef_gpu_prefix_slot_allocated(p->gpu, s)) fresh++;
+    }
+    return clef_gpu_prefix_estimate(e->gpu, &e->cfg, p->gpu, T, fresh);
+}
+
+bool clef_run_prefix(clef_engine *e, clef_prefix *p, const clef_record *rec, float ****out, bool raw,
+                     int *reused, char *err, size_t errlen) {
+    /* The snapshot sits where the schema begins, on attention's 32-query-row boundary. A request
+     * with fewer than 128 cacheable tokens takes the plain path and leaves the entry alone: every
+     * request shares the template tokens, so it would otherwise "match" and then overwrite an
+     * entry that took seconds to fill. clef_run_template is the entry for those tokens. */
+    return run_entry(e, p, rec, snapshot_row(rec), true, out, raw, reused, err, errlen);
+}
+
+bool clef_run_template(clef_engine *e, clef_prefix *p, const clef_record *rec, float ****out, bool raw,
+                       int *reused, char *err, size_t errlen) {
+    const size_t T = rec->ids.len, rem = T % 64;
+    bool fits = T <= CLEF_TEMPLATE_MAX && rec->schema_start >= CLEF_TEMPLATE_TOKENS;
+    /* Flash's selected short GEMM uses 64-row tiles at these lengths; removing 32 rows
+     * switches to its slower 32-row tile. Bypass preserves the ordinary dispatch and entry. */
+    if (e && e->cfg.H == 4096 && T >= 768 && T <= 1024 && (rem == 0 || rem > 32)) fits = false;
+    /* Above 1,056, both full and suffix GEMMs use 64-row tiles. Reuse pays off when it
+     * removes a padded tile; otherwise the measured bookkeeping cost cancels the saving. */
+    if (T > 1056 && (rem == 0 || rem > 32)) fits = false;
+    return run_entry(e, p, rec, fits ? CLEF_TEMPLATE_TOKENS : 0, false, out, raw, reused, err, errlen);
+}
+
+bool clef_keep_warm(clef_engine *e, char *err, size_t errlen) {
+    if (!e) { snprintf(err, errlen, "invalid engine"); return false; }
+    return clef_gpu_keepalive(e->gpu, err, errlen);
 }
 
 bool clef_run(clef_engine *e, const clef_record *recs, int n, float ****probs, char *err, size_t errlen) {

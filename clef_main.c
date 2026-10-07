@@ -6,9 +6,14 @@
  *   --dump FILE   write [n_layer+2][R][H] f32 residual dumps of the first request
  *   --dump-last N dump only the last N token rows of each layer (R = N; default all T)
  *   --batch N     pack up to N requests per forward pass (default 1)
+ *   --prefix-cache  keep the backbone state of each request's template and state tokens and
+ *                 reuse it when the next request starts with the same tokens (one request per
+ *                 pass; results are bitwise those without the option)
+ *   --template-cache  reuse the first 32 fixed prompt tokens for requests up to 2,048 tokens
  *   --time        print per-batch latency to stderr
  *   --strict      tokenize request content without special-token recognition (see README)
- *   --no-truncate reject requests whose state does not fit, instead of silently cutting it
+ *   --truncate    opt into reference behavior that cuts state to fit the context limit
+ *   --no-truncate reject requests whose state does not fit (default)
  */
 
 #include <errno.h>
@@ -74,7 +79,7 @@ static bool emit(item *it, float **p, bool logits) {
 
 int main(int argc, char **argv) {
     const char *model = NULL, *input = NULL, *dump_path = NULL;
-    bool logits = false, timing = false, strict = false, no_truncate = false;
+    bool logits = false, timing = false, strict = false, no_truncate = true, prefix_cache = false, template_cache = false;
     int batch = 1;
     int dump_last = 0;
     for (int i = 1; i < argc; i++) {
@@ -82,14 +87,25 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--logits")) logits = true;
         else if (!strcmp(argv[i], "--time")) timing = true;
         else if (!strcmp(argv[i], "--strict")) strict = true;
+        else if (!strcmp(argv[i], "--truncate")) no_truncate = false;
         else if (!strcmp(argv[i], "--no-truncate")) no_truncate = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump_path = argv[++i];
         else if (!strcmp(argv[i], "--dump-last") && i + 1 < argc) dump_last = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--prefix-cache")) {
+            if (template_cache) { fprintf(stderr, "clef: choose --prefix-cache or --template-cache\n"); return 2; }
+            prefix_cache = true;
+        }
+        /* the 32 template tokens every request starts with, for requests up to 2,048 tokens */
+        else if (!strcmp(argv[i], "--template-cache")) {
+            if (prefix_cache && !template_cache) { fprintf(stderr, "clef: choose --prefix-cache or --template-cache\n"); return 2; }
+            prefix_cache = template_cache = true;
+        }
         else if (argv[i][0] != '-' && !input) input = argv[i];
-        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--no-truncate] [--batch N] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
+        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
     }
     if (!model || batch < 1) { fprintf(stderr, "clef: -m MODEL.gguf is required\n"); return 2; }
+    if (prefix_cache && (batch != 1 || dump_path)) { fprintf(stderr, "clef: %s takes one request per pass and no --dump\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
     FILE *in = input ? fopen(input, "r") : stdin;
     if (!in) { fprintf(stderr, "clef: cannot open %s\n", input); return 1; }
 
@@ -102,9 +118,11 @@ int main(int argc, char **argv) {
     item *items = calloc((size_t)batch, sizeof(*items));
     clef_record *recs = calloc((size_t)batch, sizeof(*recs));
     int *map = calloc((size_t)batch, sizeof(int));
-    if (!items || !recs || !map) {
+    clef_prefix *prefix = prefix_cache ? clef_prefix_new() : NULL;
+    if (!items || !recs || !map || (prefix_cache && !prefix)) {
         fprintf(stderr, "clef: out of memory (batch of %d)\n", batch);
         free(items); free(recs); free(map);
+        clef_prefix_free(prefix);
         if (in != stdin) fclose(in);
         clef_close(e);
         return 1;
@@ -161,7 +179,12 @@ int main(int argc, char **argv) {
             }
         }
         double t1 = now_ms();
-        if (m && !clef_run_ex(e, recs, dump ? 1 : m, &probs, logits, dump, (int)dump_rows, err, sizeof(err))) {
+        int reused = 0;
+        if (m && prefix_cache && !(template_cache ? clef_run_template : clef_run_prefix)(e, prefix, recs, &probs, logits, &reused, err, sizeof(err))) {
+            items[map[0]].ok = false;
+            snprintf(items[map[0]].err, sizeof(items[map[0]].err), "%s", err);
+            rc = 1;
+        } else if (m && !prefix_cache && !clef_run_ex(e, recs, dump ? 1 : m, &probs, logits, dump, (int)dump_rows, err, sizeof(err))) {
             for (int i = 0; i < m; i++) { items[map[i]].ok = false; snprintf(items[map[i]].err, sizeof(items[map[i]].err), "%s", err); }
             rc = 1;
         } else if (dump) {
@@ -196,6 +219,7 @@ int main(int argc, char **argv) {
         if (timing && m) {
             size_t toks = 0;
             for (int i = 0; i < m; i++) toks += recs[i].ids.len;
+            if (prefix_cache) fprintf(stderr, "clef: prefix cache reused %d of %zu tokens, entry %.0f MB\n", reused, toks, clef_prefix_bytes(prefix) / 1e6);
             fprintf(stderr, "clef: batch of %d (%zu tokens) in %.1f ms\n", m, toks, now_ms() - t1);
         }
         free(dump);
@@ -226,6 +250,7 @@ int main(int argc, char **argv) {
     }
     free(line); free(items); free(recs); free(map);
     if (in != stdin) fclose(in);
+    clef_prefix_free(prefix);
     clef_close(e);
     return rc;
 }

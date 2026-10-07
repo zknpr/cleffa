@@ -36,6 +36,24 @@ make clean
 - `bench/jev_compare.py` compares SystemOne endpoints (Jev's API, `clef-server`) on the corpus:
   `collect URL MODEL OUT REQUESTS --key-file jev.api`, then `compare A B ...`. The key file is
   git-ignored; the script sends it only in the Authorization header and never prints it.
+- `bench/checkout_latency.py OUT.json` measures the blog's checkout example and synthetic longer
+  fixtures on localhost only. It checks full token counts and repeated-response equality, and
+  starts/stops one server at a time. These fixtures do not reproduce the external API chart.
+- `bench/cloudflare_checkout.py OUT.jsonl` prepares the same public fixtures for Workers AI.
+  Add `--run` to send them, using `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_API_TOKEN` from the
+  environment. It records full versus reported token counts and every response, without retries.
+  Missing or mismatched usage does not establish equal work. Its default mode makes no network
+  requests. `.venv/bin/python -B tests/test_cloudflare_checkout.py` checks result/error handling.
+- `bench/compare_mlx.py T K N --output OUT.json` compares the MPP GEMM algorithm with MLX on
+  identical FP16/BF16 operands and FP32 output. It requires optional MLX/NumPy dependencies;
+  see `docs/rejected-experiments.md` for isolated installation, measurements and rejected probes.
+- `docs/` holds six topic reports indexed by `docs/README.md`: performance history, attention,
+  prefix cache, hosted comparison, long-request timing and rejected experiments. Add new
+  measurements to the matching report rather than starting a dated file. The raw evidence they
+  cite lives in git-ignored `golden/<experiment>-<date>/` directories.
+- `tools/evidence_archive.py OUT.tar.gz` builds the publishable evidence archive from `golden/`
+  (rules and placeholders in its docstring; `--list` previews). Publishing it as a release asset is
+  a release step and needs explicit approval. `tests/test_evidence_archive.py` covers the rules.
 - Python always runs through `.venv/bin/python` (Python 3.12, torch 2.11, transformers 5.10.2,
   tokenizers 0.22.2). `pyrightconfig.json` points at it.
 
@@ -55,7 +73,8 @@ and `clef-f32` (27B streamed FP32), both generated with `--safe-attn`. `clef-uns
 (wrong `r021`, and `r020` in FP32); don't compare against them. The `clef-f32-r020*`/`*-r021*`
 directories are single-request diagnostic runs with last-512-row layer dumps.
 `golden/engine_logits.jsonl` and `golden/engine_dump*.bin` are engine outputs written by the
-parity tests.
+parity tests. The other `golden/<experiment>-<date>/` directories hold the evidence cited by
+`docs/`; they are git-ignored and never read by tests.
 
 Regenerate a GGUF after changing `tools/convert.py`, then verify byte-exactness:
 
@@ -97,8 +116,10 @@ for the HF snapshot, not an engine test. `golden-*.log` files at the root are or
 ## Tests
 
 `make test` runs the head and UTF-8 error unit tests, JSON byte parity, tokenizer parity against
-`gguf/clef-flash.gguf` + `model-flash`, HTTP write-failure handling, and snapshot/GGUF verifier and
-numerical parity regressions using tiny generated fixtures.
+`gguf/clef-flash.gguf` + `model-flash`, HTTP write-failure handling, snapshot/GGUF verifier and
+numerical parity regressions using tiny generated fixtures, the model-free prefix-cache ownership,
+planner and test-mode checks, the Cloudflare collector/comparator unit tests, and the checkout
+latency report test.
 `make test-errors` uses the flash GGUF to check CLI allocation/output failures, CLI/HTTP error responses, and
 Metal execution-error propagation and recovery. Everything else is run explicitly, with the model
 and golden directory as arguments. Use clef-flash for iteration; the 27B is for final parity only.
@@ -172,8 +193,8 @@ DeltaNet k->v head mapping is `repeat_interleave` (`h // ratio`). No tensor is p
 
 Per packed batch: one command buffer, serial dispatch. Activations live in buffers sized to a token
 capacity (`ensure_capacity`), reused across calls. Per layer: RMSNorm (`rmsnorm_act`, which writes the
-16-bit GEMM operand) -> `gemm_x` (`gemm_f16_32x128` etc.) -> attention (`attention_fa`, or `attention` with `CLEF_ATTN_REF=1`) or Gated DeltaNet
-(`ssm_conv`, `gdn_prep`, `gdn_scan`, `gdn_out`) -> output GEMM -> residual -> RMSNorm -> gate/up
+16-bit GEMM operand) -> `gemm_x` (`gemm_f16_32x128` etc.) -> attention (`attention_tu`; tiled FP32 with `CLEF_ATTN_TU=0`, or `attention` with `CLEF_ATTN_REF=1`) or Gated DeltaNet
+(`ssm_conv`, `gdn_prep`, `gdn_scan` or `gdn_chunk_prep_32` + `gdn_chunk_scan_32_*`, `gdn_out`) -> output GEMM -> residual -> RMSNorm -> gate/up
 GEMM -> `swiglu` -> down GEMM. The residual stream stays f32. GEMM inputs are written as FP16 by
 `act16` (BF16 with `CLEF_ACT_F16=0`), because the parity target is FP32 and FP16 is ~8x finer than
 BF16 at the same tensor-op rate. A value past 65504 sets a per-record flag, and `clef_run_ex` reruns
@@ -181,16 +202,88 @@ that record alone with BF16 activations.
 
 The head's memory-side K/V projections for each attention module run on the GPU without bias, on f32
 activations (`clef_head_inputs.kv`); `clef_head.c` explains why dropping the biases is exact.
+CPU head projections prepare padded, transposed FP32 weight copies at load for multi-row GEMMs.
+Single-row calls and ragged weight shapes retain the original layout to preserve BLAS reductions.
+The decoder's `self_in` shares original QKV weights/bias with `self_attn.in_q`, but owns its packed
+copy. `tests/test_head_linear.c` covers layout parity, padding, allocation failure and that ownership.
+The residual scorer batches the options of each record when there are at least four, reusing
+existing scratch and one extra 16.5 MiB packed projection. Keep this choice per record: the BLAS
+reduction changes slightly with row count, so batching across records would violate invariance.
+Its float64 checks live in `test_head_linear.c`; private replay has one documented last-decimal
+probability difference, with unchanged decisions and scores. See `docs/performance-history.md`.
+
+Large CPU head projections split their output columns into two 32-column-aligned halves.
+Larger head attention calls split independent heads between two workers, each with its own
+score scratch. The input reduction and each attention head's BLAS/softmax sequence stay intact.
+`tests/test_head_linear.c` compares both layouts against unsplit BLAS; `tests/test_head_parallel.c`
+checks attention, scratch allocation failure and concurrent first-use configuration. Run
+`make test-head-tsan` to instrument that initialization check. The environment threshold
+`CLEF_DEBUG_HEAD_SPLIT_MIN` is read once, thread-safely; setting it to `0` disables the linear
+split only. See `docs/performance-history.md` for timing and qualification limits.
 
 ### Invariants the tests enforce
 
 - **Batch invariance.** Logits for a record are bitwise identical regardless of what it is packed
-  with. This requires: a fixed GEMM tile shape for every T (32x128), attention key blocks aligned to
-  each record's start, and per-record conv/scan boundaries. Any kernel change must keep
-  `tests/test_batch.sh` green.
+  with. This requires identical per-element GEMM reductions, attention key blocks aligned to
+  each record's start, and per-record conv/scan boundaries. FP16 GEMMs use 64x128 from 1,024
+  packed tokens upward. Flash also uses 64 rows at 768–1,023 tokens when 64-row
+  padding equals 32-row padding (`T % 64 == 0` or `T % 64 > 32`). Other short
+  cases use 32x256 when K and N are both at least 5,120,
+  otherwise 32x128. At 4,096 or more packed tokens, down projections with N >= 5,120
+  and K >= 2*N use 32x256; this selects the 27B FFN down projection. At the same token
+  boundary, expansion projections with K >= 5,120 and N >= 4*K interleave four 64x128
+  tile rows. Each threadgroup still owns one output tile with the original K reduction;
+  the partial final group uses its actual height. This selects long 27B expansions only.
+  `make test-gemm` checks exact tile and row-offset parity at both dispatch boundaries,
+  including accumulation, ragged edges and partial groups (190 shape/mode checks).
+  BF16/f32 GEMMs always use 32x128. Any kernel change
+  must keep `tests/test_batch.sh` green.
+- **Compensated attention.** The default FP16-output path uses `attention_tu`: high
+  and residual FP16 planes, three FP32-accumulating products per QK/PV operation,
+  and record-aligned 32-query/128-key tiles. It omits the residual-times-residual
+  term, so it is not FP32 bit equivalence. `attn_prep_split` saturates and flags
+  out-of-range or NaN values per record; the BF16 rerun uses FP32 attention.
+  Rescaling votes have one writer per SIMD-group slot followed by a barrier.
+  The engine fixes its mode at opening, including prefix K/V layout. Permanent
+  attention checks cover float64 bounds, split planes, packed invariance,
+  cache strides, poison and overflow. Model quality evidence and its limits are
+  in `docs/attention.md`; no input token is omitted.
+- **FP32 attention control.** With `CLEF_ATTN_TU=0`, single requests with at least 1,024 tokens use
+  `attention_prefetch_64`. Packed batches of up to eight records with at least 4,096 total
+  tokens use `attention_reuse_4`; other requests retain `attention_fa`. Both reuse variants
+  share 32 query rows across four SIMDgroups, each owning 64 output columns.
+  Prefetch computes 64 score columns together but applies each original
+  32-key softmax and value-product update separately, preserving per-output reduction
+  order. Merging the updates worsens full-model probability error despite unchanged decisions.
+  All groups in the reuse kernel must reach its barriers, including entirely padded
+  query groups, which load zero Q. `make test-attention` compares exact output and overflow
+  flags across kernels, all 32 row offsets, packed records, ragged tails, and FP16/BF16 output.
+  Long packed cases cover 8 × 512, 8 × 1,382, 4,510 + 346, and 2 × 8,072 tokens with every
+  candidate output poisoned before comparison. The host zeroes 64 K/V tail rows within
+  the existing allocation and eight Q tail rows; the benchmark poisons beyond those limits.
+  Packed prefetch timing is mixed, so packed requests retain their prior dispatch.
+  Reuse and prefetch rescale the two local float elements with a loaded row-broadcast
+  fragment instead of an 8x8 diagonal multiply, and normalize after the final store.
+  This uses the compiler's `thread_elements()` accessor; the host requires a 32-lane
+  SIMDgroup for these pipelines. No lane-to-row fragment mapping is hard-coded. The
+  original FA kernel remains unchanged. See `docs/attention.md` for exact-output checks
+  and the modest, separately measured complete-request gains.
+  The benchmark's `--values fp32` mode supplements the original coarse grid with full
+  FP32 mantissas and varied magnitudes. `make test-attention` checks this distribution too;
+  passing it does not replace full-model probability-error checks for numerical changes.
 - **No read-before-write.** `CLEF_DEBUG_POISON=1` fills every activation buffer with NaN before each
   forward; outputs must not change (`tests/test_poison.sh`). Masked attention must never multiply
   into unwritten rows (`0 * NaN = NaN`).
+- **Chunked DeltaNet.** Records with Hv=48, dv=128 and at least 4,096 tokens use 32-token FP32 blocks
+  (the chunk kernels address V/O at a fixed 128 columns; other dv values stay on the sequential scan),
+  with 16 value columns below 8,192 tokens and 32 thereafter. Flash retains the sequential scan.
+  Dispatch and block boundaries are per record; selecting by packed T would change logits when
+  records are batched. Scratch is sized to the longest selected record, allocated atomically,
+  poisoned by the existing debug hook, and reused only across serial dispatches. Sum each decay
+  interval directly: subtracting large prefix sums loses small later decays and can yield NaN.
+  `make test-gdn` checks both value tiles, all 32 row offsets/tails, float64, strong/overflowing
+  decays, output guards and allocation-failure recovery. Arithmetic differs from the old scan;
+  assess final logits against FP32, then require exact standalone/packed and poison invariance.
 - **Byte parity with Python** for JSON dump, float repr, `round`, tokenizer ids, encoded spans, and
   response text. The engine reproduces CPython 3.12 behaviour including Neumaier `sum()`.
 - **FP16 overflow is decided per record.** A record that overflows reruns alone in BF16, so its
@@ -214,8 +307,9 @@ non-finite logits/residuals, max absolute logit error > 0.05, max probability er
 exactly where BF16 is wrong (clef-flash `r004/urgency`, `r006/urgency`). A jump at one layer helps
 locate a bug (`--dump` prints jump markers); smooth drift can reflect reference rounding.
 An argmax flip on a small FP32 top-2 margin can be precision error rather than an implementation bug.
-Judge a precision change by its error against FP32 over all questions (mean |dp|, logit error), not
-argmax. `r019/service` has an FP32 margin of 0.004 and flips with noise. FP16 on a single producer
+Judge numerical error against FP32 over all questions (mean |dp| and logit error),
+not only argmax. Report labeled task accuracy and probability scores separately;
+unchanged task decisions do not erase a measured numerical-error increase. `r019/service` has an FP32 margin of 0.004 and flips with noise. FP16 on a single producer
 class reached 46/46 there without lowering the error; FP16 on all classes cut it ~7x.
 
 ### Strict mode
@@ -231,18 +325,134 @@ requests encode identically either way. Keep that asymmetry when adding options.
 8 SwiGLU; default 15, 0 = BF16 as in HF's BF16 path), `CLEF_HEAD_BF16=1` (round the head's input to
 BF16 as HF does; with `CLEF_ACT_F16=0` this reproduces the pre-FP16 engine bitwise),
 `CLEF_DEBUG_F16_LIMIT` (lower the FP16 overflow limit to exercise the rerun),
-`CLEF_PROFILE=1` (GPU ms per kernel category; serializes the GPU, so not for latency),
-`CLEF_ATTN_REF=1` (reference attention kernel), `CLEF_DEBUG_POISON=1`, `CLEF_DEBUG_FAIL_MULTI=1`
+`CLEF_PROFILE=1` (GPU ms for gemm, attention, gdn_scan, norm, attn_prep, conv_prep, gdn_out,
+swiglu and head; serializes the GPU, so not for latency),
+`CLEF_STAGE_TIME=1` (host encode, commit-to-completion wait, GPU execution and CPU head time),
+`CLEF_ATTN_TU=0` (tiled FP32 attention control; compensated tensor-unit attention defaults on),
+`CLEF_ATTN_REF=1` (reference attention kernel, overrides tensor attention), `CLEF_DEBUG_POISON=1`, `CLEF_DEBUG_FAIL_MULTI=1`
 (fails every multi-record forward; exercises the server's per-record retry), `CLEF_SCAN_LPC`
-(lanes per value column in `gdn_scan`), `CLEF_DEBUG_NIL_CMDBUF=N` (the Nth Metal command-buffer
-creation fails; every creation goes through `new_cb`, which makes the pass fail instead of running
+(lanes per value column in the sequential `gdn_scan`), `CLEF_DEBUG_NIL_CMDBUF=N` (the Nth Metal command-buffer
+creation fails; forward-pass creation goes through `new_cb`, which makes the pass fail instead of running
 on stale activations), `CLEF_DEBUG_IO_TIMEOUT=S` (server request deadline; reads run against a
-monotonic deadline, not just a per-read timeout).
+monotonic deadline, not just a per-read timeout), `CLEF_DEBUG_KEEPWARM_MS=N` (idle-pass interval,
+0 disables), `CLEF_DEBUG_KEEPWARM_NOWEIGHTS=1` (idle passes omit the weights, a diagnostic control).
+
+The server enables keep-warm by default; `--no-keep-warm` disables it. The worker calls
+`clef_keep_warm` while idle, so it never overlaps a forward on that engine. Its idle round then touches
+each cache entry and the template entry, rechecking the queue between entries so an arriving
+request waits for at most one entry's pass (`tests/test_server_writes.c`). The function reads
+model/activation buffers and writes only its separate sink; it is not thread-safe against a
+forward. Its nullable command-buffer/encoder and execution errors are checked separately from
+`new_cb`. `tests/test_metal_errors.m` checks error propagation, recovery and exact activation-byte
+preservation; `tests/test_keep_warm.py MODEL.gguf` checks idle latency and complete response bytes.
+
+### Fixed-template entry
+
+`clef_run_template` uses the same exact-within-mode cache path with a snapshot at token
+32 and a 2,048-token eligibility limit. The encoder emits a separately tokenized
+36-token fixed prompt before request content. The library still checks prefix
+IDs and engine ownership. Give the template function a dedicated entry; it must
+not share one with `clef_run_prefix`. Ineligible records bypass it without
+invalidating the saved template. Above 1,056 tokens, reuse requires
+`1 <= T % 64 <= 32`: removing 32 rows then saves one padded GEMM tile. Flash
+also bypasses `768 <= T <= 1024` when `T % 64 == 0 || T % 64 > 32`, since its
+full pass uses a faster 64-row tile but its suffix would use a 32-row tile. This
+selection uses host config and leaves ownership validation in `run_entry`
+before any token or GPU-buffer access. Both paths process the full input.
+
+Only public prefix state is reused. Full-capacity attention K/V and head-memory
+buffers also retain request-dependent suffix rows. The next pass overwrites its
+live suffix and clears attention padding before reads; this is not a promise
+that the entry contains no request data. The server owns one such entry in its
+worker thread, touches it during keep-warm, and logs failures before uncached
+fallback. This allocation is additional to the keyed cache budget. The option is
+off by default and does not alter packed execution.
+
+`tests/test_template_cache.py` checks exact logits on unrelated inputs, shrinkage,
+replacement and both sides of the tile/padding eligibility boundaries; it also checks overflow, HTTP
+bytes, interleaving with keyed requests and allocation failure/recovery. Run it
+for both models under the shared GPU lock. CLI flag conflicts are covered by
+`tests/test_cli_errors.py` before model opening.
+
+### Exact prefix cache
+
+`clef_run_prefix` operates on one record and one engine-owned entry. The record
+encoder records `schema_start` without changing token IDs. A successful pass
+stores a snapshot eight tokens before the schema, rounded down to a 32-token
+boundary, with a minimum eligible prefix of 128 tokens. It also stores recurrent
+state every 2,048 tokens and at an observed divergence, rounded down to a 32-token
+boundary. Up to twelve slots retain these checkpoints; periodic spacing doubles
+for longer library requests so a pass never overwrites its loaded checkpoint.
+The planner resumes from the last checkpoint inside the exact common token
+prefix. Shrinkage and edits can therefore reuse an earlier checkpoint. A change
+of full-record DeltaNet class invalidates reuse. Short or unsupported requests
+bypass the entry without evicting it. The CLI enables this with `--prefix-cache`
+and requires batch size 1 without a residual dump. Template entries keep only
+their one public-prefix checkpoint.
+
+An entry holds attention K/V and head-memory K/V once per token, with separate
+DeltaNet recurrent state and convolution tails per checkpoint. Each checkpoint
+costs 50.25 MiB on Flash or 149.625 MiB on 27B; allocated slots remain counted in
+the cache budget after invalidation. FP32 mode stores float K/V; compensated mode stores high
+and residual half planes in the same total bytes. The layout is fixed for the
+engine's lifetime. Preparation writes absolute K/V positions with a separate
+capacity stride, and capacity growth copies every plane. Resumed attention keeps
+the same query/key tile alignment and arithmetic as the full pass in that mode. Query rows and schema/head inputs remain
+compact; `nh_skip` shifts only the latter, retaining the full head memory.
+Poison checks cover stale padding between heads and the final allocation slack.
+Full-record length selects the DeltaNet class even when only a suffix is
+processed; changing that class can change results. GEMM tiles are selected for the
+computed rows, with exact reductions across the supported tile shapes. A template
+hit can therefore cross a GEMM performance boundary despite retaining exact logits.
+
+An entry binds to a monotonic engine instance ID before model-dependent storage
+is allocated. It cannot be used by another engine, including a new one allocated
+at a recycled address. A failed or overflowing cached pass invalidates the
+checkpoints; FP16 overflow returns the ordinary full BF16 fallback, and the server drops such an
+entry instead of retaining its buffers or inserting it (`clef_prefix_usable`). Cache hits retain
+the full context and the arithmetic of their engine's uncached attention mode.
+
+The server's `--prefix-cache-mb N` defaults to zero. Its worker alone owns the
+32-entry table. `X-Clef-Prefix-Cache` selects an entry; keyed jobs run alone and
+unkeyed jobs retain normal batching. The table has a retained-buffer budget with LRU
+eviction; `clef_prefix_estimate` projects an entry's size by replaying the planner's rows and slot
+choices and charging only slots without buffers (exact for a fresh entry and for slot reuse;
+a checkpoint read for resume is not charged) and the server serves a request uncached when its entry would exceed
+the budget, so no entry larger than the budget is allocated. Growth still copies the planes,
+so the transient peak can reach twice an entry. Keys must be assigned by the
+authenticating deployment per isolation boundary because hits are visible in
+latency. The idle worker touches each entry's buffers read-only as well as the
+ordinary engine buffers. Cache failure falls back to an ordinary server pass.
+
+`make test` includes model-free ownership, checkpoint-planner, test-mode selection
+and eval-comparator regressions. The planner test checks saved token identities
+and recurrent checksums independently of its slot-eviction policy, including
+partial writes, overflow and head failure.
+`make test-prefix-attention` checks exact full/resumed attention, poisoned guards
+and float64 error bounds. `make test-prefix-model` runs `tests/test_prefix_owner_model.c`,
+which exercises populated entries across both models and a reopened engine. `tests/test_prefix_cache.py` covers
+transitions, overflow, bypass and allocation recovery; `test_prefix_public.py`
+covers poisoned public fill/hit pairs. `test_server_prefix.py` checks HTTP bytes,
+key isolation and oversized-entry eviction. Run GPU tests under the shared lock.
+`tests/test_prefix_checkpoints.py MODEL.gguf REQUESTS.jsonl --attention tu`
+checks changing tails, edits, shrinkage, class transitions, slot eviction and
+failure recovery against uncached logits. Repeat with `--attention fp32` to cover
+the other attention layout: the runner intentionally removes inherited `CLEF_*`
+settings before applying this selector.
+`CLEF_DEBUG_PREFIX_FAIL_ABOVE=N` injects cache-capacity failures above N tokens to
+check invalidation, explicit errors and recovery. `CLEF_DEBUG_PREFIX_CKPT_FAIL=N`
+fails the Nth new checkpoint allocation for partial-entry recovery tests.
+`CLEF_DEBUG_SIMD_WIDTH_FOR=NAME` reports that pipeline as 16 lanes wide at open, to check that
+every pipeline using `rescale_fragment` (reuse, prefetch and the cached FP32 attention) refuses to open.
+
 
 ### Measuring latency
 
-The GPU clocks down after ~1 s idle and the next request pays for it (a ~260-token request goes
-from 95 ms back-to-back to 200+ ms after a 1-3 s gap). Measure as the median of three warm,
+An idle gap can add a large delay before GPU execution. Periodically referencing the model
+buffers removes it on the measured M5 Max; buffer residency is an inference, not a confirmed
+driver mechanism. See `docs/performance-history.md`. The server's keep-warm default addresses
+this delay; thermal and clock effects on execution remain separate. State whether a latency
+comes from sparse traffic or a continuously busy engine. Measure as the median of three warm,
 back-to-back passes (`./clef --time`, or `ref/oracle.py` latency.json for the PyTorch side), and
 compare engine vs PyTorch in the same sitting. Never take latency from a `CLEF_PROFILE=1` run.
 On the 27B, the corpus's 8k/16k requests heat-soak the GPU. A 260-token request goes from ~310 ms
