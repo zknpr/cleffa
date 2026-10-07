@@ -11,7 +11,13 @@
  *                         scan has been decoded under UBSan)
  *   6 duplicate-scan      a 3-component baseline SOS naming component 1 three times, only table 1
  *                         defined: components 2 and 3 decoded with undefined table 0 (values[-1])
- * Cases 1, 2, 5 and 6 must be refused, 3-4 must decode (the content is out of range, the syntax is not).
+ * Every case must now be refused. Cases 3 and 4 decoded until the decoder began refusing blocks
+ * whose IDCT output leaves [-512, 511], where libjpeg's builds disagree (review #3, Codex on
+ * 3f3eb03). Case 3's block still runs the whole 64-bit IDCT under UBSan before the refusal. Case 4
+ * now stops at its first block, so its long accumulation no longer runs; a baseline file cannot
+ * reach it any more, since every accepted block bounds the predictor, and the arithmetic stays
+ * defined regardless (unsigned sum, 16-bit coefficient, a product below 2^31). Case 5 still
+ * accumulates across a whole progressive scan before its refusal.
  * Built with UBSan and ASan and -fno-sanitize-recover; includes clef_image.c so the decoders are
  * instrumented. Usage: test-jpeg-ub [CASE...]  (all cases without arguments) */
 #include "../clef_image.c"
@@ -129,19 +135,12 @@ static int run(int c) {
     char err[256] = "";
     const bool ok = clef_image_decode(j.p, j.n, &rgb, err, sizeof(err));
     free(j.p);
-    const bool want_ok = c == 3 || c == 4;
+    const bool want_ok = false;
     if (ok != want_ok) {
         fprintf(stderr, "jpeg ub: case %d %s: %s\n", c, names[c], ok ? "decoded, expected refusal" : err);
         if (ok) clef_rgb_free(&rgb);
         return 1;
     }
-    if (ok && c == 3 && (rgb.width != 1 || rgb.height != 1 || rgb.rgb[0] != 255)) {
-        /* a DC level far above white clamps to white once the IDCT no longer wraps */
-        fprintf(stderr, "jpeg ub: case 3 pixel %u, expected 255\n", rgb.rgb[0]);
-        clef_rgb_free(&rgb);
-        return 1;
-    }
-    if (ok) clef_rgb_free(&rgb);
     printf("jpeg ub: case %d %s: %s\n", c, names[c], ok ? "decoded" : "refused");
     return 0;
 }

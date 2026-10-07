@@ -46,13 +46,15 @@ image's first component must carry the largest sampling factors, scans may only 
 tables a DHT defined and name each component once, DC table symbols above 15 are refused, the DC predictor wraps and is stored
 as 16 bits before dequantization, the IDCT computes in 64-bit, and a progressive DC scan of one
 component walks that component's blocks in raster order. Matching libjpeg on files from other
-encoders, 4:4:0 chroma uses its h1v2 triangle filter, SOF1 frames decode as baseline, an overshooting
-refinement run writes its coefficient where libjpeg does, progressive images libjpeg would
+encoders, 4:4:0 chroma uses its h1v2 triangle filter, SOF1 frames decode as baseline, a run
+overshooting its band (refinement, first scan or baseline) writes its coefficient where libjpeg does, progressive images libjpeg would
 reconstruct with block smoothing are refused, 0xFF fill bytes before a marker are skipped one at a
 time, entropy data with fill bytes before a stuffed zero is refused, a one-component frame
 decodes as 1x1 whatever sampling it declares, three components are copied as RGB when libjpeg would
 (no JFIF marker, and an Adobe transform of 0 or, without an Adobe marker, component ids R, G, B),
-and a progressive frame that reaches EOI before any scan is refused. `clef_image.c` includes the
+a progressive frame that reaches EOI before any scan is refused, each component's quantization
+table must be defined by its first scan and is latched there as libjpeg does, and a block whose
+IDCT output leaves [-512, 511], where libjpeg's builds disagree, is refused. `clef_image.c` includes the
 headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
 `tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header also has optional inflate and CRC32 hooks;
 cleffa supplies these through the system zlib library, preserving size and checksum validation.

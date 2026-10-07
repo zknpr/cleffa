@@ -369,7 +369,7 @@ Host-side pieces must match Python byte for byte, and they do:
 | `json.dumps` / `repr(float)` / `round()` | 404k floats, 240k roundings, 20k documents |
 | Request encoding (`encode_record`) | 3,089 requests, 43 with images (ids, spans, image runs, 3D positions) |
 | Response building (`systemone_answer`) | 1,338 responses |
-| Image decoding, resizing, normalization, patches, position interpolation | 83 PNG/JPEG images of every color type, scan layout and JPEG colour-space marking, byte-identical to PIL, torchvision and the processor |
+| Image decoding, resizing, normalization, patches, position interpolation | 92 PNG/JPEG images of every color type, scan layout, JPEG colour-space marking and quantization-table placement, byte-identical to PIL, torchvision and the processor |
 
 **Images.** The vision tower runs its 27 layers before any text is read, so operand rounding there
 compounds. Its producers retain f32 outputs. Non-residual GEMMs use compensated high/residual
@@ -763,8 +763,9 @@ differently:
   12-bit, lossless, arithmetic-coded or luma-under-chroma-sampled JPEGs, progressive JPEGs whose
   scans stop before full precision (libjpeg reconstructs those with block smoothing), JPEG
   entropy data with fill bytes before a stuffed zero (`FF FF 00`, not standard; libjpeg-turbo's
-  own result for it depends on how its input is buffered), WebP; and images over the decode
-  limits;
+  own result for it depends on how its input is buffered), JPEG blocks whose IDCT output leaves
+  [-512, 511] (no encoder was measured above 397; libjpeg-turbo's C and NEON builds decode them
+  differently), WebP; and images over the decode limits;
 - a literal `<|image_pad|>` in request text in parity mode (the reference raises later, on the
   placeholder count).
 

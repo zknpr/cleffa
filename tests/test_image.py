@@ -166,6 +166,112 @@ FF_RUN_BEFORE_STUFFED_ZERO_JPEG = (
 )
 
 
+# An 8x8 one-pixel checkerboard from libjpeg-turbo 3.2's `cjpeg -quality 3` (16-bit quantizers, SOF1).
+# Its IDCT output reaches 397 before the level shift, the largest measured over 3,692 encoder files;
+# the decoder refuses blocks beyond [-512, 511], where libjpeg-turbo's C and NEON paths disagree.
+CJPEG_Q3_CHECKER_JPEG = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCDEAELALcAyADpAMgApwELAOkA2QDpASwBGwELAT0BkAKaAbEBkAFvAW8BkAMwAkcCaAHj"
+    "ApoDxgNSA/gD6AO2A1IDpQOUBCoEsAX9BRMEKgRtBakEfgOUA6UFNQcYBUUFqQYvBmEGtAbFBrQECQUDB1sH4AdKBoIHzwX9BpMG"
+    "tAZx/9sAgxEBGwEsASwBkAFeAZADDwGxAbEDDwZxBEwDpQRMBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEG"
+    "cQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcQZxBnEGcf/BABEIAAgACAMBIgAC"
+    "EQEDEQH/xAAfAAABBQEBAQEBAQAAAAAAAAAAAQIDBAUGBwgJCgv/xAC1EAACAQMDAgQDBQUEBAAAAX0BAgMABBEFEiExQQYTUWEH"
+    "InEUMoGRoQgjQrHBFVLR8CQzYnKCCQoWFxgZGiUmJygpKjQ1Njc4OTpDREVGR0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoOE"
+    "hYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4eLj5OXm5+jp6vHy8/T19vf4+fr/xAAf"
+    "AQADAQEBAQEBAQEBAAAAAAAAAQIDBAUGBwgJCgv/xAC1EQACAQIEBAMEBwUEBAABAncAAQIDEQQFITEGEkFRB2FxEyIygQgUQpGh"
+    "scEJIzNS8BVictEKFiQ04SXxFxgZGiYnKCkqNTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqCg4SFhoeIiYqS"
+    "k5SVlpeYmZqio6Slpqeoqaqys7S1tre4ubrCw8TFxsfIycrS09TV1tfY2dri4+Tl5ufo6ery8/T19vf4+fr/2gAMAwEAAhEDEQA/"
+    "AD/P+f8AP/1iiigD/9k="
+)
+
+
+# A 7x3 progressive JPEG found by tests/fuzz_jpeg_diff.c: in Cr's first AC scan (Ss = 1, Se = 63) a run
+# passes position 63 at the end of the data. libjpeg writes that coefficient at 63 through the
+# padding of its natural order; the decoder dropped it, 29 of 63 values off by up to 18 (review #3).
+AC_FIRST_OVERSHOOT_JPEG = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAIBAQEBAQIBAQECAgICAgQDAgICAgUEBAMEBgUGBgYFBgYGBwkIBgcJBwYGCAsICQoK"
+    "CgoKBggLDAsKDAkKCgr/2wBDAQICAgICAgUDAwUKBwYHCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoK"
+    "CgoKCgoKCgr/wgARCAADAAcDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACP/EABUBAQEAAAAAAAAAAAAAAAAAAAYI/9oA"
+    "DAMBAAIQAxAAAAEuEqL/AP/EABYQAQEBAAAAAAAAAAAAAAAAAAIGE//aAAgBAQABBQKOBz//xAAaEQABBQEAAAAAAAAAAAAAAABB"
+    "ZKJiZSFB/9oACAEDAQE/AYzEOls4v//EABgRAAIDAAAAAAAAAAAAAAAAAAACBSEi/9oACAECAQE/AZfTWf/EABYQAAMAAAAAAAAA"
+    "AAAAAAAAAAAxQf/aAAgBAQAGPwJQ/8QAFhAAAwAAAAAAAAAAAAAAAAAAABEh/9oACAEBAAE/IU0n/9oADAMBAAIAAwAAABBf/8QA"
+    "FhEBAQEAAAAAAAAAAAAAAAAAMQCx/9oACAEDAQE/ECZZf//EABYRAAMAAAAAAAAAAAAAAAAAAAAhYf/aAAgBAgEBPxCgz//EABcQ"
+    "AAMBAAAAAAAAAAAAAAAAAAARMcH/2gAIAQEAAT8QdZYP/9k="
+)
+
+
+def jpeg_segments(jpeg: bytes) -> list[tuple[int, bytes]]:
+    """(marker, bytes) for each segment from SOI to EOI, entropy-coded data attached to its SOS."""
+    segs, pos = [(0xD8, jpeg[:2])], 2
+    while pos < len(jpeg):
+        assert jpeg[pos] == 0xFF
+        m = jpeg[pos + 1]
+        if m == 0xD9:
+            segs.append((m, jpeg[pos:pos + 2]))
+            break
+        end = pos + 2 + int.from_bytes(jpeg[pos + 2:pos + 4], "big")
+        if m == 0xDA:
+            while end + 1 < len(jpeg) and not (jpeg[end] == 0xFF and jpeg[end + 1] != 0x00 and not 0xD0 <= jpeg[end + 1] <= 0xD7):
+                end += 1
+        segs.append((m, jpeg[pos:end]))
+        pos = end
+    return segs
+
+
+def dqt_tables(jpeg: bytes) -> dict[int, bytes]:
+    """The 8-bit quantization tables a JPEG defines, by table id."""
+    tables = {}
+    for m, seg in jpeg_segments(jpeg):
+        off = 4
+        while m == 0xDB and off < len(seg):
+            assert seg[off] >> 4 == 0
+            tables[seg[off] & 15] = seg[off + 1:off + 65]
+            off += 65
+    return tables
+
+
+def dqt(table_id: int, values: bytes) -> bytes:
+    return bytes([0xFF, 0xDB, 0, 67, table_id]) + values
+
+
+def gray_block_jpeg(ac_symbols: list[int], scan_bits: str) -> bytes:
+    """One 8x8 gray block (SOF1, every quantizer 1). DC symbols 0-15 take 5-bit codes and the given
+    AC symbols 8-bit codes, in order; scan_bits is the entropy-coded data as a bit string."""
+    def dht(th: int, symbols: list[int], length: int) -> bytes:
+        counts = [0] * 16
+        counts[length - 1] = len(symbols)
+        body = bytes([th, *counts, *symbols])
+        return b"\xff\xc4" + (len(body) + 2).to_bytes(2, "big") + body
+    scan_bits += "1" * (-len(scan_bits) % 8)
+    data = bytes(int(scan_bits[i:i + 8], 2) for i in range(0, len(scan_bits), 8)).replace(b"\xff", b"\xff\x00")
+    return (b"\xff\xd8" + dqt(0, bytes([1] * 64)) + bytes([0xFF, 0xC1, 0, 11, 8, 0, 8, 0, 8, 1, 1, 0x11, 0]) +
+            dht(0x00, list(range(16)), 5) + dht(0x10, ac_symbols, 8) + bytes([0xFF, 0xDA, 0, 8, 1, 1, 0, 0, 63, 0]) +
+            data + b"\xff\xd9")
+
+
+def progressive_gray_block_jpeg(ac_symbols: list[int], scans: list[tuple[int, int, str]]) -> bytes:
+    """One 8x8 gray block, progressive (SOF2), every quantizer 1: a DC first scan coding a zero
+    difference, then one AC first scan per (Ss, Se, scan_bits), all with Al = 0. Tables as in
+    gray_block_jpeg."""
+    base = gray_block_jpeg(ac_symbols, "00000")
+    head = base[:base.index(b"\xff\xda")].replace(bytes([0xFF, 0xC1]), bytes([0xFF, 0xC2]), 1)
+    def scan(ss: int, se: int, bits: str) -> bytes:
+        bits += "1" * (-len(bits) % 8)
+        data = bytes(int(bits[i:i + 8], 2) for i in range(0, len(bits), 8)).replace(b"\xff", b"\xff\x00")
+        return bytes([0xFF, 0xDA, 0, 8, 1, 1, 0, ss, se, 0]) + data
+    return head + scan(0, 0, "00000") + b"".join(scan(*x) for x in scans) + b"\xff\xd9"
+
+
+def single_coefficient_jpeg(index: int, value: int) -> bytes:
+    """gray_block_jpeg holding one coefficient at zigzag index 1-15 (or DC at 0), with whatever
+    category its value needs: libjpeg accepts AC categories up to 15, not only the 10 of 8-bit data."""
+    n = abs(value).bit_length()
+    extra = format(value if value >= 0 else value + (1 << n) - 1, f"0{n}b") if n else ""
+    if index == 0:
+        return gray_block_jpeg([0x00], format(n, "05b") + extra + "0" * 8)
+    sym = ((index - 1) << 4) | n
+    return gray_block_jpeg([0x00, sym], "00000" + format(1, "08b") + extra + "0" * 8)
+
+
 def with_fill_bytes(jpeg: bytes) -> bytes:
     """The same JPEG with one 0xFF fill byte before every marker after SOI, which the format allows
     and libjpeg skips. The vendored decoder stepped over "FF FF" as a pair and so lost the marker's
@@ -393,6 +499,35 @@ def main() -> None:
                 data = with_colour_markers(buf.getvalue(), **kw)
                 cases.append((f"colour-{vname}{'-prog' if prog else ''}", base64.b64encode(data).decode(),
                               Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
+        # Quantization tables are latched per component at its first scan, as libjpeg does: a table
+        # redefined after the first scan of a progressive file must not change it, and one defined
+        # between the frame and the scan is in time (review #3, Codex on 3f3eb03). AC categories above
+        # 10 and run/size symbols with size 0 decode as libjpeg decodes them; the IDCT output at 511
+        # and the cjpeg quality-3 checkerboard (397) stay inside the decoder's range.
+        prog = io.BytesIO()
+        Image.fromarray(synth(np.random.default_rng(43), 16, 24)).save(prog, "JPEG", quality=80, progressive=True)
+        segs = jpeg_segments(prog.getvalue())
+        first_sos = next(i for i, (m, _) in enumerate(segs) if m == 0xDA)
+        redefined = b"".join(s for _, s in segs[:first_sos + 1]) + dqt(0, bytes([1] * 64)) + b"".join(s for _, s in segs[first_sos + 1:])
+        base = io.BytesIO()
+        Image.fromarray(synth(np.random.default_rng(47), 16, 16)).convert("L").save(base, "JPEG", quality=75)
+        segs = [x for x in jpeg_segments(base.getvalue()) if x[0] != 0xDB]
+        sof = next(i for i, (m, _) in enumerate(segs) if m == 0xC0)
+        late_dqt = b"".join(s for _, s in segs[:sof + 1]) + dqt(0, dqt_tables(base.getvalue())[0]) + b"".join(s for _, s in segs[sof + 1:])
+        for name, data in (("dqt-redefined-after-scan", redefined), ("dqt-after-frame", late_dqt),
+                           ("ac-category-11", single_coefficient_jpeg(1, 1024)),
+                           ("ac-run3-size0", gray_block_jpeg([0x30], "00000" + "0" * 8)),
+                           ("idct-511", single_coefficient_jpeg(0, 4088)),
+                           ("cjpeg-q3-checker", base64.b64decode(CJPEG_Q3_CHECKER_JPEG)),
+                           # Runs that pass the band's end: libjpeg writes the coefficient at zigzag
+                           # position k, or 63 past the table, and ends the band, without a warning.
+                           # The decoder dropped it at the end of the data and refused the file
+                           # elsewhere (tests/fuzz_jpeg_diff.c).
+                           ("ac-first-overshoot-fuzz", base64.b64decode(AC_FIRST_OVERSHOOT_JPEG)),
+                           ("ac-first-overshoot-band", progressive_gray_block_jpeg(
+                               [0x00, 0xA1], [(1, 5, "00000001" + "1"), (6, 63, "00000000")])),
+                           ("baseline-overshoot-63", gray_block_jpeg([0x00, 0xF1], "00000" + ("00000001" + "1") * 4 + "00000000"))):
+            cases.append((name, base64.b64encode(data).decode(), Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
         lines = [json.dumps({"image": b64, "out": f"{tmp}/{name}", "min_pixels": mn, "max_pixels": mx})
                  for name, b64, _, mn, mx in cases]
         results = run_tool(lines)
@@ -472,6 +607,30 @@ def main() -> None:
             data = cut.getvalue()
             bad.append(json.dumps({"image": base64.b64encode(data[:data.index(b"\xff\xda")] + b"\xff\xd9").decode(),
                                    "out": f"{tmp}/bad-no-scan{i}"}))
+        # A quantization table that is not defined when its component's first scan starts: libjpeg
+        # fails with JERR_NO_QUANT_TABLE, and the decoder used the zero-filled slot, a flat gray image.
+        # And blocks whose IDCT output leaves [-512, 511]: libjpeg-turbo's C path wraps 512 to black
+        # where its NEON path (Pillow on this Mac) clamps, and a category-15 AC coefficient decoded
+        # 128 levels from Pillow (review #3, Codex on 3f3eb03). 513 is refused although Pillow here
+        # clamps it: no wider range is stable across libjpeg builds.
+        gray = base.getvalue()
+        segs = jpeg_segments(gray)
+        no_dqt = b"".join(s for m, s in segs if m != 0xDB)
+        wrong_id = b"".join(dqt(1, dqt_tables(gray)[0]) if m == 0xDB else s for m, s in segs)
+        after_scan = b"".join(s for m, s in segs if m not in (0xDB, 0xD9)) + dqt(0, bytes([1] * 64)) + b"\xff\xd9"
+        colour = io.BytesIO()
+        Image.fromarray(synth(np.random.default_rng(53), 16, 24)).save(colour, "JPEG", quality=80, progressive=True)
+        tables, segs = dqt_tables(colour.getvalue()), [x for x in jpeg_segments(colour.getvalue()) if x[0] != 0xDB]
+        first_sos = next(i for i, (m, _) in enumerate(segs) if m == 0xDA)
+        sof = next(s for m, s in segs if m == 0xC2)
+        if 1 not in tables or segs[first_sos][1][4] != 3 or sof[9] != 3 or (sof[12], sof[15], sof[18]) != (0, 1, 1):
+            sys.exit("late-table fixture: expected an interleaved first scan of three components, chroma on table 1")
+        late_table1 = (segs[0][1] + dqt(0, tables[0]) + b"".join(s for _, s in segs[1:first_sos + 1]) + dqt(1, tables[1]) +
+                       b"".join(s for _, s in segs[first_sos + 1:]))
+        for name, data in (("no-dqt", no_dqt), ("dqt-wrong-id", wrong_id), ("dqt-after-scan", after_scan),
+                           ("dqt1-after-first-scan", late_table1), ("ac-category-15", single_coefficient_jpeg(1, 16384)),
+                           ("idct-513", single_coefficient_jpeg(0, 4104))):
+            bad.append(json.dumps({"image": base64.b64encode(data).decode(), "out": f"{tmp}/bad-{name}"}))
         raw = b"\0\x10\x20\x30"   # one RGB scanline, including its filter byte
         stream = zlib.compress(raw)
         corrupt_checksum = stream[:-1] + bytes([stream[-1] ^ 1])
@@ -493,7 +652,7 @@ def main() -> None:
         # the crafted JPEGs' unmodified sources still decode, and PIL reads the unusual sampling layout
         Image.open(io.BytesIO(base64.b64decode(LUMA_UNDER_CHROMA_JPEG))).load()
         print("errors: bad base64, truncated PNG, aspect ratio, 16-bit PNG, a non-base64 data URL, a progressive scan "
-              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, seven malformed zlib "
+              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
               "streams and three corrupt CRCs rejected"
               if not failures else "errors: see above")
     sys.exit(1 if failures else 0)

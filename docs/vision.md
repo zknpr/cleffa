@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; and 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded) | 83/83 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band) | 92/92 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -254,6 +254,44 @@ minutes with 14 workers with no pixel difference, sanitizer report, out-of-memor
 (`golden/fuzz-image-2026-10-07/diff-run5.log`; the old build's corpus failures and the cut files
 are in `review6/` there). The encoder corpus now has 1,759 files, 1,613 of them comparable and
 identical.
+
+A seventh round (Codex on `3f3eb03`) raised two points, measured against Pillow and libjpeg-turbo
+3.2's `djpeg` on crafted files before any change. (25) Confirmed: a quantization table that is not
+defined when its component's first scan starts (no DQT, a DQT for another id, or one only after
+the scan) decoded from the zero-filled slot as flat gray, where libjpeg fails with
+`JERR_NO_QUANT_TABLE` and Pillow refuses the file. Checking that also showed a parity bug Codex did
+not name: libjpeg latches each component's table at its first scan (`latch_quant_tables`), so a
+DQT redefining it between progressive scans does not apply, but the decoder dequantized with the
+last table defined, 1,146 values off by up to 114. Tables are now required and latched per
+component at the first scan. (26) Refuted as stated: libjpeg does not reject AC symbols above
+category 10; it decodes them, and the engine already matched it on category 11 and on run/size
+symbols with size 0. Category 15 did differ, by up to 128 levels, because its IDCT output was far
+outside the pixel range, the class the differential fuzzer had excluded. Refusing large categories
+would also have refused files that match. Instead, a block whose IDCT output leaves [-512, 511]
+is now refused. Measured with libjpeg-turbo 3.2, that is the range where its builds agree: the C
+path (`JSIMD_FORCENONE=1`) wraps an output of 512 to black, while the NEON path, which Pillow uses
+on this Mac, clamps to about +-1,024 and then wraps differently. The first threshold tried,
+[-384, 383] (the fuzzer's old exclusion), refused 15 `cjpeg -quality 3` checkerboards that
+decoded identically. Over 3,692 files, from the encoder corpus and 40 photographs found on this
+Mac re-encoded at quality 1 to 100 by Pillow and cjpeg, the largest output was 397, and 2,640
+harsher synthetic encodes were all accepted. Sweeps of one- and two-coefficient blocks, with
+outputs up to about 7,300, found no accepted file that differs from Pillow; the previous build
+differed from about 1,024. The
+range check also stops `tests/test_jpeg_ub.c` cases 3 and 4, now expected refusals; case 3 still
+runs the whole 64-bit IDCT under UBSan, and case 4's long DC accumulation can no longer be reached
+through a baseline file. The fuzzer's range exclusion is gone, so it now compares every file the
+decoder accepts. Its first run under that rule (15 minutes, 14 workers, 57.8 million inputs) found
+a 7x3 progressive file 805 seconds in, 29 of 63 values off by up to 18, that libjpeg's C and NEON
+paths and Pillow all decode alike: in Cr's first AC scan a run passed position 63 at the end of the
+data. libjpeg's `decode_mcu_AC_first` writes such a coefficient at `natural_order[k]`, a real
+position when k is past Se but within 63 and position 63 through the table's padding beyond it,
+then ends the band, without a warning; the decoder dropped it at the end of the data and refused
+the file anywhere else. Baseline `decode_mcu` writes the same way past 63, which the decoder also
+refused. Both now write where libjpeg does (refinement scans already did). `tests/test_image.py`
+keeps the fuzz file and two crafted single blocks, a progressive run ending past Se = 5 and a
+baseline run past 63; the old build differs on the first and refuses the others. A second
+15-minute run on the final decoder executed 67.7 million inputs, every accepted file compared,
+with no finding. Evidence: `golden/fuzz-image-2026-10-07/review7/`.
 
 ## Numerical parity
 

@@ -69,8 +69,9 @@
  *   - SOF1 (extended sequential, 8-bit) decodes as baseline: libjpeg writes it whenever a
  *     quantizer exceeds 255, and it was refused;
  * and, found by tests/fuzz_jpeg_diff.c against libjpeg:
- *   - a refinement run overshooting Se writes its new coefficient at Se + 1 (or 63), as
- *     libjpeg does through its padded natural order;
+ *   - a refinement run overshooting Se writes its new coefficient at Se + 1 (or 63), and a
+ *     first-scan or baseline run overshooting Se (or 63) writes its coefficient at k (or 63),
+ *     as libjpeg does through its padded natural order;
  *   - an incomplete progressive image, which libjpeg would reconstruct with block smoothing,
  *     is refused (libjpeg's smoothing_ok() condition);
  *   - a one-component frame decodes as 1x1 whatever sampling factors it declares, as libjpeg
@@ -78,6 +79,10 @@
  *   - three components are RGB-coded, and copied, under libjpeg's rule (no JFIF marker, and an
  *     Adobe transform of 0 or, without one, component ids 'R','G','B'); a progressive frame
  *     with no scan is refused, as libjpeg's JERR_SOF_NO_SOS;
+ *   - each component's quantization table must be defined by its first scan and is latched
+ *     there, as libjpeg does; a block with a dequantized coefficient beyond 16 bits or an IDCT
+ *     output beyond [-512, 511] is refused, since libjpeg wraps such outputs where this decoder
+ *     clamps;
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
  *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
  *     result for it depends on how its input is buffered. */
@@ -257,6 +262,9 @@ typedef struct {
 
     /* Quantization tables (up to 4) */
     uint16_t qt[4][64];
+    unsigned qt_defined;     /* cleffa: bit t set once a DQT defined qt[t] */
+    uint16_t comp_qt[4][64]; /* cleffa: each component's table, latched at its first scan */
+    unsigned qt_latched;     /* cleffa: bit c set once comp_qt[c] is latched */
 
     /* Huffman tables (DC: 0-1, AC: 2-3) */
     jpeg_huff_table huff[4];
@@ -456,19 +464,20 @@ static int jpeg_extend(int v, int bits) {
  * Inverse DCT
  * ======================================================================== */
 
-/* cleffa: test hook, a no-op unless defined. tests/fuzz_jpeg_diff.c uses it to learn when a
- * dequantized coefficient or an IDCT output leaves the range real encoders produce: libjpeg masks
- * such IDCT outputs with its range-limit table (wrapping outside about [-512, 511]) where this
- * decoder clamps, and its SIMD paths need not match its C path there, so those inputs are not
- * compared pixel for pixel. */
-#ifndef JPEG_RANGE_HOOK
-#define JPEG_RANGE_HOOK(out_of_range) ((void)0)
-#endif
-#define JPEG_IDCT_OUT(v) (JPEG_RANGE_HOOK((v) < -384 || (v) > 383), (uint8_t)JPEG_CLAMP((v) + 128))
+/* cleffa: jpeg_idct reports a block whose dequantized coefficients leave 16 bits or whose output
+ * leaves [-512, 511] before the level shift, and the file is refused. This decoder clamps; libjpeg
+ * clamps only inside that range and its builds disagree outside it: measured with libjpeg-turbo
+ * 3.2, the C path (JSIMD_FORCENONE=1) wraps an output of 512 to black, while the NEON path that
+ * Pillow uses on this Mac clamps to about +-1024 and then wraps differently. An AC coefficient of
+ * category 15 decoded 128 levels from Pillow (review #3, Codex on 3f3eb03). Encoder output stays
+ * well inside: the largest over 3,692 files from cjpeg, jpegtran, sips, ffmpeg and Pillow,
+ * photographs among them at quality 1 to 100, was 397 (docs/vision.md). */
+#define JPEG_IDCT_OUT(v) (out_of_range |= ((v) < -512 || (v) > 511), (uint8_t)JPEG_CLAMP((v) + 128))
 
 /* Fast integer IDCT using AAN algorithm (Arai, Agui, Nakajima 1988) */
-static void jpeg_idct(int *block, uint8_t *out, int stride) {
-    for (int i = 0; i < 64; i++) JPEG_RANGE_HOOK(block[i] < -32768 || block[i] > 32767);
+static int jpeg_idct(int *block, uint8_t *out, int stride) {
+    int out_of_range = 0;
+    for (int i = 0; i < 64; i++) if (block[i] < -32768 || block[i] > 32767) out_of_range = 1;
     /* cleffa: 64-bit like libjpeg's JLONG here; a dequantized coefficient may be near 2^31 */
     int64_t tmp0, tmp1, tmp2, tmp3;
     int64_t tmp10, tmp11, tmp12, tmp13;
@@ -634,6 +643,7 @@ static void jpeg_idct(int *block, uint8_t *out, int stride) {
     #undef FIX_2_053
     #undef FIX_2_562
     #undef FIX_3_072
+    return out_of_range;
 }
 
 /* ========================================================================
@@ -646,7 +656,7 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
     int ac_idx = dec->comp[comp_idx].ac_idx;
     jpeg_huff_table *dc_huff = &dec->huff[dc_idx];
     jpeg_huff_table *ac_huff = &dec->huff[ac_idx + 2];
-    uint16_t *qt = dec->qt[dec->comp[comp_idx].qt_idx];
+    uint16_t *qt = dec->comp_qt[comp_idx];
 
     memset(block, 0, 64 * sizeof(int));
 
@@ -683,11 +693,13 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
             }
         } else {
             k += run;
-            if (k >= 64) return -1;
+            /* cleffa: past 63, libjpeg's decode_mcu writes through the padding of its natural
+             * order, at 63, and the block ends; this was refused. */
 
             int ac_val = jpeg_get_bits(&dec->bs, size);
             if (ac_val < 0) return -1;
             ac_val = jpeg_extend(ac_val, size);
+            if (k > 63) k = 63;
 
             block[jpeg_zigzag[k]] = ac_val * qt[k];
             k++;
@@ -817,7 +829,7 @@ static int jpeg_decode_scan(jpeg_decoder *dec, uint8_t *y_data, uint8_t *cb_data
             for (int v = 0; v < dec->comp[0].v_samp; v++) {
                 for (int h = 0; h < dec->comp[0].h_samp; h++) {
                     if (jpeg_decode_block(dec, 0, block) < 0) return -1;
-                    jpeg_idct(block, block_out, 8);
+                    if (jpeg_idct(block, block_out, 8)) return -1;
 
                     /* Copy to Y plane */
                     int bx = mcu_x * dec->comp[0].h_samp * 8 + h * 8;
@@ -843,7 +855,7 @@ static int jpeg_decode_scan(jpeg_decoder *dec, uint8_t *y_data, uint8_t *cb_data
                 for (int v = 0; v < dec->comp[1].v_samp; v++) {
                     for (int h = 0; h < dec->comp[1].h_samp; h++) {
                         if (jpeg_decode_block(dec, 1, block) < 0) return -1;
-                        jpeg_idct(block, block_out, 8);
+                        if (jpeg_idct(block, block_out, 8)) return -1;
 
                         int bx = mcu_x * dec->comp[1].h_samp * 8 + h * 8;
                         int by = mcu_y * dec->comp[1].v_samp * 8 + v * 8;
@@ -866,7 +878,7 @@ static int jpeg_decode_scan(jpeg_decoder *dec, uint8_t *y_data, uint8_t *cb_data
                 for (int v = 0; v < dec->comp[2].v_samp; v++) {
                     for (int h = 0; h < dec->comp[2].h_samp; h++) {
                         if (jpeg_decode_block(dec, 2, block) < 0) return -1;
-                        jpeg_idct(block, block_out, 8);
+                        if (jpeg_idct(block, block_out, 8)) return -1;
 
                         int bx = mcu_x * dec->comp[2].h_samp * 8 + h * 8;
                         int by = mcu_y * dec->comp[2].v_samp * 8 + v * 8;
@@ -972,10 +984,11 @@ static int jpeg_prog_decode_ac_first(jpeg_decoder *dec, int comp_idx, int16_t *c
             }
         } else {
             k += run;
-            if (k > dec->se || k > 63) {   /* cleffa: never index past the zigzag table */
-                if (dec->bs.eof) return 0;
-                return -1;
-            }
+            /* cleffa: a run that overshoots Se still writes its coefficient, at zigzag position
+             * k, or 63 once k passes the table, and ends the band: libjpeg's
+             * decode_mcu_AC_first indexes its padded natural order without a check or a
+             * warning. The decoder dropped the coefficient at the end of the data and refused
+             * the file elsewhere (tests/fuzz_jpeg_diff.c; one Cr coefficient of 6 was lost). */
 
             int ac_val = jpeg_get_bits(&dec->bs, size);
             if (ac_val < 0) {
@@ -983,6 +996,7 @@ static int jpeg_prog_decode_ac_first(jpeg_decoder *dec, int comp_idx, int16_t *c
                 return -1;
             }
             ac_val = jpeg_extend(ac_val, size);
+            if (k > 63) k = 63;
 
             coef[jpeg_zigzag[k]] = (int16_t)(ac_val * (1 << dec->al));
             k++;
@@ -1233,14 +1247,14 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
 }
 
 /* Convert progressive coefficients to pixels */
-static void jpeg_prog_finish(jpeg_decoder *dec, uint8_t **planes, int *strides) {
+static int jpeg_prog_finish(jpeg_decoder *dec, uint8_t **planes, int *strides) {
     int block[64];
     uint8_t block_out[64];
 
     for (int comp_idx = 0; comp_idx < dec->num_components; comp_idx++) {
         int blocks_x = dec->comp[comp_idx].blocks_x;
         int blocks_y = dec->comp[comp_idx].blocks_y;
-        uint16_t *qt = dec->qt[dec->comp[comp_idx].qt_idx];
+        uint16_t *qt = dec->comp_qt[comp_idx];
         int stride = strides[comp_idx];
 
         for (int by = 0; by < blocks_y; by++) {
@@ -1255,7 +1269,7 @@ static void jpeg_prog_finish(jpeg_decoder *dec, uint8_t **planes, int *strides) 
                 }
 
                 /* IDCT */
-                jpeg_idct(block, block_out, 8);
+                if (jpeg_idct(block, block_out, 8)) return -1;
 
                 /* Copy to output plane */
                 int px = bx * 8;
@@ -1272,6 +1286,7 @@ static void jpeg_prog_finish(jpeg_decoder *dec, uint8_t **planes, int *strides) 
             }
         }
     }
+    return 0;
 }
 
 /* ========================================================================
@@ -1479,6 +1494,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                     }
                     off += 128;
                 }
+                dec.qt_defined |= 1u << tq;
             }
 
         } else if ((marker == 0xE0 || marker == 0xEE) && !dec.scans_seen) {
@@ -1552,6 +1568,19 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 const bool ac = !dec.is_progressive || dec.ss != 0;
                 if (dc && !(dec.huff_defined & (1u << dec.comp[ci].dc_idx))) goto fail;
                 if (ac && !(dec.huff_defined & (1u << (dec.comp[ci].ac_idx + 2)))) goto fail;
+            }
+            /* cleffa: libjpeg copies a component's quantization table at the component's first
+             * scan and fails if it is not defined by then (jdinput.c latch_quant_tables,
+             * JERR_NO_QUANT_TABLE); a later DQT for the same slot does not change it. A file
+             * with no table decoded from the zero-filled slot as flat gray, and a progressive
+             * file was dequantized with whatever table the last DQT left (review #3, Codex on
+             * 3f3eb03). */
+            for (int i = 0; i < ns; i++) {
+                const int ci = scan_comps[i];
+                if (dec.qt_latched & (1u << ci)) continue;
+                if (!(dec.qt_defined & (1u << dec.comp[ci].qt_idx))) goto fail;
+                memcpy(dec.comp_qt[ci], dec.qt[dec.comp[ci].qt_idx], sizeof(dec.comp_qt[ci]));
+                dec.qt_latched |= 1u << ci;
             }
 
             /* Setup bitstream for scan data */
@@ -1704,7 +1733,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         {
             int smooth = 0, possible = 1;
             for (int ci = 0; ci < dec.num_components && possible; ci++) {
-                const uint16_t *q = dec.qt[dec.comp[ci].qt_idx];
+                const uint16_t *q = dec.comp_qt[ci];
                 if (dec.coef_bits[ci][0] < 0) possible = 0;
                 for (int k = 0; k < 10 && possible; k++) if (q[k] == 0) possible = 0;
                 for (int k = 1; k < 10; k++) if (dec.coef_bits[ci][k] != 0) smooth = 1;
@@ -1714,7 +1743,10 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 goto fail;
             }
         }
-        jpeg_prog_finish(&dec, planes, strides);
+        if (jpeg_prog_finish(&dec, planes, strides) < 0) {
+            for (int i = 0; i < dec.num_components; i++) free(planes[i]);
+            goto fail;
+        }
 
         /* Create output image */
         int out_channels = (dec.num_components == 1) ? 1 : 3;

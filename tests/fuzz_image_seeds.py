@@ -70,4 +70,16 @@ for prog in (False, True):
     Image.fromarray(arr(17, 33, 3)).save(buf, "JPEG", quality=85, subsampling=2, progressive=prog)
     save(test_image.with_colour_markers(buf.getvalue(), jfif=False, adobe=0), f"adobe0{'-prog' if prog else ''}.jpg")
     save(test_image.with_colour_markers(buf.getvalue(), jfif=False, ids=b"RGB"), f"rgb-ids{'-prog' if prog else ''}.jpg")
+# Single blocks at the IDCT range boundary and with AC categories above 10, and a progressive file
+# whose quantization table is redefined after its first scan (review #3, Codex on 3f3eb03)
+for name, data in (("idct-511", test_image.single_coefficient_jpeg(0, 4088)), ("idct-513", test_image.single_coefficient_jpeg(0, 4104)),
+                   ("ac-category-11", test_image.single_coefficient_jpeg(1, 1024)), ("ac-category-15", test_image.single_coefficient_jpeg(5, 16384))):
+    save(data, f"{name}.jpg")
+buf = io.BytesIO()
+Image.fromarray(arr(16, 24, 3)).save(buf, "JPEG", quality=80, progressive=True)
+segs = test_image.jpeg_segments(buf.getvalue())
+first = next(i for i, (m, _) in enumerate(segs) if m == 0xDA)
+save(b"".join(x for _, x in segs[:first + 1]) + test_image.dqt(0, bytes([1] * 64)) + b"".join(x for _, x in segs[first + 1:]),
+     "dqt-redefined-after-scan.jpg")
+save(base64.b64decode(test_image.AC_FIRST_OVERSHOOT_JPEG), "ac-first-overshoot-fuzz.jpg")
 print(f"{n} seeds in {out}")

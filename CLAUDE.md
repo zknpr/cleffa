@@ -57,11 +57,13 @@ make clean
   header bounds, luma must be the most sampled component, scans may only use defined Huffman
   tables and name each component once, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT,
   single-component progressive DC scans in raster order, libjpeg's h1v2 (4:4:0) upsampling, SOF1
-  as baseline, libjpeg's write for an overshooting refinement run, refusal of progressive images
+  as baseline, libjpeg's write for a run overshooting its band (refinement, first scan or baseline), refusal of progressive images
   libjpeg would smooth, fill bytes before markers skipped one at a time, `FF FF 00` in entropy
   data refused (libjpeg-turbo's result for it is not stable), one-component frames as 1x1,
   three-component frames copied as RGB under libjpeg's JFIF/Adobe/component-id rule, a progressive
-  frame with no scan refused, a no-op `JPEG_RANGE_HOOK` for the differential fuzzer) and
+  frame with no scan refused, quantization tables required by and latched at each component's
+  first scan, blocks with IDCT output beyond [-512, 511] refused because libjpeg's C and NEON paths
+  disagree there) and
   optional PNG inflate/CRC hooks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
