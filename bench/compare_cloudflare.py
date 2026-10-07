@@ -44,6 +44,15 @@ def distribution(answer: dict, option_ids: list[str], planned_type: str) -> dict
     return {k: result[k] for k in option_ids}
 
 
+def score_value(answer: dict, option_ids: list[str]) -> float:
+    """A score answer's `score`: a finite number within the option range, or an error. The
+    value is recorded as evidence, so an impossible one must not be published."""
+    score = answer.get("score")
+    if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= len(option_ids) - 1:
+        raise ValueError("Invalid score")
+    return score
+
+
 def decision(answer: dict, probs: dict[str, float]) -> str:
     if answer.get("type") == "choice":
         choice = answer["choice"]
@@ -163,10 +172,12 @@ def compare(path: Path, local_dir: Path | None) -> dict:
                     comparison["local_decision"] = decision(answer, comparison["local"])
                     comparison["local_confidence"] = answer.get("confidence")
                 if planned_type == "score":
+                    for a in answers:
+                        score_value(a, options)   # every pass, like the probabilities
                     comparison["hosted_score"] = answers[0]["score"]
                     comparison["fp32_score"] = sum(int(k) * p for k, p in fp32.items())
                     if local:
-                        comparison["local_score"] = local[i]["answers"][qid]["score"]
+                        comparison["local_score"] = score_value(local[i]["answers"][qid], options)
                 comparisons.append(comparison)
         pairs = [("hosted", "fp32")]
         if local:

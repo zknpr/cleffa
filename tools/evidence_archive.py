@@ -444,6 +444,7 @@ def collect_below(golden: Path, root_fd: int):
     included, excluded = [], {}
     total = 0
     seen: list[tuple[str, frozenset[str], tuple[int, int]]] = []
+    snapshots: list[tuple[Path, tuple[int, int, int, int]]] = []   # what each included file was when read
     for dirpath, dirnames, filenames in os.walk(golden, onerror=walk_error):
         st = os.stat(dirpath, follow_symlinks=False)
         seen.append((dirpath, frozenset(dirnames) | frozenset(filenames), (st.st_dev, st.st_ino)))
@@ -481,6 +482,7 @@ def collect_below(golden: Path, root_fd: int):
             if total > MAX_TOTAL:
                 raise SystemExit(f'included evidence exceeds MAX_TOTAL ({MAX_TOTAL} bytes) at {path}')
             included.append((path.relative_to(golden).as_posix(), path, data, rewritten, source))
+            snapshots.append((path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)))
     # Quiescence: a file created or removed after its directory was enumerated is seen by no
     # per-file check, and the manifest would describe neither the tree at the start nor at the
     # end. Every enumerated directory must still be the same directory with the same entries
@@ -493,6 +495,17 @@ def collect_below(golden: Path, root_fd: int):
             raise SystemExit(f'{dirpath}: cannot re-list: {e.strerror}')
         if (st.st_dev, st.st_ino) != ident or now != listed:
             raise SystemExit(f'{dirpath} changed during collection')
+    # An in-place overwrite of a file already read leaves its directory's entries unchanged, so
+    # every included file must still have the identity, size and mtime it was read with once
+    # the whole tree has been collected (review #72). A rewrite that restores all three is
+    # beyond this check; the archive describes files, not a filesystem snapshot.
+    for path, ident in snapshots:
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError as e:
+            raise SystemExit(f'{path}: cannot re-stat: {e.strerror}')
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != ident:
+            raise SystemExit(f'{path} changed after it was read')
     return included, excluded
 
 

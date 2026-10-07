@@ -248,9 +248,10 @@ class EvidenceArchive(unittest.TestCase):
         with patch.object(ea.os, 'fstat', fstat_mutating_between), self.assertRaises(SystemExit):
             ea.build(self.root, Path(self.tmp.name) / 'changing.tar.gz', 'ev')
 
-    def test_manifest_describes_the_bytes_archived(self):
-        # If a source changes after it was read, the manifest must still describe the bytes that
-        # were archived, not the current file.
+    def test_source_changing_after_its_read_aborts(self):
+        # A source that changes after it was read used to be archived as read, with the
+        # manifest describing those bytes. Now the build refuses: the archived bytes would come
+        # from one revision of the tree and files read later from another.
         target = self.root / 'gemm-probe-20261004' / 'run.py'
         original = target.read_bytes()
         real = ea.prepare
@@ -262,13 +263,13 @@ class EvidenceArchive(unittest.TestCase):
             return result
 
         ea.prepare = prepare_then_mutate
+        out = Path(self.tmp.name) / 'prov.tar.gz'
         try:
-            manifest = ea.build(self.root, Path(self.tmp.name) / 'prov.tar.gz', 'ev')
+            with self.assertRaisesRegex(SystemExit, 'changed after it was read'):
+                ea.build(self.root, out, 'ev')
         finally:
             ea.prepare = real
-        entry = next(e for e in manifest['files'] if e['path'] == 'gemm-probe-20261004/run.py')
-        self.assertEqual(entry['source_sha256'], hashlib.sha256(original).hexdigest())
-        self.assertEqual(entry['source_bytes'], len(original))
+        self.assertFalse(out.exists())
 
     def test_final_scan_fails_closed(self):
         # A token-like line is excluded by the pre-filter; if the pre-filter is bypassed, the
@@ -564,6 +565,22 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/basic-unpadded.log', names)
         self.assertNotIn('gemm-probe-20261004/basic.json', names)
         self.assertIn('gemm-probe-20261004/prose.md', names)
+
+    def test_file_overwritten_after_its_read_aborts(self):
+        # An in-place overwrite of an already-collected file leaves the directory's entries and
+        # inode unchanged; the archived bytes would then come from one revision and files read
+        # later from another.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        real = ea.classify
+
+        def overwrite_earlier(golden, path):
+            verdict = real(golden, path)
+            if path == exp / 'run.py':   # sorted after result.json, which has been read by now
+                (exp / 'result.json').write_text('{"ms": 9.5}')
+            return verdict
+        with patch.object(ea, 'classify', overwrite_earlier), self.assertRaisesRegex(SystemExit, 'changed after it was read'):
+            ea.build(self.root, Path(self.tmp.name) / 'overwrite.tar.gz', 'ev')
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

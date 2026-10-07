@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
-from compare_cloudflare import decision, distribution, load_hosted
+from compare_cloudflare import decision, distribution, load_hosted, score_value
 
 
 class ComparisonTests(unittest.TestCase):
@@ -31,6 +31,16 @@ class ComparisonTests(unittest.TestCase):
             with self.subTest(answer=answer, planned=planned), self.assertRaises(ValueError):
                 distribution(answer, list(probs), planned)
         self.assertEqual(distribution({"type": "score", "probabilities": probs}, ["a", "b"], "score"), probs)
+
+    def test_score_must_be_a_finite_number_within_the_option_range(self):
+        # A score answer's `score` is recorded as evidence; a string, a boolean, NaN or a value
+        # outside the option range must be an error, not a published number.
+        options = ["0", "1", "2"]
+        for score in ["1", True, float("nan"), float("inf"), -0.5, 2.5, 999, None]:
+            with self.subTest(score=score), self.assertRaises(ValueError):
+                score_value({"type": "score", "score": score}, options)
+        self.assertEqual(score_value({"type": "score", "score": 1.25}, options), 1.25)
+        self.assertEqual(score_value({"type": "score", "score": 2}, options), 2)
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")
