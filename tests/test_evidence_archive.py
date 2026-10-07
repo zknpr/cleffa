@@ -161,8 +161,7 @@ class EvidenceArchive(unittest.TestCase):
         by_path = {e['path']: e for e in manifest['files']}
         self.assertTrue(by_path['gemm-probe-20261004/result.json']['rewritten'])
         self.assertFalse(by_path['gemm-probe-20261004/run.py']['rewritten'])
-        self.assertNotEqual(by_path['gemm-probe-20261004/result.json']['sha256'],
-                            by_path['gemm-probe-20261004/result.json']['source_sha256'])
+        self.assertNotIn('source_sha256', by_path['gemm-probe-20261004/result.json'])
         ex = manifest['excluded_counts']
         self.assertNotIn('gemm-probe-20261004/calls.jsonl', names)  # account ID inside a recorded URL
         self.assertNotIn('gemm-probe-20261004/latin.log', names)  # undecodable text is never archived raw
@@ -1001,6 +1000,32 @@ class EvidenceArchive(unittest.TestCase):
         names = {e['path'] for e in manifest['files']}
         for d in dirs:
             self.assertNotIn(f'gemm-probe-20261004/{d}/data.json', names, d)
+
+    def test_punctuation_leading_authorization_values_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'slash.log': 'Authorization: Bearer /abc1234\n', 'under.log': 'Authorization: token _abc1234\n',
+                  'dash.log': 'Authorization: -abc1234\n', 'plus.json': '{"Authorization": "Bearer +abc1234"}'}
+        kept = {'tmpl4.py': 'headers = {"Authorization": f"Bearer {api_token}"}\n',
+                'doc4.md': 'Authorization: required, see the deployment notes.\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'punctauth.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_manifest_publishes_no_digest_of_original_bytes(self):
+        # A digest of the pre-rewrite bytes is an offline oracle for the replaced values, which
+        # are low-entropy (a username, a path): a reader could hash candidates and compare.
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'nodigest.tar.gz', 'ev')
+        for entry in manifest['files']:
+            self.assertNotIn('source_sha256', entry, entry['path'])
+            self.assertNotIn('source_bytes', entry, entry['path'])
+        rewritten = next(e for e in manifest['files'] if e['path'] == 'gemm-probe-20261004/result.json')
+        self.assertTrue(rewritten['rewritten'])
+        self.assertIn('sha256', rewritten)
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

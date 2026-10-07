@@ -90,17 +90,25 @@ class ComparisonTests(unittest.TestCase):
         payload = {"questions": {"q": {"type": "noul"}}}
         digest = hashlib.sha256(json.dumps(payload).encode()).hexdigest()
         plan = {"type": "plan", "passes": 2, "planned_calls": 3, "requests": [
-            {"model": "clef", "id": "r000", "request": payload, "request_sha256": digest}]}
+            {"model": "clef", "id": "r000", "request": payload, "request_sha256": digest, "full_input_tokens": 4}]}
+        answer = {"answers": {"q": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 4}}
         calls = [{"type": "call", "model": "clef", "id": "r000", "pass": p,
                   "status": 200, "warmup": p == -1, "request_sha256": digest,
-                  "answer": {"answers": {"q": {"type": "noul", "noul": 0.9}}}}
+                  "response": {"result": answer, "success": True, "errors": []},
+                  "answer": answer, "reported_input_tokens": 4, "full_input_reported": True}
                  for p in [-1, 0, 1]]
         complete = {"type": "complete"}
         good = [plan, *calls, complete]
+        # The duplicated fields must be what response_info() derives from the recorded body: a
+        # substituted answer or token count is rejected, not trusted.
+        other = {"answers": {"q": {"type": "noul", "noul": 0.1}}, "usage": {"input_tokens": 4}}
         bad = [[plan, *calls], [plan, *calls[:-1], complete],
                [plan, *calls, calls[-1], complete],
                [plan, *calls[:-1], {**calls[-1], "error": "failure"}, complete],
-               [plan, *calls[:-1], {**calls[-1], "request_sha256": "wrong"}, complete]]
+               [plan, *calls[:-1], {**calls[-1], "request_sha256": "wrong"}, complete],
+               [plan, *calls[:-1], {**calls[-1], "answer": other}, complete],
+               [plan, *calls[:-1], {**calls[-1], "reported_input_tokens": 9}, complete],
+               [plan, *calls[:-1], {**calls[-1], "full_input_reported": False}, complete]]
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "reference.jsonl"
             for records in [good, *bad]:

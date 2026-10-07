@@ -156,7 +156,7 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 STRONG = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD'
 # A TOML or Python triple-quoted value, which may span lines (review #101).
 TRIPLE = r'"""(?:(?!""")[\s\S]){4,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){4,256}\'\'\''
-PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\})(?![A-Za-z0-9_])'
+PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|\{[^}\s]*\})(?![A-Za-z0-9_])'
 # Two groups: paths and names the rewrites replace (scanned on the rewritten text, since a
 # surviving path is a leak) and credentials (scanned on the original text as well, since a
 # rewrite could alter the bytes around a secret before the pattern sees them; review #94).
@@ -170,12 +170,13 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
                        r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
                        # the key is explicitly Authorization: any value that is not a placeholder, however
-                       # short, when it ends the line or the quoted string; prose after the colon runs on,
-                       # and a scheme word standing alone (`"Bearer " + token` in code) is no value
-                       # (review #98)
+                       # short and whatever its first character (`/abc1234`, `_abc1234`; review #108),
+                       # when it ends the line or the quoted string; prose after the colon runs on,
+                       # a `{template}` is a placeholder, and a scheme word standing alone
+                       # (`"Bearer " + token` in code) is no value (review #98)
                        r'Authorization["\']?[ \t]*[=:][ \t]*["\']?(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
                        r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$|["\']))'
-                       r'[A-Z0-9][^\s"\']{3,}[ \t]*(?:\r?\n|$|["\'])|'
+                       r'[^\s"\']{4,}[ \t]*(?:\r?\n|$|["\'])|'
                        r'Authorization["\']?\s*[=:]\s*(["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!\1)[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
@@ -588,8 +589,11 @@ def collect_below(golden: Path, root_fd: int):
                 continue
             # Provenance comes from this one read and stat, not from a later look at a file that
             # may have changed meanwhile (review #48).
-            source = {'source_bytes': len(raw), 'source_sha256': hashlib.sha256(raw).hexdigest(),
-                      'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
+            # No digest or size of the original bytes: the values the rewrites replace are
+            # low-entropy (a username, a checkout path, an account name), and a digest of the
+            # original would let a reader hash candidates against the archived text and confirm
+            # them offline (review #109). The archived bytes are what the manifest describes.
+            source = {'mtime': datetime.datetime.fromtimestamp(st.st_mtime, datetime.timezone.utc).isoformat(),
                       'mtime_s': st.st_mtime}
             total += len(data)
             if total > MAX_TOTAL:
@@ -641,7 +645,6 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
     for rel, path, data, rewritten, source in included:
         entries.append({
             'path': rel, 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
-            'source_bytes': source['source_bytes'], 'source_sha256': source['source_sha256'],
             'rewritten': rewritten, 'mtime': source['mtime'],
         })
     if label is None:
@@ -717,10 +720,12 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
 README = '''# {label}
 
 Curated evidence for the reports in `docs/` of the cleffa repository: {n} files copied from
-the local `golden/` tree by `tools/evidence_archive.py`, with their SHA-256 before and after
-copying in `manifest.json`. {rewritten} text files were rewritten to replace the local
+the local `golden/` tree by `tools/evidence_archive.py`, with the SHA-256 of the archived
+bytes in `manifest.json`. {rewritten} text files were rewritten to replace the local
 checkout path, home directory and Cloudflare account name with `<repo>`, `<home>` and
-`<cf-account>`; nothing else was edited. Each report names the directories it relies on.
+`<cf-account>`; nothing else was edited, and they are flagged `rewritten`. No digest of a
+file's original bytes is published: the replaced values are low-entropy, and such a digest
+would let a reader confirm guesses offline. Each report names the directories it relies on.
 
 Not included, by rule: engine binaries and objects, Instruments traces and their counter
 exports, model tensors and layer dumps, the MLX environment, the ds4 upstream clone, the

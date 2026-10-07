@@ -28,6 +28,7 @@ import statistics
 import numpy as np
 from safetensors.numpy import load_file
 
+from cloudflare_checkout import response_info
 from cloudflare_corpus import ROOT, RATES, hosted_payload
 
 
@@ -141,6 +142,12 @@ def load_hosted(path: Path) -> tuple[dict, dict]:
         row = rows[key]
         if record["request_sha256"] != row["request_sha256"]:
             raise ValueError("Call does not match planned request")
+        # The answer and token count a record carries are derived from its recorded body at
+        # collection time; derive them again and require equality, so an edited or corrupted
+        # duplicate cannot drive the comparison while the body says otherwise.
+        derived = response_info(record["status"], record["response"], row)
+        if any(record.get(k) != derived[k] for k in ("answer", "reported_input_tokens", "full_input_reported")):
+            raise ValueError("Call fields differ from what the recorded response derives to")
         if set(record["answer"]["answers"]) != set(row["request"]["questions"]):
             raise ValueError("Missing or unexpected hosted questions")
         if record["warmup"] != (record["pass"] == -1):
