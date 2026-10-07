@@ -133,6 +133,19 @@ the 63-image parity and the vision corpus logits are unchanged. (16) The benchma
 from round one could never pass, because its sanitized environment dropped `CLEF_STAGE_TIME`,
 which prints the line it looks for; both arms now set it.
 
+A fourth round (on `571417e`) found two more. (17) A three-component baseline scan naming
+component 1 three times passed the defined-table check, which looked at the scan's components,
+while baseline decoding walks every frame component, so components 2 and 3 decoded with a table
+never defined (`values[-1]` again, `tests/test_jpeg_ub.c` case 6). A scan may now name each
+component once, as libjpeg requires; with baseline scans naming every component, the table check
+covers everything they decode. (18) The context check compared each image alone with the whole
+context, so an image of exactly 16,384 tokens, or several images that fit one at a time, were
+preprocessed before the later length check refused the request: 542 MB and 492 MB resident for a
+4096x4096 image and two 4096x2048 ones. The encoder now reserves the fixed prompt (57 tokens with
+one image), the markers and the earlier images before preprocessing each one: 139 MB and 291 MB,
+the first of the two images still fitting alone. The schema is not reserved, so nothing the
+reference accepts is refused. `tests/test_record.py` checks both peaks.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to

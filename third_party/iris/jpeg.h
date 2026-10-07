@@ -48,7 +48,9 @@
  * and, after a second review (tests/test_jpeg_ub.c, each case undefined behavior under
  * UBSan before the change):
  *   - a scan may only select Huffman tables a DHT defined, as libjpeg requires: a zeroed
- *     table matched the all-zero code and indexed values[-1];
+ *     table matched the all-zero code and indexed values[-1]; and it may name each component
+ *     once, as libjpeg requires, since a baseline scan naming component 1 three times decoded
+ *     the other two with tables the check had not seen;
  *   - DC table symbols above 15 are refused when the table is defined (libjpeg's
  *     jpeg_make_d_derived_tbl bound): they are bit counts, and 255 shifted by 255;
  *   - the DC predictor wraps in unsigned arithmetic and the coefficient is stored as
@@ -1422,6 +1424,9 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                     }
                 }
                 if (comp_idx < 0) goto fail;
+                /* cleffa: each component at most once per scan. A baseline scan must name every
+                 * component, so with this the table check below covers all that it decodes. */
+                for (int k = 0; k < i; k++) if (scan_comps[k] == comp_idx) goto fail;
                 scan_comps[i] = comp_idx;
             }
 

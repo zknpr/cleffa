@@ -10,6 +10,10 @@
 static const char SYSTEM_PROMPT[] =
     "Read the complete state and schema. Decide every field jointly. Each answer "
     "must be exactly one of that field's allowed options.";
+/* The fixed prompt around the request's content (template prefix, then the closing suffix). */
+static const char PROMPT_HEAD[] = "<|im_start|>system\n";
+static const char PROMPT_USER[] = "<|im_end|>\n<|im_start|>user\nSTATE:\n";
+static const char PROMPT_TAIL[] = "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:";
 
 static bool fail(char *err, size_t errlen, const char *fmt, const char *arg, size_t arg_len) {
     if (arg) {
@@ -236,6 +240,25 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
             }
             if (prm.min_pixels > prm.max_pixels) return fail(err, errlen, "media_kwargs: min_pixels exceeds max_pixels", NULL, 0);
         }
+        /* Images are never truncated, and the fixed prompt, one start/end pair per image and the
+         * newline after them always come with them: an image is refused before preprocessing when
+         * it, the images before it and that minimum cannot fit the context. A per-image comparison
+         * with the whole context let an image of exactly 16,384 tokens allocate 384 MiB of patches,
+         * and several large images each pass it, before the length check refused the request
+         * (review #3). The schema is left out, so this never refuses what the reference accepts. */
+        size_t reserve = 1 + 2 * n_images;
+        {
+            jbuf pb = {0};
+            clef_tokens pt = {0};
+            jbuf_puts(&pb, PROMPT_HEAD);
+            jbuf_puts(&pb, SYSTEM_PROMPT);
+            jbuf_puts(&pb, PROMPT_USER);
+            const bool tok_ok = tok_jbuf(tok, &pb, false, &pt) && tok_z(tok, PROMPT_TAIL, false, &pt);
+            reserve += pt.len;
+            jbuf_free(&pb);
+            clef_tokens_free(&pt);
+            if (!tok_ok) return fail(err, errlen, "out of memory", NULL, 0);
+        }
         out->images = calloc(n_images, sizeof(*out->images));
         if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
         for (size_t i = 0; i < n_images; i++) {
@@ -269,10 +292,11 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
                          opts.vision.max_image_tokens * px_per_token);
                 return false;
             }
-            if (tokens > opts.max_length) {
+            if ((size_t)out->n_image_tokens + (size_t)tokens + reserve > (size_t)opts.max_length) {
                 clef_rgb_free(&rgb);
-                snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens, more than a request holds (%d)",
-                         i, width, height, tokens, opts.max_length);
+                snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens; with %d image tokens before it and the "
+                         "%zu-token prompt the request cannot fit %d tokens",
+                         i, width, height, tokens, out->n_image_tokens, reserve, opts.max_length);
                 return false;
             }
             ok = clef_image_preprocess(&rgb, &prm, &out->images[i].pt, ierr, sizeof(ierr));
@@ -400,9 +424,9 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     }
 
     if (ok) {
-        jbuf_puts(&b, "<|im_start|>system\n");
+        jbuf_puts(&b, PROMPT_HEAD);
         jbuf_puts(&b, SYSTEM_PROMPT);
-        jbuf_puts(&b, "<|im_end|>\n<|im_start|>user\nSTATE:\n");
+        jbuf_puts(&b, PROMPT_USER);
         ok = tok_jbuf(tok, &b, false, &prefix);   /* template: real control tokens */
         if (ok && n_images) {
             /* _encode_media: "<|vision_start|><|image_pad|><|vision_end|>" per image, then "\n",
@@ -421,7 +445,7 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
             for (size_t i = 0; ok && i < nl.len; i++) ok = clef_tokens_push(&prefix, nl.ids[i]);
             clef_tokens_free(&nl);
         }
-        ok = ok && tok_z(tok, "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", false, &suffix);
+        ok = ok && tok_z(tok, PROMPT_TAIL, false, &suffix);
         /* only max_length - fixed state tokens can survive truncation (and max_state_tokens) */
         const size_t fixed0 = prefix.len + schema.len + suffix.len;
         size_t keep = fixed0 < (size_t)opts.max_length ? (size_t)opts.max_length - fixed0 : 0;

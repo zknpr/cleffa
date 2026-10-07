@@ -335,9 +335,41 @@ def main() -> None:
             if rbad <= 5:
                 print(f"  respond mismatch\n    python={w[:300]}\n    c     ={g[:300]}")
     print(f"respond: {len(wants) - rbad}/{len(wants)} match")
-    if bad or rbad:
+    mem_bad = image_budget_memory(gguf_path)
+    if bad or rbad or mem_bad:
         sys.exit("FAIL")
     print("PASS")
+
+
+def image_budget_memory(gguf_path: str) -> int:
+    """Review #3: an image that cannot fit with the prompt and the images before it is refused
+    before its resize and patches are allocated. Before the fix, a 4096x4096 image (exactly the
+    16,384-token context) reached 542 MB resident and two 4096x2048 images 492 MB; after, 139 MB
+    and 291 MB (the first of the two fits alone and is preprocessed). Peak RSS of clef-tool,
+    which applies no per-image token limit, as the CLI does by default."""
+    def png(w: int, h: int) -> str:
+        y, x = np.indices((h, w))
+        arr = np.stack([x * 255 // (w - 1), y * 255 // (h - 1), (x + y) % 256], -1).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, "PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    q = {"q": {"type": "noul", "instructions": "Is it blue?"}}
+    half = png(4096, 2048)
+    cases = [("one 16,384-token image", [png(4096, 4096)], 300), ("two 8,192-token images", [half, half], 400)]
+    failures = 0
+    for name, images, limit_mb in cases:
+        line = json.dumps({"model": "clef-flash", "state": "x", "images": images, "questions": q}) + "\n"
+        r = subprocess.run(["/usr/bin/time", "-l", str(ROOT / "clef-tool"), "encode", gguf_path], input=line,
+                           capture_output=True, text=True)
+        rss = next((int(l.split()[0]) for l in r.stderr.splitlines() if "maximum resident set size" in l), None)
+        refused = r.stdout.startswith("ERR") and "cannot fit" in r.stdout
+        mb = rss / 1e6 if rss is not None else float("inf")
+        ok = refused and mb < limit_mb
+        failures += not ok
+        print(f"image budget: {name} {'refused' if refused else 'NOT refused: ' + r.stdout[:120]} at {mb:.0f} MB peak "
+              f"(limit {limit_mb} MB){'' if ok else '  FAIL'}")
+    return failures
 
 
 if __name__ == "__main__":

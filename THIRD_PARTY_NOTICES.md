@@ -43,7 +43,7 @@ for untrusted input and its JPEG changes for libjpeg agreement (centered chroma 
 rounded YCbCr conversion, retained progressive scan bits). cleffa changes `jpeg.h` as documented
 in its header comment: scan headers (Ss/Se/Ah/Al) are validated before decoding, a multi-component
 image's first component must carry the largest sampling factors, scans may only select Huffman
-tables a DHT defined, DC table symbols above 15 are refused, the DC predictor wraps and is stored
+tables a DHT defined and name each component once, DC table symbols above 15 are refused, the DC predictor wraps and is stored
 as 16 bits before dequantization, and the IDCT computes in 64-bit. `clef_image.c` includes the
 headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
 `tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header also has optional inflate and CRC32 hooks;

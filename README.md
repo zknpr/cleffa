@@ -690,7 +690,7 @@ Requests and GGUF files are treated as untrusted:
   instead of 2.07 GB; the remainder is the GPU passes' own vision scratch. Image tokens cost the
   same prefill as text.
   The vendored JPEG decoder got input checks here (scan-header bounds, sampling layout, defined
-  Huffman tables, DC symbols at most 15) and libjpeg's arithmetic widths (wrapping 16-bit DC
+  Huffman tables, each component once per scan, DC symbols at most 15) and libjpeg's arithmetic widths (wrapping 16-bit DC
   coefficients, a 64-bit IDCT) after crafted files overflowed the unmodified copy under
   AddressSanitizer or reached undefined behavior under UBSan ([docs/vision.md](docs/vision.md));
   every file is a regression case (`tests/test_image.py`, `tests/test_jpeg_ub.c`).

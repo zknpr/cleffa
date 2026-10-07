@@ -55,7 +55,7 @@ make clean
   `THIRD_PARTY_NOTICES.md`); `clef_image.c` is their only includer and sets their decode limits.
   Local changes are the input checks and arithmetic listed in `jpeg.h`'s header comment (scan
   header bounds, luma must be the most sampled component, scans may only use defined Huffman
-  tables, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT) and
+  tables and name each component once, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT) and
   optional PNG inflate/CRC hooks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
