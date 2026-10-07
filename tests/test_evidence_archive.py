@@ -1096,6 +1096,38 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_short_triple_quoted_and_bare_bearer_values_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'tq.toml': 'API_KEY = """x"""\n', 'tq.py': "password = \'\'\'ab\'\'\'\n",
+                  'bearer1.log': 'Bearer hunter2\n', 'bearer2.json': '{"authorization": "Bearer ab12"}',
+                  'bearer3.log': 'auth=Bearer x\n'}
+        kept = {'prose3.md': 'Send a Bearer token in the header.\nThe API accepts Bearer tokens\n',
+                'code3.py': 'headers = {"X-Auth": "Bearer " + tok}\nh = f"Bearer {token}"\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'bearer.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_checkout_path_inside_a_file_url_is_rewritten(self):
+        # file:///workspace/cleffa/x: the two slashes before the path are the URL's, not a
+        # directory's, so the boundary rule must let the rewrite through there. Simulated with
+        # a checkout outside /Users, /home and /root, where only the dynamic pattern applies.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'fileurl.log').write_text('see file:///workspace/cleffa/result.json and /workspace/cleffa/x\n')
+        rewrites = [ea.path_rewrite('/workspace/cleffa', '<repo>')]
+        forbidden = re.compile(ea.path_pattern('/workspace/cleffa') + '|' + ea.CREDENTIAL_PATTERNS, re.IGNORECASE)
+        with patch.object(ea, 'REWRITES', rewrites), patch.object(ea, 'FORBIDDEN', forbidden):
+            ea.build(self.root, Path(self.tmp.name) / 'fileurl.tar.gz', 'ev')
+        with tarfile.open(Path(self.tmp.name) / 'fileurl.tar.gz') as tar:
+            text = tar.extractfile('ev/gemm-probe-20261004/fileurl.log').read().decode()
+        self.assertEqual(text, 'see file://<repo>/result.json and <repo>/x\n')
+        self.assertFalse(re.compile(ea.path_pattern('/root')).search('mysql://root:pw@db'))   # a URL authority stays
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

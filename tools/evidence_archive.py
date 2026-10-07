@@ -98,8 +98,10 @@ def path_pattern(path: str) -> str:
     `mysql://root:pw@db` is a URL authority, not a home directory) and not followed by a name
     character (`/rooted/` is another directory). Shared by the rewrite and the forbidden
     pattern, so a home of /root neither rewrites a connection string's userinfo nor excludes
-    a file for `/rooted/path` after the rewrite left it alone (reviews #94, #100)."""
-    return r'(?<!/)' + re.escape(path) + r'(?![A-Za-z0-9_.-])'
+    a file for `/rooted/path` after the rewrite left it alone (reviews #94, #100). The two
+    slashes of a `file://` URL are the URL's, not a directory's, so a path right after them
+    is still a path (review #120)."""
+    return r'(?:(?<=file://)|(?<!/))' + re.escape(path) + r'(?![A-Za-z0-9_.-])'
 
 
 def path_rewrite(path: str, placeholder: str) -> tuple[re.Pattern, str]:
@@ -157,7 +159,7 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 # indicator alone, since the value cannot be matched inline (review #96).
 STRONG = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD'
 # A TOML or Python triple-quoted value, which may span lines (review #101).
-TRIPLE = r'"""(?:(?!""")[\s\S]){4,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){4,256}\'\'\''
+TRIPLE = r'"""(?:(?!""")[\s\S]){1,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){1,256}\'\'\''   # any length (review #119)
 # A shell variable reference ($SECRET, uppercase by convention; case-sensitive inside the
 # otherwise case-insensitive pattern) is a placeholder; $upersecret is a password.
 PLACEHOLDER = (r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|\{[^}\s]*\}|\([^)\s]*\)|'
@@ -172,6 +174,11 @@ PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                  # accountTag, CLOUDFLARE_ACCOUNT_ID (review #99)
                  r'account(?:[_-]?(?:id|tag))?["\']?\s*[=:]\s*["\']?[0-9a-f]{32}\b')
 CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
+                       # a bare `Bearer <value>` of any length when the value ends the line or a quoted
+                       # string: `Bearer hunter2`; prose ("a Bearer token in the header") runs on, and
+                       # the words that follow "Bearer" in prose are not values (review #121)
+                       r'Bearer[ \t]+["\']?(?!' + PLACEHOLDER + r')(?!(?:token|tokens|auth|authentication|scheme|header|value)\b)'
+                       r'[^\s"\']+[ \t]*(?:\r?\n|$|["\'])|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
                        r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
                        # the key is explicitly Authorization: any value that is not a placeholder, of any
