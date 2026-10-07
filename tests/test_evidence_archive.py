@@ -265,7 +265,7 @@ class EvidenceArchive(unittest.TestCase):
         ea.prepare = prepare_then_mutate
         out = Path(self.tmp.name) / 'prov.tar.gz'
         try:
-            with self.assertRaisesRegex(SystemExit, 'changed after it was read'):
+            with self.assertRaisesRegex(SystemExit, 'changed after it was examined'):
                 ea.build(self.root, out, 'ev')
         finally:
             ea.prepare = real
@@ -579,8 +579,65 @@ class EvidenceArchive(unittest.TestCase):
             if path == exp / 'run.py':   # sorted after result.json, which has been read by now
                 (exp / 'result.json').write_text('{"ms": 9.5}')
             return verdict
-        with patch.object(ea, 'classify', overwrite_earlier), self.assertRaisesRegex(SystemExit, 'changed after it was read'):
+        with patch.object(ea, 'classify', overwrite_earlier), self.assertRaisesRegex(SystemExit, 'changed after it was examined'):
             ea.build(self.root, Path(self.tmp.name) / 'overwrite.tar.gz', 'ev')
+
+    def test_member_names_are_scanned_like_content(self):
+        # A file name becomes a tar member name; the Basic check lives beside FORBIDDEN in
+        # forbidden_in(), so a name is scanned with the same function as content.
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'Authorization Basic dXNlcjpwYXNzd29yZA==.txt').write_text('benign\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'name.tar.gz', 'ev')
+        self.assertFalse(any('Basic' in e['path'] for e in manifest['files']))
+        self.assertIn('forbidden path', manifest['excluded_counts'])
+
+    def test_excluded_file_changing_after_classification_aborts(self):
+        # A file excluded on mutable metadata (its size) and replaced below the limit afterwards
+        # leaves the directory's entries unchanged; every enumerated file, included or not, must
+        # still be what it was when it was examined.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'big.log').write_text('x' * 4096 + '\n')
+        real = ea.classify
+
+        def truncate_earlier(golden, path):
+            verdict = real(golden, path)
+            if path == exp / 'run.py':   # sorted after big.log, which was excluded as oversized by now
+                (exp / 'big.log').write_text('small now\n')
+            return verdict
+        with patch.object(ea, 'MAX_TEXT', 1024), patch.object(ea, 'classify', truncate_earlier), \
+                self.assertRaisesRegex(SystemExit, 'changed after it was examined'):
+            ea.build(self.root, Path(self.tmp.name) / 'truncate.tar.gz', 'ev')
+
+    def test_credential_key_spellings_are_caught(self):
+        # CREDENTIAL_KEY recognizes api-key and apiKey, but the rejoined pair and plain text
+        # were matched by an assignment pattern that knew API_KEY only.
+        exp = self.root / 'gemm-probe-20261004'
+        cases = {'hyphen.json': '{"api-key": "abcdefghijklmnop"}',
+                 'camel.json': '{"apiKey": "abcdefghijklmnop"}',
+                 'hyphen.log': 'api-key: abcdefghijklmnop\n',
+                 'camel.log': 'apiKey=abcdefghijklmnop\n'}
+        for name, text in cases.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'keys.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in cases:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_pem_private_keys_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        cases = {'ssh.log': '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n',
+                 'pkcs8.txt': '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----\n',
+                 'rsa.md': 'dumped: -----BEGIN RSA PRIVATE KEY-----\n',
+                 'pgp.txt': '-----BEGIN PGP PRIVATE KEY BLOCK-----\n'}
+        for name, text in cases.items():
+            (exp / name).write_text(text)
+        (exp / 'cert.txt').write_text('-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n')   # public: kept
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'pem.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in cases:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        self.assertIn('gemm-probe-20261004/cert.txt', names)
 
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.

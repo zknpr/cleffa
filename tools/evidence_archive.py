@@ -28,8 +28,8 @@ Excluded
     `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
   - dotfiles and extensionless files other than Makefile and LICENSE, key=value assignments
-    that look like credentials, Bearer and Basic authorization values, hard-linked files and
-    anything that is not a regular file
+    that look like credentials, Bearer and Basic authorization values, PEM private keys,
+    hard-linked files and anything that is not a regular file
   - any file with "private" in any component of its path, and any text file that still matches a
     FORBIDDEN pattern after rewriting (private-workload paths, account identifiers,
     including a Cloudflare account ID inside a recorded `accounts/<id>/` API URL)
@@ -103,13 +103,17 @@ REWRITES = [
 # the build. Case-insensitive: bearer schemes and variable names vary in case. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
 # A credential value is a quoted string of sixteen or more characters, spaces included, or an
 # unquoted run of sixteen or more characters that are not whitespace or a quote: passwords carry
-# punctuation and spaces, base64 tokens carry + / = (reviews #59, #63).
+# punctuation and spaces, base64 tokens carry + / = (reviews #59, #63). The key accepts the
+# spellings CREDENTIAL_KEY does (api-key, apiKey, x-api-key) so the rejoined JSON pair and plain
+# text match alike (review #75). PEM private-key delimiters of every kind are forbidden outright
+# (review #76); certificates and public keys are not secrets.
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
+                       r'-----BEGIN [A-Z ]*PRIVATE KEY|'
+                       r'\b[A-Z0-9_-]*(API[_-]?KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
 # `Basic <base64>` authorization: the value decodes to user:password. Only a decoded colon makes
 # it a credential; "basic test" is the word before a word that happens to be valid base64 (review #66).
 BASIC_AUTH = re.compile(r'\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)
@@ -140,7 +144,7 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
         return 'private-named path'
     if any(part.startswith('.') for part in parts):
         return 'dotfile'   # .env, .gitignore, editor state: never evidence
-    if FORBIDDEN.search(rel.as_posix()):
+    if forbidden_in(rel.as_posix()):   # the same scan as content: FORBIDDEN and Basic (review #73)
         return 'forbidden path'
     if any(p in EXCLUDE_DIR_PARTS for p in parts):
         return 'clone or environment'
@@ -444,7 +448,10 @@ def collect_below(golden: Path, root_fd: int):
     included, excluded = [], {}
     total = 0
     seen: list[tuple[str, frozenset[str], tuple[int, int]]] = []
-    snapshots: list[tuple[Path, tuple[int, int, int, int]]] = []   # what each included file was when read
+    snapshots: list[tuple[Path, tuple[int, int, int, int]]] = []   # what each enumerated file was when examined
+
+    def note(path: Path, st: os.stat_result):
+        snapshots.append((path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)))
     for dirpath, dirnames, filenames in os.walk(golden, onerror=walk_error):
         st = os.stat(dirpath, follow_symlinks=False)
         seen.append((dirpath, frozenset(dirnames) | frozenset(filenames), (st.st_dev, st.st_ino)))
@@ -457,14 +464,20 @@ def collect_below(golden: Path, root_fd: int):
         for name in sorted(filenames):
             path = Path(dirpath) / name
             try:
+                st = os.stat(path, follow_symlinks=False)
                 ok, reason = classify(golden, path)
             except FileNotFoundError:
                 raise SystemExit(f'{path} vanished during collection') from None
             if not ok:
+                # Excluded on its name or its metadata: recorded too, so a file that becomes
+                # eligible after this look (replaced below a size limit, say) aborts the build
+                # instead of being omitted from a tree it is part of by completion (review #74).
+                note(path, st)
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
             tensor = path.suffix.lower() == '.safetensors'
             raw, st = read_snapshot(root_fd, path.relative_to(golden), SMALL_TENSOR if tensor else MAX_TEXT)
+            note(path, st)
             if raw is None:
                 reason = 'tensor size' if tensor else 'oversized text'
                 excluded[reason] = excluded.get(reason, 0) + 1
@@ -482,7 +495,6 @@ def collect_below(golden: Path, root_fd: int):
             if total > MAX_TOTAL:
                 raise SystemExit(f'included evidence exceeds MAX_TOTAL ({MAX_TOTAL} bytes) at {path}')
             included.append((path.relative_to(golden).as_posix(), path, data, rewritten, source))
-            snapshots.append((path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)))
     # Quiescence: a file created or removed after its directory was enumerated is seen by no
     # per-file check, and the manifest would describe neither the tree at the start nor at the
     # end. Every enumerated directory must still be the same directory with the same entries
@@ -495,17 +507,18 @@ def collect_below(golden: Path, root_fd: int):
             raise SystemExit(f'{dirpath}: cannot re-list: {e.strerror}')
         if (st.st_dev, st.st_ino) != ident or now != listed:
             raise SystemExit(f'{dirpath} changed during collection')
-    # An in-place overwrite of a file already read leaves its directory's entries unchanged, so
-    # every included file must still have the identity, size and mtime it was read with once
-    # the whole tree has been collected (review #72). A rewrite that restores all three is
-    # beyond this check; the archive describes files, not a filesystem snapshot.
+    # An in-place overwrite of a file already examined leaves its directory's entries unchanged,
+    # so every enumerated file must still have the identity, size and mtime it was read or
+    # classified with once the whole tree has been collected (reviews #72, #74). A rewrite that
+    # restores all three is beyond this check; the archive describes files, not a filesystem
+    # snapshot.
     for path, ident in snapshots:
         try:
             st = os.stat(path, follow_symlinks=False)
         except OSError as e:
             raise SystemExit(f'{path}: cannot re-stat: {e.strerror}')
         if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != ident:
-            raise SystemExit(f'{path} changed after it was read')
+            raise SystemExit(f'{path} changed after it was examined')
     return included, excluded
 
 
@@ -548,7 +561,7 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
         if forbidden_in(text):
             raise SystemExit(f'forbidden pattern in the generated {name}')
     for rel, path, data, _, _ in included:
-        if FORBIDDEN.search(rel):
+        if forbidden_in(rel):
             raise SystemExit(f'forbidden pattern in the path {rel}')
         tensor = path.suffix.lower() == '.safetensors'
         if not tensor and b'\0' in data:
