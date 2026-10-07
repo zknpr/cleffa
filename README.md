@@ -80,6 +80,13 @@ also refuses a source image above 16,777,216 pixels at its header, before decodi
 (`--max-image-pixels`; that is the processor's own `max_pixels`, and the hosted API's cap is
 16 megapixels), and decodes or holds at most 8 image requests at a time (`--max-image-requests`);
 the rest wait with only their request body in memory. The security notes give the reasoning.
+Clients should therefore shrink large photos before sending, as the hosted API requires too (it
+also caps an encoded image at 4 MiB). A 24-megapixel phone photo (5712x4284, 6.4 MB as JPEG) is
+refused by the pixel limit, and its 8.5 MB of base64 is over the default `--max-body` of 8 MiB as
+well. A local deployment that wants originals can raise `--max-image-pixels` and `--max-body`
+together. Measured on Flash, eight concurrent 24-megapixel JPEGs peaked 1.20 GB above idle against
+1.08 GB for eight 16.8-megapixel ones. Compressible PNGs are the expensive case: at the decoders'
+64-megapixel cap a decode holds about 0.5 GB, so the slot count then bounds about 4 GB.
 Measured parity, costs and the unsupported formats are in [docs/vision.md](docs/vision.md).
 
 Missing files, extra files and symbolic links fail verification; only `.cache/huggingface/`

@@ -179,7 +179,8 @@ bool clef_image_decode_limited(const uint8_t *data, size_t len, long max_pixels,
     uint32_t w = 0, h = 0;
     memset(out, 0, sizeof(*out));
     if (limit < CLEF_IMAGE_MAX_PIXELS && data && header_dimensions(data, len, &w, &h) && (size_t)w * h > limit) {
-        snprintf(err, errlen, "image: %ux%u is %zu pixels, above the limit of %zu per image", w, h, (size_t)w * h, limit);
+        snprintf(err, errlen, "image: %ux%u is %zu pixels, above the limit of %zu per image; downscale it before sending",
+                 w, h, (size_t)w * h, limit);
         return false;
     }
     clef_decode_max_pixels = limit;
