@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from compare_cloudflare import (check_input_ids, check_local_binding, confidence_value, decision, distribution,
-                                hosted_snapshot, load_hosted, local_snapshot, oracle_snapshot, score_value)
+                                hosted_snapshot, load_hosted, local_snapshot, oracle_dtype, oracle_snapshot, score_value)
 
 
 class ComparisonTests(unittest.TestCase):
@@ -123,6 +123,23 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(refs, [{"id": "r000"}])
             self.assertEqual(list(logits), ["r000/q"])
             self.assertEqual(sha, hashlib.sha256(tensors).hexdigest())
+
+    def test_oracle_dtype_is_verified_where_recorded(self):
+        # A golden directory is FP32 by name only; ref/oracle.py records its dtype in
+        # latency.json, the streamed 27B oracle records nothing. The dtype is verified where it
+        # exists, refused when it is not float32, and reported as unverified when absent only
+        # with the allow flag.
+        with tempfile.TemporaryDirectory() as temp:
+            golden = Path(temp)
+            (golden / "latency.json").write_text(json.dumps({"dtype": "float32", "device": "mps"}))
+            self.assertEqual(oracle_dtype(golden, allow_unhashed=False), "float32")
+            (golden / "latency.json").write_text(json.dumps({"dtype": "bfloat16"}))
+            with self.assertRaises(ValueError):
+                oracle_dtype(golden, allow_unhashed=False)
+            (golden / "latency.json").unlink()
+            with self.assertRaises(ValueError):
+                oracle_dtype(golden, allow_unhashed=False)
+            self.assertIsNone(oracle_dtype(golden, allow_unhashed=True))
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")

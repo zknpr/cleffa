@@ -224,6 +224,9 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'Authorization["\']?[ \t]*[=:][ \t]*(?P<aq>["\'])(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
                        r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?P=aq))'
                        r'[^\s"\']+[ \t]*(?P=aq)|'
+                       # a quoted token after a scheme word (`Token 'abc'`, `ApiKey "x"`), including inside a
+                       # JSON string where the inner quotes are escaped
+                       r'Authorization["\']?[ \t]*[=:][ \t]*["\']?[A-Z][A-Z0-9-]*[ \t]+\\?(?P<tq>["\'])(?!' + PLACEHOLDER + r')[^\s"\'\\]+\\?(?P=tq)|'
                        # ... or a comment or annotation delimiter (`# staging`, `// prod`, `; note`)
                        r'Authorization[ \t]*[=:][ \t]*(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
                        r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$|#|//|;))'
@@ -240,7 +243,7 @@ CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'(?<![A-Z0-9-])--?[A-Z0-9-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'[ \t]+["\']?(?!' + PLACEHOLDER + r')[^\s"\'\\{\[(<][^\s"\',;}\]{]*|'
                        # curl's user:password argument, whose option is not named for a credential
-                       r'(?<![A-Z0-9-])(?:--user|-u)[ \t=]+["\']?[^\s"\':]+:[^\s"\']+|'
+                       r'(?<![A-Z0-9-])(?:--user[ \t=]+|-u[ \t=]*)["\']?[^\s"\':]+:[^\s"\']+|'
                        r'\b[A-Z0-9_-]*(?:' + SENSITIVE + r')' + KEY_SUFFIX + r'["\']?\s*:\s*[|>][-+0-9]*[ \t]*\n')
 FORBIDDEN = re.compile(PATH_PATTERNS + '|' + CREDENTIAL_PATTERNS, re.IGNORECASE)
 CREDENTIALS = re.compile(CREDENTIAL_PATTERNS, re.IGNORECASE)
@@ -456,7 +459,18 @@ def json_credential(text: str) -> bool:
     try:
         return walk(json.loads(text))
     except ValueError:
-        return False
+        pass
+    # A JSONL file is not one document; each record is judged like one.
+    records = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            records.append(json.loads(line))
+        except ValueError:
+            return False
+    return any(walk(r) for r in records)
 
 
 def forbidden_in(text: str, pattern: re.Pattern = None) -> bool:
