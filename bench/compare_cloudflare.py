@@ -115,9 +115,21 @@ def decision(answer: dict, probs: dict[str, float]) -> str:
     return max(probs, key=probs.get)
 
 
+def hosted_snapshot(path: Path) -> tuple[dict, dict, str]:
+    """The plan, the calls and the SHA-256 of one read of the journal, so the digest the summary
+    publishes is of the bytes that produced its calls and metrics, not of whatever the path
+    holds by the time it is hashed."""
+    data = path.read_bytes()
+    plan, calls = load_hosted_bytes(data)
+    return plan, calls, hashlib.sha256(data).hexdigest()
+
+
 def load_hosted(path: Path) -> tuple[dict, dict]:
-    with path.open() as source:
-        records = [json.loads(line) for line in source]
+    return load_hosted_bytes(path.read_bytes())
+
+
+def load_hosted_bytes(data: bytes) -> tuple[dict, dict]:
+    records = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
     if not records or records[0].get("type") != "plan":
         raise ValueError("Missing reference plan")
     plan = records[0]
@@ -173,8 +185,8 @@ def metrics(rows: list[dict], left: str, right: str) -> dict:
 
 
 def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) -> dict:
-    plan, calls = load_hosted(path)
-    summary = {"hosted_journal": str(path), "hosted_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    plan, calls, hosted_sha256 = hosted_snapshot(path)
+    summary = {"hosted_journal": str(path), "hosted_sha256": hosted_sha256,
                "timestamp": plan["timestamp"], "passes": plan["passes"],
                "note": "Agreement and numerical distance, not labeled accuracy; probabilities rounded by API",
                "models": {}}

@@ -1128,6 +1128,42 @@ class EvidenceArchive(unittest.TestCase):
         self.assertEqual(text, 'see file://<repo>/result.json and <repo>/x\n')
         self.assertFalse(re.compile(ea.path_pattern('/root')).search('mysql://root:pw@db'))   # a URL authority stays
 
+    def test_compound_token_names_are_strong(self):
+        # A bare "token" is generic (a loop variable, a tokenizer field), but API_TOKEN,
+        # AUTH_TOKEN, accessToken and their kin name a credential whatever the value's length.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'t1.log': 'API_TOKEN=hunter2\n', 't2.log': 'AUTH_TOKEN=x\n', 't3.json': '{"api_token":"hunter2"}',
+                  't4.log': 'accessToken: ab12\n', 't5.json': '{"refresh_token": "abc"}'}
+        kept = {'t6.log': 'token=abc\nmax_token=4096\nnext_token: 12\n', 't7.json': '{"token": "abc", "token_count": 3}'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'tokens.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_pruned_directory_replaced_during_collection_aborts(self):
+        # A child pruned as a symlink and replaced by a real directory afterwards keeps the
+        # parent's entry names; its identity must be the same at the end as when it was pruned.
+        from unittest.mock import patch
+        elsewhere = Path(self.tmp.name) / 'elsewhere'
+        elsewhere.mkdir()
+        link = self.root / 'swap-link-20261005'
+        link.symlink_to(elsewhere, target_is_directory=True)
+        real = ea.classify
+
+        def replace_link(golden, path):
+            verdict = real(golden, path)
+            if path == self.root / 'engine_logits.jsonl':   # the root's files come after its pruning
+                link.unlink()
+                link.mkdir()
+                (link / 'result.json').write_text('{"ms": 1}')
+            return verdict
+        with patch.object(ea, 'classify', replace_link), self.assertRaisesRegex(SystemExit, 'changed during collection'):
+            ea.build(self.root, Path(self.tmp.name) / 'swaplink.tar.gz', 'ev')
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

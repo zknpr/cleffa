@@ -157,7 +157,10 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 # such as "kept secret:" followed by a new sentence is not an assignment. A YAML block scalar
 # after a sensitive key (`password: |-` with the value on the next lines) is rejected on the
 # indicator alone, since the value cannot be matched inline (review #96).
-STRONG = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD'
+# A bare "token" stays generic (a loop variable, a tokenizer field); a compound token name
+# (API_TOKEN, AUTH_TOKEN, accessToken, refresh_token) names a credential at any length (review #122).
+STRONG = (r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD|'
+          r'(?:API|AUTH|ACCESS|BEARER|REFRESH|SESSION|CLIENT|SERVICE|ADMIN|USER|OAUTH)[_-]?TOKEN')
 # A TOML or Python triple-quoted value, which may span lines (review #101).
 TRIPLE = r'"""(?:(?!""")[\s\S]){1,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){1,256}\'\'\''   # any length (review #119)
 # A shell variable reference ($SECRET, uppercase by convention; case-sensitive inside the
@@ -560,6 +563,7 @@ def collect_below(golden: Path, root_fd: int):
     total = 0
     seen: list[tuple[str, frozenset[str], tuple[int, int]]] = []
     children: list[tuple[str, tuple[int, int]]] = []   # retained child directories, as enumerated
+    pruned: list[tuple[str, tuple[int, int, int]]] = []   # pruned children: device, inode, file type
     snapshots: list[tuple[Path, tuple[int, int, int, int, int]]] = []   # what each enumerated file was when examined
 
     def note(path: Path, st: os.stat_result):
@@ -575,6 +579,10 @@ def collect_below(golden: Path, root_fd: int):
             if reason is not None:
                 dirnames.remove(name)
                 excluded[f'{reason} (directories)'] = excluded.get(f'{reason} (directories)', 0) + 1
+                # A pruned child (a link, say) replaced by a real directory afterwards keeps
+                # the parent's entry names; its identity is checked at the end (review #124).
+                pst = os.stat(os.path.join(dirpath, name), follow_symlinks=False)
+                pruned.append((os.path.join(dirpath, name), (pst.st_dev, pst.st_ino, stat.S_IFMT(pst.st_mode))))
                 continue
             # os.walk() skips a child that becomes a link before the descent, silently and with
             # no onerror call; the child must later turn up as a visited directory with this
@@ -635,6 +643,13 @@ def collect_below(golden: Path, root_fd: int):
     visited = {dirpath: ident for dirpath, _, ident in seen}
     for child, ident in children:
         if visited.get(child) != ident:
+            raise SystemExit(f'{child} changed during collection')
+    for child, ident in pruned:
+        try:
+            pst = os.stat(child, follow_symlinks=False)
+        except OSError as e:
+            raise SystemExit(f'{child}: cannot re-stat: {e.strerror}')
+        if (pst.st_dev, pst.st_ino, stat.S_IFMT(pst.st_mode)) != ident:
             raise SystemExit(f'{child} changed during collection')
     # An in-place overwrite of a file already examined leaves its directory's entries unchanged,
     # so every enumerated file must still have the identity, size and mtime it was read or

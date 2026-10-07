@@ -6,10 +6,11 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from compare_cloudflare import (check_input_ids, check_local_binding, confidence_value, decision, distribution,
-                                load_hosted, score_value)
+                                hosted_snapshot, load_hosted, score_value)
 
 
 class ComparisonTests(unittest.TestCase):
@@ -80,6 +81,26 @@ class ComparisonTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             check_local_binding({}, row, allow_unhashed=False)   # captured before the fields existed
         self.assertFalse(check_local_binding({}, row, allow_unhashed=True))
+
+    def test_hosted_digest_is_of_the_bytes_parsed(self):
+        # The journal is read once; the digest and the calls come from that one snapshot, so a
+        # journal replaced between parsing and hashing cannot lend its digest to other calls.
+        payload = {"questions": {"q": {"type": "noul"}}}
+        digest = hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+        answer = {"answers": {"q": {"type": "noul", "noul": 0.9}}, "usage": {"input_tokens": 4}}
+        plan = {"type": "plan", "passes": 1, "planned_calls": 2, "requests": [
+            {"model": "clef", "id": "r000", "request": payload, "request_sha256": digest, "full_input_tokens": 4}]}
+        calls = [{"type": "call", "model": "clef", "id": "r000", "pass": p, "status": 200, "warmup": p == -1,
+                  "request_sha256": digest, "response": {"result": answer, "success": True, "errors": []},
+                  "answer": answer, "reported_input_tokens": 4, "full_input_reported": True} for p in [-1, 0]]
+        journal = "".join(json.dumps(r) + "\n" for r in [plan, *calls, {"type": "complete"}]).encode()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "hosted.jsonl"
+            path.write_bytes(journal)
+            with patch.object(Path, "read_bytes", side_effect=[journal, b"replaced"]):
+                plan_out, calls_out, sha = hosted_snapshot(path)
+            self.assertEqual(len(calls_out), 2)
+            self.assertEqual(sha, hashlib.sha256(journal).hexdigest())
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")
