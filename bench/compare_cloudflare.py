@@ -26,7 +26,7 @@ from pathlib import Path
 import statistics
 
 import numpy as np
-from safetensors.numpy import load_file
+from safetensors.numpy import load as load_safetensors
 
 from cloudflare_checkout import response_info
 from cloudflare_corpus import ROOT, RATES, hosted_payload
@@ -128,6 +128,25 @@ def load_hosted(path: Path) -> tuple[dict, dict]:
     return load_hosted_bytes(path.read_bytes())
 
 
+def jsonl_rows(data: bytes) -> list[dict]:
+    return [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+
+
+def local_snapshot(path: Path) -> tuple[list[dict], str]:
+    """The local responses and the SHA-256 of the one read they came from."""
+    data = path.read_bytes()
+    return jsonl_rows(data), hashlib.sha256(data).hexdigest()
+
+
+def oracle_snapshot(golden: Path) -> tuple[list[dict], list[dict], dict, str]:
+    """The oracle requests, encodings and logits, the logits parsed from the same bytes that are
+    hashed, so the published digest is of the tensors the metrics used."""
+    refs = jsonl_rows((golden / "requests.jsonl").read_bytes())
+    encoded = jsonl_rows((golden / "encoded.jsonl").read_bytes())
+    data = (golden / "logits.safetensors").read_bytes()
+    return refs, encoded, load_safetensors(data), hashlib.sha256(data).hexdigest()
+
+
 def load_hosted_bytes(data: bytes) -> tuple[dict, dict]:
     records = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
     if not records or records[0].get("type") != "plan":
@@ -193,14 +212,12 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
     for model in RATES:
         rows = [r for r in plan["requests"] if r["model"] == model]
         golden = ROOT / "golden" / (model + "-f32")
-        refs = [json.loads(line) for line in (golden / "requests.jsonl").read_text().splitlines()]
-        encoded = [json.loads(line) for line in (golden / "encoded.jsonl").read_text().splitlines()]
+        refs, encoded, logits, logits_sha256 = oracle_snapshot(golden)
         if len(refs) != len(rows) or len(encoded) != len(rows):
             raise ValueError("Oracle corpus size differs")
-        logits = load_file(str(golden / "logits.safetensors"))
-        local = None
+        local = local_sha256 = None
         if local_dir:
-            local = [json.loads(line) for line in (local_dir / (model + ".jsonl")).read_text().splitlines()]
+            local, local_sha256 = local_snapshot(local_dir / (model + ".jsonl"))
             if len(local) != len(rows):
                 raise ValueError("Local response count differs")
         comparisons, coverage, unstable = [], [], []
@@ -268,9 +285,7 @@ def compare(path: Path, local_dir: Path | None, allow_unhashed: bool = False) ->
                 "all": metrics(comparisons, a, b),
                 "matching_reported_token_counts": metrics([r for r in comparisons if r["counts_match"]], a, b)
             } for a, b in pairs}, "questions_detail": comparisons,
-            "fp32_logits_sha256": hashlib.sha256((golden / "logits.safetensors").read_bytes()).hexdigest(),
-            "local_response_sha256": hashlib.sha256((local_dir / (model + ".jsonl")).read_bytes()).hexdigest()
-            if local_dir else None}
+            "fp32_logits_sha256": logits_sha256, "local_response_sha256": local_sha256}
     return summary
 
 

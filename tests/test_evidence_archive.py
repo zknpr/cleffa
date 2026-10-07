@@ -1164,6 +1164,22 @@ class EvidenceArchive(unittest.TestCase):
         with patch.object(ea, 'classify', replace_link), self.assertRaisesRegex(SystemExit, 'changed during collection'):
             ea.build(self.root, Path(self.tmp.name) / 'swaplink.tar.gz', 'ev')
 
+    def test_triple_quoted_credentials_of_any_length_are_caught(self):
+        # The opening triple quote after a sensitive key is enough: a bounded value let a
+        # 257-character key through, and an unterminated one is no safer.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'long.toml': 'API_KEY = """' + 'k' * 300 + '"""\n',
+                  'open.py': 'password = """\nnever closed\n'}
+        kept = {'doc2.py': 'doc = """' + 'd' * 300 + '"""\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'triplelong.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

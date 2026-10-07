@@ -161,8 +161,11 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 # (API_TOKEN, AUTH_TOKEN, accessToken, refresh_token) names a credential at any length (review #122).
 STRONG = (r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|PASSPHRASE|PASSWORD|PASSWD|'
           r'(?:API|AUTH|ACCESS|BEARER|REFRESH|SESSION|CLIENT|SERVICE|ADMIN|USER|OAUTH)[_-]?TOKEN')
-# A TOML or Python triple-quoted value, which may span lines (review #101).
-TRIPLE = r'"""(?:(?!""")[\s\S]){1,256}"""|\'\'\'(?:(?!\'\'\')[\s\S]){1,256}\'\'\''   # any length (review #119)
+# A TOML or Python triple-quoted value after a sensitive key (review #101).
+# The opening delimiter alone: a bounded value let a longer key through, an unbounded one would
+# run to the end of a file with an unterminated string, and a sensitive key followed by a
+# triple-quoted value is a credential whatever follows (reviews #119, #125).
+TRIPLE = r'"""|\'\'\''
 # A shell variable reference ($SECRET, uppercase by convention; case-sensitive inside the
 # otherwise case-insensitive pattern) is a placeholder; $upersecret is a password.
 PLACEHOLDER = (r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\}\}|\{[^}\s]*\}|\([^)\s]*\)|'

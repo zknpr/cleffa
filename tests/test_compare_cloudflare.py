@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from compare_cloudflare import (check_input_ids, check_local_binding, confidence_value, decision, distribution,
-                                hosted_snapshot, load_hosted, score_value)
+                                hosted_snapshot, load_hosted, local_snapshot, oracle_snapshot, score_value)
 
 
 class ComparisonTests(unittest.TestCase):
@@ -101,6 +101,28 @@ class ComparisonTests(unittest.TestCase):
                 plan_out, calls_out, sha = hosted_snapshot(path)
             self.assertEqual(len(calls_out), 2)
             self.assertEqual(sha, hashlib.sha256(journal).hexdigest())
+
+    def test_local_and_oracle_digests_are_of_the_bytes_parsed(self):
+        # Each input is read once; its rows or tensors and its digest come from that snapshot.
+        import numpy as np
+        from safetensors.numpy import save
+        rows = [{"model": "clef", "answers": {}, "usage": {"input_tokens": 4}}]
+        local = ("".join(json.dumps(r) + "\n" for r in rows)).encode()
+        tensors = save({"r000/q": np.zeros(2, dtype=np.float32)})
+        with tempfile.TemporaryDirectory() as temp:
+            golden = Path(temp)
+            (golden / "requests.jsonl").write_text('{"id": "r000"}\n')
+            (golden / "encoded.jsonl").write_text('{"id": "r000", "input_ids": [1]}\n')
+            (golden / "logits.safetensors").write_bytes(tensors)
+            (golden / "clef.jsonl").write_bytes(local)
+            with patch.object(Path, "read_bytes", side_effect=[local, b"replaced"]):
+                parsed, sha = local_snapshot(golden / "clef.jsonl")
+            self.assertEqual(parsed, rows)
+            self.assertEqual(sha, hashlib.sha256(local).hexdigest())
+            refs, encoded, logits, sha = oracle_snapshot(golden)
+            self.assertEqual(refs, [{"id": "r000"}])
+            self.assertEqual(list(logits), ["r000/q"])
+            self.assertEqual(sha, hashlib.sha256(tensors).hexdigest())
 
     def test_choice_uses_explicit_winner_for_rounded_tie(self):
         self.assertEqual(decision({"type": "choice", "choice": "b"}, {"a": 0.5, "b": 0.5}), "b")
