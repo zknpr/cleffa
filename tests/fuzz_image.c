@@ -33,6 +33,7 @@ static uint8_t *png_fixup(const uint8_t *d, size_t n) {
     }
     if (total >= 7) {
         uint8_t *z = malloc(total);
+        if (!z) { free(p); return NULL; }   /* out of memory must not look like a finding */
         size_t off = 0;
         for (int i = 0; i < nr; i++) { memcpy(z + off, p + at[i], len[i]); off += len[i]; }
         z[1] = (uint8_t)(z[1] & 0xc0);

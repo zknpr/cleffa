@@ -14,6 +14,7 @@
  * instrumented. Usage: test-jpeg-ub [CASE...]  (all cases without arguments) */
 #include "../clef_image.c"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -145,7 +146,14 @@ static int run(int c) {
 
 int main(int argc, char **argv) {
     int failures = 0;
-    if (argc > 1) for (int i = 1; i < argc; i++) failures += run(atoi(argv[i]));
+    for (int i = 1; i < argc; i++) {
+        /* whole numbers only: atoi ran "3junk" as case 3 */
+        char *end;
+        errno = 0;
+        const long c = strtol(argv[i], &end, 10);
+        if (!*argv[i] || *end || errno || c < 1 || c > 6) { fprintf(stderr, "jpeg ub: case must be 1-6, not \"%s\"\n", argv[i]); return 2; }
+    }
+    if (argc > 1) for (int i = 1; i < argc; i++) failures += run((int)strtol(argv[i], NULL, 10));
     else for (int c = 1; c <= 6; c++) failures += run(c);
     return failures ? 1 : 0;
 }
