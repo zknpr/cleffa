@@ -59,8 +59,9 @@ make clean
   single-component progressive DC scans in raster order, libjpeg's h1v2 (4:4:0) upsampling, SOF1
   as baseline, libjpeg's write for an overshooting refinement run, refusal of progressive images
   libjpeg would smooth, fill bytes before markers skipped one at a time, `FF FF 00` in entropy
-  data refused (libjpeg-turbo's result for it is not stable), one-component frames as 1x1, a no-op
-  `JPEG_RANGE_HOOK` for the differential fuzzer) and
+  data refused (libjpeg-turbo's result for it is not stable), one-component frames as 1x1,
+  three-component frames copied as RGB under libjpeg's JFIF/Adobe/component-id rule, a progressive
+  frame with no scan refused, a no-op `JPEG_RANGE_HOOK` for the differential fuzzer) and
   optional PNG inflate/CRC hooks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;

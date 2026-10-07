@@ -88,7 +88,11 @@ def cjpeg_variants(tmp: Path, gray: bool):
             ("restart-2-prog", ["-sample", "2x2,1x1,1x1", "-restart", "2", "-progressive", *q]),
             ("optimize", ["-optimize", *q]), ("q1", ["-quality", "1"]), ("q100", ["-quality", "100"]),
             ("dct-float", ["-dct", "float", *q]), ("smooth", ["-smooth", "50", *q]),
-            ("arithmetic", ["-arithmetic", *q]), ("12bit", ["-precision", "12", *q]), ("lossless", ["-lossless", "1"])]
+            ("arithmetic", ["-arithmetic", *q]), ("12bit", ["-precision", "12", *q]), ("lossless", ["-lossless", "1"]),
+            # RGB-coded files (Adobe transform 0, ids 'R','G','B'), which libjpeg copies rather than
+            # converting; none were in this corpus when review #3 found the decoder converted them
+            ("rgb", ["-rgb", *q]), ("rgb-prog", ["-rgb", "-progressive", *q]),
+            ("rgb-s2x2", ["-rgb", "-sample", "2x2,1x1,1x1", *q])]
     return out
 
 

@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2) | 70/70 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; and 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded) | 83/83 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -230,6 +230,30 @@ sanitizer report, out-of-memory or timeout. Its comparison covers files libjpeg 
 warning and whose coefficients stay in the range encoders produce; refusals are classified by
 `tests/test_image_diff.py`, not by the fuzzer. Logs and every finding are in
 `golden/fuzz-image-2026-10-07/`.
+
+A sixth round (Codex on `b1e7dd2`) raised three points. (22) Confirmed: every three-component JPEG
+was converted from YCbCr, but libjpeg (`default_decompress_parms`, which Pillow leaves in charge)
+treats one as RGB-coded and copies its planes when it has no JFIF marker and either an Adobe APP14
+transform of 0 or, without an Adobe marker, component ids `R`, `G`, `B`. `cjpeg -rgb` writes such
+files; none were in the encoder corpus, the fuzzer never produced one from YCbCr seeds, and the old
+decoder got all 78 that the corpus now builds (baseline, progressive and 2x2-sampled) wrong by up to
+255 levels. The decoder now records the JFIF and Adobe markers seen before the first scan, where
+libjpeg fixes the colour space, and copies RGB-coded planes after the same upsampling.
+`tests/test_image.py` adds 13 files with rewritten markers and ids, four RGB-coded and the rest
+YCbCr controls (JFIF over Adobe, Adobe over ids, an unknown transform, unknown ids, and an RGB
+transform that only arrives after the first scan); the seed corpus and fuzz dictionary gained
+RGB-coded files and the APP14 tokens. (23) Confirmed: a progressive file cut before its first scan
+and closed with EOI decoded as a blank image, where libjpeg fails with `JERR_SOF_NO_SOS` ("missing
+SOS marker") and Pillow refuses it; such a frame is now refused (the baseline cut already was). (24) Refuted: two copies
+of one `media_kwargs` bound do not pass the both-bounds check, because the JSON DOM merges a
+repeated key as `json.loads` does (also through escapes, `max\u005fpixels`), so the object has one
+member and is refused like any lone bound. `tests/test_server_images.py` now sends both repeated
+forms as raw bodies to keep the merge and the check tied together. A fifth differential run on
+the fixed decoder, from the earlier corpus plus the new seeds, executed 46.8 million inputs in 15
+minutes with 14 workers with no pixel difference, sanitizer report, out-of-memory or timeout
+(`golden/fuzz-image-2026-10-07/diff-run5.log`; the old build's corpus failures and the cut files
+are in `review6/` there). The encoder corpus now has 1,759 files, 1,613 of them comparable and
+identical.
 
 ## Numerical parity
 

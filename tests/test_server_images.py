@@ -67,12 +67,12 @@ class Server:
                 fail(f"server did not start ({name})")
             time.sleep(0.5)
 
-    def post(self, req: dict, key: str | None = None) -> tuple[int, bytes]:
+    def post(self, req: dict, key: str | None = None, raw: bytes | None = None) -> tuple[int, bytes]:
         c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=600)
         headers = {"Content-Type": "application/json"}
         if key is not None:
             headers["X-Clef-Prefix-Cache"] = key
-        body = json.dumps(req).encode()
+        body = raw if raw is not None else json.dumps(req).encode()
         try:
             c.request("POST", "/v1/systemone", body, headers)
             r = c.getresponse()
@@ -189,6 +189,16 @@ with tempfile.TemporaryDirectory() as t:
             fail(f"oversized image with media_kwargs: {st} {body[:200]!r}")
         st, body = plain.post(dict(small, images=[tiny], media_kwargs={"max_pixels": 65536}))
         expect(st, body, 400, "both min_pixels and max_pixels", "lone bound")
+        # A repeated key collapses to one, as json.loads makes it before the processor ignores the lone
+        # bound. Codex read the member count as counting copies (refuted on b1e7dd2); this keeps the
+        # parser's merge and the count check tied together. Raw bytes: json.dumps cannot repeat a key.
+        lone = json.dumps(dict(small, images=[tiny], media_kwargs={"max_pixels": 65536}))
+        for repeated in ('{"max_pixels": 65536, "max_pixels": 102400}', '{"max_pixels": 65536, "max\\u005fpixels": 102400}'):
+            raw = lone.replace('{"max_pixels": 65536}', repeated)
+            if raw == lone:
+                fail("repeated-bound fixture did not rewrite media_kwargs")
+            st, body = plain.post({}, raw=raw.encode())
+            expect(st, body, 400, "both min_pixels and max_pixels", f"repeated bound {repeated}")
         st, body = plain.post(dict(small, images=["not base64!"]))
         expect(st, body, 400, "images[0]", "bad base64")
         st, body = plain.post(dict(small, images=[base64.b64encode(base64.b64decode(tiny)[:40]).decode()]))
@@ -198,7 +208,7 @@ with tempfile.TemporaryDirectory() as t:
         st, body = plain.post(dict(small, state="<|image_pad|> in the state"))
         if st != 200:
             fail(f"strict mode: placeholder text was not served: {st} {body[:200]!r}")
-        print("limits and errors: five images, 2,304-token image, lone media_kwargs bound, bad base64, truncated PNG, video, WebP and a mislabeled "
+        print("limits and errors: five images, 2,304-token image, lone or repeated media_kwargs bound, bad base64, truncated PNG, video, WebP and a mislabeled "
               "object rejected; mislabeled and WebP data URLs rejected; a tiny image with huge bounds refused in %.2f s before any resize; "
               "out-of-range media_kwargs rejected; an 8192x8192 source refused at its header in %.2f s, a 4096x4096 one served; "
               "data URL, object and bare forms equal; placeholder text served" % (huge_s, src_s))

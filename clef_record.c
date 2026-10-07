@@ -214,6 +214,8 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         const jval *mk = json_get(req, "media_kwargs");
         if (mk && mk->type != J_NULL) {
             if (mk->type != J_OBJECT) return fail(err, errlen, "media_kwargs must be an object", NULL, 0);
+            /* n counts distinct keys: the DOM merges a repeated key as json.loads does (clef_json.h), so
+             * {"min_pixels": a, "min_pixels": b} is one member and refused here like any lone bound. */
             if (mk->n == 1) return fail(err, errlen, "media_kwargs: give both min_pixels and max_pixels (the reference ignores one alone)", NULL, 0);
             for (size_t i = 0; i < mk->n; i++) {
                 const jmember *m = &mk->members[i];

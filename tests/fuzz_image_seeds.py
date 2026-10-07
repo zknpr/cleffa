@@ -63,4 +63,11 @@ save(base64.b64decode(test_image.LUMA_UNDER_CHROMA_JPEG), "luma-under-chroma.jpg
 # otherwise never sees (review #3 found the decoder mishandled it)
 save(base64.b64decode(test_image.SEPARATE_DC_SCANS_37X21), "separate-dc-37x21.jpg")
 save(base64.b64decode(test_image.SEPARATE_DC_SCANS_32X32), "separate-dc-32x32.jpg")
+# RGB-coded JPEGs (Adobe transform 0; ids 'R','G','B'), which libjpeg copies instead of converting: the
+# differential fuzzer never produced one from YCbCr seeds, and review #3 found them decoded wrong
+for prog in (False, True):
+    buf = io.BytesIO()
+    Image.fromarray(arr(17, 33, 3)).save(buf, "JPEG", quality=85, subsampling=2, progressive=prog)
+    save(test_image.with_colour_markers(buf.getvalue(), jfif=False, adobe=0), f"adobe0{'-prog' if prog else ''}.jpg")
+    save(test_image.with_colour_markers(buf.getvalue(), jfif=False, ids=b"RGB"), f"rgb-ids{'-prog' if prog else ''}.jpg")
 print(f"{n} seeds in {out}")

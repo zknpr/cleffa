@@ -75,6 +75,9 @@
  *     is refused (libjpeg's smoothing_ok() condition);
  *   - a one-component frame decodes as 1x1 whatever sampling factors it declares, as libjpeg
  *     does;
+ *   - three components are RGB-coded, and copied, under libjpeg's rule (no JFIF marker, and an
+ *     Adobe transform of 0 or, without one, component ids 'R','G','B'); a progressive frame
+ *     with no scan is refused, as libjpeg's JERR_SOF_NO_SOS;
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
  *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
  *     result for it depends on how its input is buffered. */
@@ -259,6 +262,8 @@ typedef struct {
     jpeg_huff_table huff[4];
     unsigned huff_defined;   /* cleffa: bit t set once a DHT defined huff[t] */
     int8_t coef_bits[4][64]; /* cleffa: progressive precision per coefficient, -1 = never coded */
+    int scans_seen;          /* cleffa: SOS segments processed */
+    int saw_jfif, saw_adobe, adobe_transform;   /* cleffa: markers before the first SOS */
 
     /* DC prediction for each component */
     int dc_pred[4];
@@ -690,6 +695,16 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
     }
 
     return 0;
+}
+
+/* cleffa: libjpeg's colour-space choice for three components (jdapimin.c default_decompress_parms,
+ * which Pillow leaves in charge): a JFIF marker means YCbCr; otherwise an Adobe marker decides
+ * (transform 0 = RGB, anything else YCbCr); otherwise component ids 'R','G','B' mean RGB. Converting
+ * RGB-coded planes as YCbCr gave wrong colours where Pillow copies them. */
+static int jpeg_rgb_coded(const jpeg_decoder *dec) {
+    if (dec->num_components != 3 || dec->saw_jfif) return 0;
+    if (dec->saw_adobe) return dec->adobe_transform == 0;
+    return dec->comp[0].id == 82 && dec->comp[1].id == 71 && dec->comp[2].id == 66;
 }
 
 /* YCbCr to RGB conversion */
@@ -1466,12 +1481,21 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 }
             }
 
+        } else if ((marker == 0xE0 || marker == 0xEE) && !dec.scans_seen) {
+            /* cleffa: libjpeg's examine_app0 / examine_app14. The colour space is decided at
+             * the first SOS (jdapimin.c default_decompress_parms), so later markers do not count. */
+            const uint8_t *d = file_data + pos + 2;
+            const size_t n = seg_len >= 2 ? (size_t)seg_len - 2 : 0;
+            if (marker == 0xE0 && n >= 14 && !memcmp(d, "JFIF\0", 5)) dec.saw_jfif = 1;
+            if (marker == 0xEE && n >= 12 && !memcmp(d, "Adobe", 5)) { dec.saw_adobe = 1; dec.adobe_transform = d[11]; }
+
         } else if (marker == JPEG_DRI) {
             if (seg_len < 4) goto fail;
             dec.restart_interval = (file_data[pos + 2] << 8) | file_data[pos + 3];
 
         } else if (marker == JPEG_SOS) {
             /* Start of scan */
+            dec.scans_seen++;
             if (seg_len < 6) goto fail;
 
             int ns = file_data[pos + 2];
@@ -1628,13 +1652,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                         }
                     }
                 } else {
+                    const int rgb_coded = jpeg_rgb_coded(&dec);
                     for (int y = 0; y < dec.height; y++) {
                         for (int x = 0; x < dec.width; x++) {
                             uint8_t yy = y_data[y * y_stride + x];
                             uint8_t cb = jpeg_sample_chroma(&dec, 1, cb_data, cb_stride, x, y);
                             uint8_t cr = jpeg_sample_chroma(&dec, 2, cr_data, cr_stride, x, y);
 
-                            jpeg_ycbcr_to_rgb(yy, cb, cr, img->data + (y * dec.width + x) * 3);
+                            uint8_t *o = img->data + (y * dec.width + x) * 3;
+                            if (rgb_coded) { o[0] = yy; o[1] = cb; o[2] = cr; }
+                            else jpeg_ycbcr_to_rgb(yy, cb, cr, o);
                         }
                     }
                 }
@@ -1651,6 +1678,10 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
 
     /* For progressive, finish decoding after all scans */
     if (dec.is_progressive) {
+        /* cleffa: a progressive frame that reached EOI before any scan is not an image; libjpeg
+         * fails with JERR_SOF_NO_SOS ("missing SOS marker"), and finishing it here returned a
+         * blank picture. */
+        if (!dec.scans_seen) goto fail;
         /* Allocate pixel planes */
         uint8_t *planes[4] = {NULL, NULL, NULL, NULL};
         int strides[4] = {0, 0, 0, 0};
@@ -1701,13 +1732,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 }
             }
         } else {
+            const int rgb_coded = jpeg_rgb_coded(&dec);
             for (int y = 0; y < dec.height; y++) {
                 for (int x = 0; x < dec.width; x++) {
                     uint8_t yy = planes[0][y * strides[0] + x];
                     uint8_t cb = jpeg_sample_chroma(&dec, 1, planes[1], strides[1], x, y);
                     uint8_t cr = jpeg_sample_chroma(&dec, 2, planes[2], strides[2], x, y);
 
-                    jpeg_ycbcr_to_rgb(yy, cb, cr, img->data + (y * dec.width + x) * 3);
+                    uint8_t *o = img->data + (y * dec.width + x) * 3;
+                    if (rgb_coded) { o[0] = yy; o[1] = cb; o[2] = cr; }
+                    else jpeg_ycbcr_to_rgb(yy, cb, cr, o);
                 }
             }
         }

@@ -199,6 +199,48 @@ def with_padded_stuffing(jpeg: bytes) -> bytes:
     return head + body[:2 + seg] + body[2 + seg:].replace(b"\xff\x00", b"\xff\xff\x00")
 
 
+def with_colour_markers(jpeg: bytes, *, jfif: bool, adobe: int | None = None, ids: bytes = b"\x01\x02\x03",
+                        adobe_after_first_scan: bool = False) -> bytes:
+    """A three-component Pillow JPEG with its colour-space signals rewritten: the JFIF APP0 kept or
+    dropped, an Adobe APP14 with the given transform added (before the frame, or after the first
+    scan), and the component ids in the frame and every scan header replaced. The entropy-coded data
+    is unchanged, so libjpeg (and so Pillow) either converts the planes from YCbCr or copies them as
+    RGB, by jdapimin.c default_decompress_parms; the vendored decoder converted them in every case
+    (review #3, Codex on b1e7dd2)."""
+    remap = dict(zip(b"\x01\x02\x03", ids))
+    app14 = None if adobe is None else b"\xff\xee\x00\x0eAdobe\x00\x64\x00\x00\x00\x00" + bytes([adobe])
+    out, pos, scans = bytearray(jpeg[:2]), 2, 0
+    if app14 and not adobe_after_first_scan:
+        out += app14
+    while pos < len(jpeg):
+        assert jpeg[pos] == 0xFF
+        m = jpeg[pos + 1]
+        if m == 0xD9:
+            out += jpeg[pos:]
+            break
+        end = pos + 2 + int.from_bytes(jpeg[pos + 2:pos + 4], "big")
+        seg = bytearray(jpeg[pos:end])
+        if m == 0xDA:
+            if app14 and adobe_after_first_scan and scans == 1:
+                out += app14
+            scans += 1
+            for c in range(seg[4]):
+                seg[5 + 2 * c] = remap[seg[5 + 2 * c]]
+            while end + 1 < len(jpeg) and not (jpeg[end] == 0xFF and jpeg[end + 1] not in (0x00,) and not 0xD0 <= jpeg[end + 1] <= 0xD7):
+                end += 1
+            seg += jpeg[pos + len(seg):end]
+        elif m in (0xC0, 0xC2):
+            assert seg[9] == 3
+            for c in range(3):
+                seg[10 + 3 * c] = remap[seg[10 + 3 * c]]
+        if not (m == 0xE0 and seg[4:9] == b"JFIF\0" and not jfif):
+            out += seg
+        pos = end
+    if adobe_after_first_scan and scans < 2:
+        raise AssertionError("adobe_after_first_scan needs a file with at least two scans")
+    return bytes(out)
+
+
 def progressive_se255(arr: np.ndarray) -> bytes:
     """A progressive JPEG whose first AC scan declares Se = 255: the coefficient index ran past the
     64-entry zigzag table (global over-read feeding a heap write) until the scan header was validated."""
@@ -333,6 +375,24 @@ def main() -> None:
             sys.exit("gray-sampling fixture is not a one-component 1x1 frame")
         g[sof + 11] = 0x22
         cases.append(("gray-declared-2x2", base64.b64encode(bytes(g)).decode(), Image.open(io.BytesIO(bytes(g))), MIN_PIXELS, MAX_PIXELS))
+        # Three-component colour space, as libjpeg decides it: JFIF means YCbCr, otherwise an Adobe
+        # transform of 0 means RGB and any other YCbCr, otherwise ids 'R','G','B' mean RGB. The first
+        # two rows of each group are RGB-coded and decoded wrong before review #3's fix; the rest are
+        # YCbCr controls, including an RGB transform that arrives only after the first scan.
+        rgb_ids = b"RGB"
+        for prog, sub in ((False, 0), (True, 2)):
+            buf = io.BytesIO()
+            Image.fromarray(synth(np.random.default_rng(37), 29, 43)).save(buf, "JPEG", quality=85, subsampling=sub, progressive=prog)
+            variants = [("rgb-ids", dict(jfif=False, ids=rgb_ids)), ("adobe0", dict(jfif=False, adobe=0)),
+                        ("adobe1-rgb-ids", dict(jfif=False, adobe=1, ids=rgb_ids)),
+                        ("jfif-adobe0-rgb-ids", dict(jfif=True, adobe=0, ids=rgb_ids)),
+                        ("adobe2", dict(jfif=False, adobe=2)), ("other-ids", dict(jfif=False, ids=b"RGC"))]
+            if prog:
+                variants.append(("adobe0-after-scan", dict(jfif=False, adobe=0, adobe_after_first_scan=True)))
+            for vname, kw in variants:
+                data = with_colour_markers(buf.getvalue(), **kw)
+                cases.append((f"colour-{vname}{'-prog' if prog else ''}", base64.b64encode(data).decode(),
+                              Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
         lines = [json.dumps({"image": b64, "out": f"{tmp}/{name}", "min_pixels": mn, "max_pixels": mx})
                  for name, b64, _, mn, mx in cases]
         results = run_tool(lines)
@@ -402,6 +462,16 @@ def main() -> None:
             sys.exit("padded-stuffing fixture has too few stuffed bytes to test anything")
         bad.append(json.dumps({"image": base64.b64encode(padded).decode(), "out": f"{tmp}/bad7"}))
         bad.append(json.dumps({"image": FF_RUN_BEFORE_STUFFED_ZERO_JPEG, "out": f"{tmp}/bad8"}))
+        # A valid progressive file cut before its first scan and closed with EOI: libjpeg fails with
+        # JERR_SOF_NO_SOS ("missing SOS marker") and Pillow refuses it, but the vendored decoder
+        # returned a blank image (review #3, Codex on b1e7dd2). The baseline cut was already refused
+        # and stays a control.
+        for i, prog in enumerate((True, False)):
+            cut = io.BytesIO()
+            Image.fromarray(synth(np.random.default_rng(41), 24, 40)).save(cut, "JPEG", quality=85, progressive=prog)
+            data = cut.getvalue()
+            bad.append(json.dumps({"image": base64.b64encode(data[:data.index(b"\xff\xda")] + b"\xff\xd9").decode(),
+                                   "out": f"{tmp}/bad-no-scan{i}"}))
         raw = b"\0\x10\x20\x30"   # one RGB scanline, including its filter byte
         stream = zlib.compress(raw)
         corrupt_checksum = stream[:-1] + bytes([stream[-1] ^ 1])
@@ -423,7 +493,8 @@ def main() -> None:
         # the crafted JPEGs' unmodified sources still decode, and PIL reads the unusual sampling layout
         Image.open(io.BytesIO(base64.b64decode(LUMA_UNDER_CHROMA_JPEG))).load()
         print("errors: bad base64, truncated PNG, aspect ratio, 16-bit PNG, a non-base64 data URL, a progressive scan "
-              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, seven malformed zlib streams and three corrupt CRCs rejected"
+              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, seven malformed zlib "
+              "streams and three corrupt CRCs rejected"
               if not failures else "errors: see above")
     sys.exit(1 if failures else 0)
 
