@@ -43,12 +43,16 @@ Byte parity with the reference, `make test`:
 | Check | Test | Result |
 |---|---|---|
 | Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants) | 63/63 byte-identical to PIL, torchvision and the processor's `pixel_values` |
-| Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (41 image requests among 3,081) | 3,081/3,081 |
+| Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
 Divergences from the reference (it answers or behaves differently; the engine errors):
 videos; `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
-processor silently ignores a lone bound); PNGs that are 16-bit, sub-8-bit grayscale or
+processor silently ignores a lone bound), or bounds that are not positive integers within int32; a
+data URL whose media type is not `image/png` or `image/jpeg` or contradicts the bytes (the object
+form's `content_type` is checked the same way; the reference's PIL decode ignores both labels); an
+image whose resized grid alone exceeds the 16,384-token context, refused before any resize (the
+reference builds the patches and then fails on length); PNGs that are 16-bit, sub-8-bit grayscale or
 interlaced; JPEGs that are CMYK, 12-bit or arithmetic-coded, or whose first component is
 sampled below another (Y 1x1 under Cb 2x2, which libjpeg accepts); images over 64 MiB encoded,
 16,384 pixels on a side or 64 megapixels decoded; a literal `<|image_pad|>` in request text in
@@ -61,6 +65,31 @@ unmodified copy and rejected cleanly after: a progressive scan header with Se > 
 coefficient index past the zigzag table (global over-read feeding a heap write), and a legal
 luma-under-chroma sampling layout read past the luma plane in the color conversion. Both
 files are regression cases in `tests/test_image.py`.
+
+A second automated review, of the pull request (2026-10-07), raised seven points; each was
+checked against the code and, where it mattered, reproduced before the fix: (1) the per-image
+token limit was enforced after `clef_image_preprocess` had resized and allocated the patches, so a
+40x40 PNG with `media_kwargs` bounds of 67,108,864 pixels reached 1.85 GB resident (control at the
+default bounds: 40 MB) before being refused; the encoder now computes the geometry first and refuses
+the image at 38 MB and 0.26 s, also when its grid alone exceeds the context; (2) a data URL's
+media type was not checked against the signature while the object form's `content_type` was, so
+`data:image/jpeg;base64,<PNG>` was accepted; both forms now share one check; (3) `--max-images foo`
+and `--max-image-tokens 1k` started the server with "at most 0 per request, 1 tokens each" because
+`atoi`/`atol` read a typo as 0 (unlimited); both binaries now exit 2 on anything but a whole
+number; (4) `media_kwargs` integers were converted with `atol`, undefined for out-of-range input
+and safe here only because macOS saturates; they are parsed with `strtol` and `errno`; (5) the
+startup warm-up ran text only, so the first image request was also the first allocation of the
+vision scratch and the first touch of the tower's weight pages; the warm-up now includes an image
+sized to the per-image limit (1,024 tokens, 743 ms at startup on Flash). Measured with the two
+builds alternated, fresh server each, warm page cache, `v009` first then steady: old 0.816/0.814 s
+then about 0.775 s, new 0.820/0.824 s then about 0.770 s. The 40-50 ms first-request difference
+is the same with either build, so it is not the vision path (most likely activation capacity
+growth to the request's 1,363 tokens, which a text warm-up at `--batch-tokens` would cover); the
+image pass is kept for the cold-cache case, which was not measured; (6) `bench/vision_cache_latency.py`
+asserted prefix-token reuse only, which a resume after the image could satisfy without reusing
+features; it now requires the `image cache reused` count on every hit; (7) the
+`tests/test-vision-buffers` rule lacked `$(DEPFLAGS)`. Regressions: `tests/test_record.py`,
+`tests/test_server_images.py` (including the timed huge-bounds case) and `tests/test_cli_errors.py`.
 
 ## Numerical parity
 

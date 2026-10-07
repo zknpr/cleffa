@@ -229,7 +229,13 @@ BF16; the merger input is four consecutive patch rows (merge-window order makes 
 
 Images come in the hosted API's two forms in the request's `images` list, a `data:` URL or a
 `{"content_type", "base64"}` object (bare base64 is an extension); `image_bytes` in `clef_record.c`
-checks a declared type against the signature and rejects WebP. `clef_image.c`
+checks a declared type (object `content_type` or data URL media type) against the signature and
+rejects WebP. The encoder computes each image's `smart_resize` geometry and refuses an image over
+the per-image limit or the context before resizing or allocating patches: the resized area is
+request-controlled through `media_kwargs` and reached 1.85 GB resident from a 40x40 file when the
+check came after preprocessing. `media_kwargs` integers are parsed range-checked, never with `atol`.
+The server's startup warm-up includes one image sized to the per-image limit when the model has a
+tower. `clef_image.c`
 reproduces the reference's `Qwen2VLImageProcessor` byte for byte (`tests/test_image.py`): PIL-style RGB
 conversion, `smart_resize`, PyTorch's native uint8 antialiased bicubic CPU kernel (what torchvision
 runs on this Mac; PIL differs by ±1 in hundreds of pixels, the float path by much more), f32

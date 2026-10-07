@@ -63,7 +63,7 @@ vision-gemm-bench: bench/vision_gemm_bench.m
 	$(CC) $(OBJCFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -framework Metal -framework Foundation
 
 tests/test-vision-buffers: tests/test_vision_buffers.m clef_metal.m clef_metal_src.inc clef.o clef_head.o $(HOST_OBJS)
-	$(CC) $(OBJCFLAGS) -fsanitize=address -o $@ tests/test_vision_buffers.m clef.o clef_head.o $(HOST_OBJS) $(LDFLAGS) $(LDLIBS) $(FRAMEWORKS)
+	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -fsanitize=address -o $@ tests/test_vision_buffers.m clef.o clef_head.o $(HOST_OBJS) $(LDFLAGS) $(LDLIBS) $(FRAMEWORKS)
 
 test-vision-gemm: vision-gemm-bench tests/test-vision-buffers
 	./vision-gemm-bench

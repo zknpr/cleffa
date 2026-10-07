@@ -143,7 +143,22 @@ with tempfile.TemporaryDirectory() as t:
         other = "image/png" if kind == "image/jpeg" else "image/jpeg"
         st, body = plain.post(dict(small, images=[{"content_type": other, "base64": b64}]))
         expect(st, body, 400, "content_type says", "mislabeled image")
+        # review #3: a data URL's media type is checked like content_type
+        st, body = plain.post(dict(small, images=["data:%s;base64," % other + b64]))
+        expect(st, body, 400, "data URL media type says", "mislabeled data URL")
+        st, body = plain.post(dict(small, images=["data:image/webp;base64," + b64]))
+        expect(st, body, 400, "WebP is not supported", "webp data URL")
         tiny = png(40, 40)
+        # review #3: a 40x40 PNG forced to 8192x8192 by media_kwargs must be refused before the
+        # resize and the 1.6 GB patch allocation, not after (measured 1.85 GB resident before the fix)
+        t0 = time.monotonic()
+        st, body = plain.post(dict(small, images=[tiny], media_kwargs={"min_pixels": 67108864, "max_pixels": 67108864}))
+        huge_s = time.monotonic() - t0
+        expect(st, body, 400, "above the limit of 1024 per image", "tiny image with huge bounds")
+        if huge_s > 2.0:
+            fail(f"tiny image with huge bounds took {huge_s:.1f} s: the token check ran after the resize")
+        st, body = plain.post(dict(small, images=[tiny], media_kwargs={"min_pixels": 99999999999999999999, "max_pixels": 99999999999999999999}))
+        expect(st, body, 400, "must be a positive integer", "out-of-range media_kwargs")
         st, body = plain.post(dict(small, images=[tiny] * 5))
         expect(st, body, 400, "too many images", "five images")
         st, body = plain.post(dict(small, images=[tiny] * 4))
@@ -167,9 +182,14 @@ with tempfile.TemporaryDirectory() as t:
         if st != 200:
             fail(f"strict mode: placeholder text was not served: {st} {body[:200]!r}")
         print("limits and errors: five images, 2,304-token image, lone media_kwargs bound, bad base64, truncated PNG, video, WebP and a mislabeled "
-              "object rejected; data URL, object and bare forms equal; placeholder text served")
+              "object rejected; mislabeled and WebP data URLs rejected; a tiny image with huge bounds refused in %.2f s before any resize; "
+              "out-of-range media_kwargs rejected; data URL, object and bare forms equal; placeholder text served" % huge_s)
     finally:
         plain.stop()
+    log = plain.log_path.read_text()
+    if "warm-up image pass" not in log:
+        fail("the server did not warm the vision path at startup (review #3)")
+    print("startup: " + next(l for l in log.splitlines() if "warm-up image pass" in l).strip())
 
     raised = Server(["--max-images", "5", "--max-image-tokens", "4096", "--no-strict"], tmp, "raised")
     try:

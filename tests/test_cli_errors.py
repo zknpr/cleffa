@@ -33,7 +33,10 @@ class CliErrors(unittest.TestCase):
                 self.assertNotIn("cannot open", p.stderr)
 
     def test_image_limit_flags_are_validated_before_model_open(self):
-        for args in (["--max-images", "-1"], ["--max-image-tokens", "-5"]):
+        # negatives, non-numbers, suffixes, empty and out-of-range values: atoi would have read "foo"
+        # as 0, which means unlimited, so a typo silently lifted the cap (review #3)
+        for args in (["--max-images", "-1"], ["--max-image-tokens", "-5"], ["--max-images", "foo"], ["--max-image-tokens", "1k"],
+                     ["--max-images", ""], ["--max-image-tokens", "99999999999999999999"]):
             for binary in ("clef", "clef-server"):
                 with self.subTest(binary=binary, args=args):
                     p = subprocess.run([ROOT / binary, "-m", "/nonexistent", *args, *(["--port", "1"] if binary == "clef-server" else [])],

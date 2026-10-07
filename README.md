@@ -64,7 +64,8 @@ printf '{"model":"clef","state":{"task":"Review the attached receipt."},"images"
 
 The hosted schema also lists `image/webp`, which this build rejects (PNG and JPEG only), and it
 caps each image at 4 MiB and 16 megapixels with 4 images per request; the engine's own caps are
-in the security notes. A `content_type` that contradicts the file's signature is an error.
+in the security notes. A `content_type`, or a data URL media type, that contradicts the file's
+signature is an error; a data URL without a media type is decoded by its signature.
 
 The engine reproduces the reference's image processor byte for byte (PIL decoding, `smart_resize`,
 torchvision's uint8 bicubic resize, normalization, patch layout) and runs the Qwen3.5 vision
@@ -92,7 +93,9 @@ curl -s localhost:8080/v1/systemone -d '{"model":"clef","state":"Our checkout is
 
 `POST /v1/systemone` takes a Jev/SystemOne request body and returns the same response body.
 `GET /health` reports status. On startup the server runs one warm-up forward pass, which
-faults in the weights and allocates buffers (`--no-warmup` to skip). The server micro-batches concurrent requests into one forward pass,
+faults in the weights and allocates buffers, plus, when the model has a vision tower, one pass
+with an image sized to the per-image token limit so the first image request pays for neither the
+vision scratch nor the tower's weight pages (`--no-warmup` to skip both). The server micro-batches concurrent requests into one forward pass,
 up to `--batch` requests (default 8) and `--batch-tokens` tokens (default 4096). Because results
 don't depend on batch composition, this is invisible to clients. A request larger than the token
 budget runs alone, so short requests never share a forward pass with a long one
@@ -352,8 +355,8 @@ Host-side pieces must match Python byte for byte, and they do:
 |---|---|
 | Tokenizer vs HF | 25,677 / 25,677 strings, including an NFC control arm |
 | `json.dumps` / `repr(float)` / `round()` | 404k floats, 240k roundings, 20k documents |
-| Request encoding (`encode_record`) | 3,081 requests, 41 with images (ids, spans, image runs, 3D positions) |
-| Response building (`systemone_answer`) | 1,336 responses |
+| Request encoding (`encode_record`) | 3,089 requests, 43 with images (ids, spans, image runs, 3D positions) |
+| Response building (`systemone_answer`) | 1,338 responses |
 | Image decoding, resizing, normalization, patches, position interpolation | 60 PNG/JPEG images of every color type, byte-identical to PIL, torchvision and the processor |
 
 **Images.** The vision tower runs its 27 layers before any text is read, so operand rounding there
@@ -725,7 +728,11 @@ differently:
 - a question with an empty id and no instructions (the reference returns NaN);
 - videos;
 - `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
-  processor silently ignores a lone bound);
+  processor silently ignores a lone bound); bounds that are not positive integers within int32;
+- a data URL whose media type is not `image/png` or `image/jpeg`, or contradicts the bytes (the
+  reference's PIL decode ignores the label);
+- an image whose resized grid alone exceeds the context (16,384 tokens), refused before any
+  resize or patch allocation (the reference would build the patches and fail on length);
 - images the vendored decoders do not read: 16-bit, low-bit grayscale or interlaced PNGs, CMYK,
   12-bit, arithmetic-coded or luma-under-chroma-sampled JPEGs, WebP; and images over the decode
   limits;

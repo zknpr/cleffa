@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <strings.h>
 
@@ -47,12 +48,39 @@ static void render(jbuf *b, const jval *v) {
  * "image/jpeg" | "image/webp", "base64": "..."}. A bare base64 string is taken as well, an
  * extension for the CLI and tests. The declared type is checked against the file's signature
  * after decoding, so a mislabeled image is an error rather than a silently different format. */
+/* The declared type against the file's signature, for both wire forms: a mislabeled image is an
+ * error rather than a silently different format (the reference's PIL decode ignores the label).
+ * Frees the bytes on a mismatch. */
+static bool signature_matches(const char *declared, const char *label, uint8_t **bytes, size_t n, size_t index, char *err, size_t errlen) {
+    const bool png = n >= 8 && !memcmp(*bytes, "\x89PNG\r\n\x1a\n", 8);
+    const bool jpeg = n >= 2 && (*bytes)[0] == 0xff && (*bytes)[1] == 0xd8;
+    if ((declared[0] == 'P') == png && (declared[0] == 'J') == jpeg) return true;
+    snprintf(err, errlen, "images[%zu]: %s says %s but the data is %s", index, label, declared,
+             png ? "PNG" : jpeg ? "JPEG" : "neither PNG nor JPEG");
+    free(*bytes);
+    *bytes = NULL;
+    return false;
+}
+
 static bool image_bytes(const jval *im, size_t index, uint8_t **bytes, size_t *n, char *err, size_t errlen) {
     char ierr[256];
     const char *declared = NULL;
     if (im->type == J_STRING) {
+        if (im->len >= 5 && !strncasecmp(im->s, "data:", 5)) {
+            /* data:[<mediatype>][;base64],<payload>. A media type, when present, must name a format
+             * the decoders take and must match the bytes, exactly as content_type must below; an
+             * absent type leaves the signature to decide. MIME types compare case-insensitively.
+             * (review #3: the string form skipped this check while the object form enforced it) */
+            const char *p = im->s + 5, *end = im->s + im->len, *q = p;
+            while (q < end && *q != ';' && *q != ',') q++;
+            const size_t tlen = (size_t)(q - p);
+            if (tlen == 9 && !strncasecmp(p, "image/png", 9)) declared = "PNG";
+            else if (tlen == 10 && !strncasecmp(p, "image/jpeg", 10)) declared = "JPEG";
+            else if (tlen == 10 && !strncasecmp(p, "image/webp", 10)) { snprintf(err, errlen, "images[%zu]: WebP is not supported (PNG or JPEG only)", index); return false; }
+            else if (tlen) { snprintf(err, errlen, "images[%zu]: data URL media type must be image/png or image/jpeg, not %.*s", index, (int)(tlen > 40 ? 40 : tlen), p); return false; }
+        }
         if (!clef_base64_decode(im->s, im->len, bytes, n, ierr, sizeof(ierr))) { snprintf(err, errlen, "images[%zu]: %s", index, ierr); return false; }
-        return true;
+        return !declared || signature_matches(declared, "data URL media type", bytes, *n, index, err, errlen);
     }
     if (im->type != J_OBJECT) { snprintf(err, errlen, "images[%zu]: must be a data URL string or {\"content_type\", \"base64\"}", index); return false; }
     const jval *ct = json_get(im, "content_type"), *b64 = json_get(im, "base64");
@@ -66,16 +94,7 @@ static bool image_bytes(const jval *im, size_t index, uint8_t **bytes, size_t *n
     else { snprintf(err, errlen, "images[%zu]: content_type must be image/png, image/jpeg or image/webp", index); return false; }
     if (b64->len >= 5 && !strncasecmp(b64->s, "data:", 5)) { snprintf(err, errlen, "images[%zu]: base64 must not be a data URL", index); return false; }
     if (!clef_base64_decode(b64->s, b64->len, bytes, n, ierr, sizeof(ierr))) { snprintf(err, errlen, "images[%zu]: %s", index, ierr); return false; }
-    const bool png = *n >= 8 && !memcmp(*bytes, "\x89PNG\r\n\x1a\n", 8);
-    const bool jpeg = *n >= 2 && (*bytes)[0] == 0xff && (*bytes)[1] == 0xd8;
-    if ((declared[0] == 'P') != png || (declared[0] == 'J') != jpeg) {
-        snprintf(err, errlen, "images[%zu]: content_type says %s but the data is %s", index, declared,
-                 png ? "PNG" : jpeg ? "JPEG" : "neither PNG nor JPEG");
-        free(*bytes);
-        *bytes = NULL;
-        return false;
-    }
-    return true;
+    return signature_matches(declared, "content_type", bytes, *n, index, err, errlen);
 }
 
 /* split: strict mode for request-derived text (see clef_encode_opts.strict) */
@@ -197,8 +216,20 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
                 const bool is_min = m->klen == 10 && !memcmp(m->key, "min_pixels", 10);
                 const bool is_max = m->klen == 10 && !memcmp(m->key, "max_pixels", 10);
                 if (!is_min && !is_max) return fail(err, errlen, "media_kwargs: only min_pixels and max_pixels are supported, not %.*s", m->key, m->klen);
-                long value = m->val->type == J_INT ? atol(m->val->s) : 0;
-                if (m->val->type != J_INT || value <= 0 || value > INT32_MAX) {
+                /* strtol over the token's own bytes: atol on an out-of-range number is undefined
+                 * behavior, and only a saturating libc made it look safe (review #3). */
+                char num[24];
+                long value = 0;
+                bool is_int = m->val->type == J_INT && m->val->len > 0 && m->val->len < sizeof(num);
+                if (is_int) {
+                    memcpy(num, m->val->s, m->val->len);
+                    num[m->val->len] = 0;
+                    char *endp;
+                    errno = 0;
+                    value = strtol(num, &endp, 10);
+                    is_int = errno == 0 && endp == num + m->val->len;
+                }
+                if (!is_int || value <= 0 || value > INT32_MAX) {
                     return fail(err, errlen, "media_kwargs: %.*s must be a positive integer", m->key, m->klen);
                 }
                 if (is_min) prm.min_pixels = value; else prm.max_pixels = value;
@@ -215,14 +246,21 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
             clef_rgb rgb = {0};
             out->n_images = (int)i + 1;   /* freed by clef_record_free even when this one fails */
             if (!image_bytes(im, i, &bytes, &n, err, errlen)) return false;
-            bool ok = clef_image_decode(bytes, n, &rgb, ierr, sizeof(ierr)) &&
-                      clef_image_preprocess(&rgb, &prm, &out->images[i].pt, ierr, sizeof(ierr));
-            const int width = rgb.width, height = rgb.height;
+            bool ok = clef_image_decode(bytes, n, &rgb, ierr, sizeof(ierr));
             free(bytes);
-            clef_rgb_free(&rgb);
-            if (!ok) { snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
-            const long tokens = out->images[i].pt.n_tokens;
+            const int width = rgb.width, height = rgb.height;
+            /* Bound the work before doing it. The resize buffer and the f32 patches scale with the
+             * resized area, which media_kwargs can push to 268 Mpx (16384x16384, about 6 GB of
+             * patches) from a 40x40 file; the per-image limit used to be checked only after that
+             * allocation (review #3). Compute the geometry first and refuse what the per-image
+             * limit forbids or what no request could hold, then resize and patch. */
+            const int factor = prm.patch * prm.merge;
+            int rh = 0, rw = 0;
+            ok = ok && clef_smart_resize(height, width, factor, prm.min_pixels, prm.max_pixels, &rh, &rw, ierr, sizeof(ierr));
+            if (!ok) { clef_rgb_free(&rgb); snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
+            const long tokens = (long)(rh / factor) * (rw / factor);
             if (opts.vision.max_image_tokens > 0 && tokens > opts.vision.max_image_tokens) {
+                clef_rgb_free(&rgb);
                 /* one token per merge window of patch*merge pixels on each side */
                 const long px_per_token = (long)prm.patch * prm.patch * prm.merge * prm.merge;
                 snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens, above the limit of %ld per image; "
@@ -231,6 +269,16 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
                          opts.vision.max_image_tokens * px_per_token);
                 return false;
             }
+            if (tokens > opts.max_length) {
+                clef_rgb_free(&rgb);
+                snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens, more than a request holds (%d)",
+                         i, width, height, tokens, opts.max_length);
+                return false;
+            }
+            ok = clef_image_preprocess(&rgb, &prm, &out->images[i].pt, ierr, sizeof(ierr));
+            clef_rgb_free(&rgb);
+            if (!ok) { snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
+            if (out->images[i].pt.n_tokens != tokens) return fail(err, errlen, "internal: image token count changed after preprocessing", NULL, 0);
             if (out->n_image_tokens > INT32_MAX - tokens) return fail(err, errlen, "too many image tokens", NULL, 0);
             out->n_image_tokens += (int32_t)tokens;
         }

@@ -22,6 +22,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,18 @@ static bool emit(item *it, float **p, bool logits) {
     return ok;
 }
 
+/* Whole non-negative number spanning the whole argument. atoi would turn a typo into 0, and 0
+ * means the reference's (unlimited) behavior, so a mistyped limit must be an error (review #3). */
+static bool parse_count(const char *s, long max, long *out) {
+    if (!*s || strspn(s, "0123456789") != strlen(s)) return false;
+    errno = 0;
+    char *end;
+    const long v = strtol(s, &end, 10);
+    if (errno || *end || v > max) return false;
+    *out = v;
+    return true;
+}
+
 int main(int argc, char **argv) {
     const char *model = NULL, *input = NULL, *dump_path = NULL;
     bool logits = false, timing = false, strict = false, no_truncate = true, prefix_cache = false, template_cache = false;
@@ -91,8 +104,14 @@ int main(int argc, char **argv) {
     long max_image_tokens = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
-        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) max_images = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) max_image_tokens = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
+            long v;
+            if (!parse_count(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef: --max-images must be a whole number (0 = the reference's limit)\n"); return 2; }
+            max_images = (int)v;
+        }
+        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) {
+            if (!parse_count(argv[++i], LONG_MAX, &max_image_tokens)) { fprintf(stderr, "clef: --max-image-tokens must be a whole number (0 = the reference's limit)\n"); return 2; }
+        }
         else if (!strcmp(argv[i], "--logits")) logits = true;
         else if (!strcmp(argv[i], "--time")) timing = true;
         else if (!strcmp(argv[i], "--strict")) strict = true;
@@ -114,7 +133,6 @@ int main(int argc, char **argv) {
         else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-images N] [--max-image-tokens N] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
     }
     if (!model || batch < 1) { fprintf(stderr, "clef: -m MODEL.gguf is required\n"); return 2; }
-    if (max_images < 0 || max_image_tokens < 0) { fprintf(stderr, "clef: --max-images and --max-image-tokens must be non-negative\n"); return 2; }
     if (prefix_cache && (batch != 1 || dump_path)) { fprintf(stderr, "clef: %s takes one request per pass and no --dump\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
     FILE *in = input ? fopen(input, "r") : stdin;
     if (!in) { fprintf(stderr, "clef: cannot open %s\n", input); return 1; }

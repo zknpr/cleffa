@@ -33,6 +33,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -581,16 +582,18 @@ static void lingering_close(int fd) {
 
 /* One forward pass before accepting connections: faults in the weight pages, wires the
  * Metal buffers and allocates activations, so the first client does not pay for it
- * (measured: first request 208-223 ms vs 95 ms steady, with a warm OS page cache). */
-static bool warmup(char *err, size_t errlen) {
-    static const char req_text[] =
-        "{\"model\":\"warmup\",\"state\":\"warm-up request\",\"questions\":"
-        "{\"q\":{\"type\":\"choice\",\"criteria\":{\"a\":\"x\",\"b\":\"y\"}}}}";
+ * (measured: first request 208-223 ms vs 95 ms steady, with a warm OS page cache).
+ * When the model has a vision tower, a second pass carries one image sized to the per-image
+ * limit (a 1x1 PNG the processor upscales through media_kwargs), so the vision scratch is
+ * allocated at the size the first real image needs and the tower's weight pages are faulted
+ * in too; a text-only warm-up left both to the first image request (review #3). */
+static bool run_warm_request(const char *req_text, size_t len, char *err, size_t errlen) {
     jarena *a = jarena_new();
     if (!a) { snprintf(err, errlen, "out of memory"); return false; }
-    jval *req = json_parse(a, req_text, sizeof(req_text) - 1, err, errlen);
+    jval *req = json_parse(a, req_text, len, err, errlen);
     clef_record rec;
     clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
+    opts.vision = S.e->vision;
     bool ok = req && clef_encode_request(S.e->tok, req, opts, &rec, err, errlen);
     if (ok) {
         float ***probs = NULL;
@@ -600,6 +603,33 @@ static bool warmup(char *err, size_t errlen) {
     }
     jarena_free(a);
     return ok;
+}
+
+static bool warmup(char *err, size_t errlen) {
+    static const char req_text[] =
+        "{\"model\":\"warmup\",\"state\":\"warm-up request\",\"questions\":"
+        "{\"q\":{\"type\":\"choice\",\"criteria\":{\"a\":\"x\",\"b\":\"y\"}}}}";
+    if (!run_warm_request(req_text, sizeof(req_text) - 1, err, errlen)) return false;
+    if (!S.e->vision.image_token_id) return true;
+    /* side = floor(sqrt(limit)) merge windows, so the upscaled square stays within the limit;
+     * 1,024 tokens when the limit is off, 4,096 at most (about 3 s on Flash at startup). */
+    long limit = S.max_image_tokens > 0 ? S.max_image_tokens : 1024;
+    if (limit > 4096) limit = 4096;
+    long side = 1;
+    while ((side + 1) * (side + 1) <= limit) side++;
+    const long window = (long)S.e->vision.image.patch * S.e->vision.image.merge;
+    const long px = side * window * side * window;
+    char req_image[512];
+    const int n = snprintf(req_image, sizeof(req_image),
+        "{\"model\":\"warmup\",\"state\":\"warm-up request\",\"images\":[\"data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mNoaGgAAAMEAYF1LgG8AAAAAElFTkSuQmCC\"],"
+        "\"media_kwargs\":{\"min_pixels\":%ld,\"max_pixels\":%ld},"
+        "\"questions\":{\"q\":{\"type\":\"choice\",\"criteria\":{\"a\":\"x\",\"b\":\"y\"}}}}", px, px);
+    if (n < 0 || (size_t)n >= sizeof(req_image)) { snprintf(err, errlen, "warm-up request too long"); return false; }
+    const double t0 = now_ms();
+    if (!run_warm_request(req_image, (size_t)n, err, errlen)) return false;
+    fprintf(stderr, "clef-server: warm-up image pass: %ld image tokens in %.0f ms\n", side * side, now_ms() - t0);
+    return true;
 }
 
 static void *connection(void *arg) {
@@ -683,8 +713,17 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--template-cache")) S.template_cache = true;
         else if (!strcmp(argv[i], "--max-conn") && i + 1 < argc) S.max_conn = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) S.max_images = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) S.max_image_tokens = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
+            /* whole numbers only: atoi turned a typo into 0, which means unlimited (review #3) */
+            size_t v;
+            if (!parse_size(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef-server: --max-images must be a whole number (0 = unlimited)\n"); return 2; }
+            S.max_images = (int)v;
+        }
+        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) {
+            size_t v;
+            if (!parse_size(argv[++i], LONG_MAX, &v)) { fprintf(stderr, "clef-server: --max-image-tokens must be a whole number (0 = unlimited)\n"); return 2; }
+            S.max_image_tokens = (long)v;
+        }
         else {
             fprintf(stderr, "usage: clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] "
                             "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N] "
@@ -696,7 +735,6 @@ int main(int argc, char **argv) {
     if (getenv("CLEF_DEBUG_KEEPWARM_MS")) S.keep_warm_ms = atoi(getenv("CLEF_DEBUG_KEEPWARM_MS"));
     if (S.keep_warm_ms < 0) S.keep_warm_ms = 0;
     if (!model || S.batch < 1 || port <= 0 || port > 65535 || S.max_conn < 1) { fprintf(stderr, "clef-server: bad arguments\n"); return 2; }
-    if (S.max_images < 0 || S.max_image_tokens < 0) { fprintf(stderr, "clef-server: --max-images and --max-image-tokens must be non-negative\n"); return 2; }
     signal(SIGPIPE, SIG_IGN);
 
     char err[512];

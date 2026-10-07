@@ -59,11 +59,16 @@ def main():
                     reused = [int(n) for n in re.findall(r'prefix cache reused (\d+) of', result.stderr)]
                     if cached and (len(reused) != len(sequence) or reused[0] or not all(reused[1:])):
                         raise RuntimeError(f'expected one fill followed by hits: {reused}')
+                    # prefix tokens alone could be reused by resuming after the image; the image
+                    # features themselves must be reused on every hit (CLEF_STAGE_TIME line)
+                    features = [int(n) for n in re.findall(r'image cache reused (\d+) features', result.stderr)]
+                    if cached and (len(features) != len(sequence) - 1 or not all(features)):
+                        raise RuntimeError(f'expected image features reused on every hit: {features}')
                     entry = {'model': model, 'id': rid, 'arm': 'cached' if cached else 'plain', 'round': rep,
                              'request_sha256': hashlib.sha256(payload.encode()).hexdigest(),
                              'fill_or_first_ms': stats[0][1], 'warmup_ms': [t for _, t in stats[:args.warmup]],
                              'ms': [t for _, t in stats[args.warmup:]], 'tokens': [n for n, _ in stats],
-                             'reused_tokens': reused, 'stderr': result.stderr}
+                             'reused_tokens': reused, 'reused_image_features': features, 'stderr': result.stderr}
                     report['runs'].append(entry)
                     args.output.write_text(json.dumps(report, indent=2) + '\n')
                     print(f'{model} {rid} {entry["arm"]} round {rep}: {statistics.median(entry["ms"]):.1f} ms', flush=True)

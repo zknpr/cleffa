@@ -87,17 +87,26 @@ def rand_image(rng: random.Random):
 
 def image_payload(item) -> bytes | None:
     """The engine's rule for one images entry: decoded bytes, or None where it rejects
-    (unsupported content_type, a mislabeled object, a non-base64 data URL)."""
+    (unsupported or mislabeled content_type or data URL media type, a non-base64 data URL)."""
     if isinstance(item, str):
+        mtype = ""
         if item[:5].lower() == "data:":
             head, _, payload = item.partition(",")
             if not head.endswith(";base64"):
                 return None
+            mtype = head[5:].split(";", 1)[0].lower()
+            if mtype not in ("", "image/png", "image/jpeg"):   # WebP and anything else: unsupported
+                return None
             item = payload
         try:
-            return base64.b64decode(item, validate=True)
+            data = base64.b64decode(item, validate=True)
         except Exception:
             return None
+        if mtype:   # a declared type must match the signature, like content_type below
+            is_png, is_jpeg = data[:8] == b"\x89PNG\r\n\x1a\n", data[:2] == b"\xff\xd8"
+            if (mtype == "image/png") != is_png or (mtype == "image/jpeg") != is_jpeg:
+                return None
+        return data
     if not isinstance(item, dict) or not isinstance(item.get("content_type"), str) or not isinstance(item.get("base64"), str):
         return None
     if item["content_type"] not in ("image/png", "image/jpeg") or item["base64"][:5].lower() == "data:":
@@ -140,6 +149,17 @@ def image_requests(rng: random.Random) -> list[dict]:
     out.append({"model": "clef-flash", "state": "s", "images": [{"content_type": "image/png", "base64": "data:image/png;base64," + png}], "questions": {"q": {"type": "noul"}}})
     out.append({"model": "clef-flash", "state": "s", "images": ["data:image/png," + png], "questions": {"q": {"type": "noul"}}})   # not base64-marked
     out.append({"model": "clef-flash", "state": "s", "images": [{"content_type": "image/png", "base64": png}, "DATA:image/png;base64," + png], "questions": {"q": {"type": "noul"}}})
+    # review #3: the data URL's media type is checked like content_type (mislabeled, WebP, other types
+    # rejected; no type leaves the signature to decide), media_kwargs integers are range-checked, and an
+    # image whose resized grid cannot fit a request is refused before any resize or patch allocation
+    out.append({"model": "clef-flash", "state": "s", "images": ["data:image/jpeg;base64," + png], "questions": {"q": {"type": "noul"}}})   # mislabeled data URL
+    out.append({"model": "clef-flash", "state": "s", "images": ["data:IMAGE/PNG;base64," + png], "questions": {"q": {"type": "noul"}}})    # MIME types are case-insensitive
+    out.append({"model": "clef-flash", "state": "s", "images": ["data:image/gif;base64," + png], "questions": {"q": {"type": "noul"}}})
+    out.append({"model": "clef-flash", "state": "s", "images": ["data:image/webp;base64," + png], "questions": {"q": {"type": "noul"}}})
+    out.append({"model": "clef-flash", "state": "s", "images": ["data:;base64," + png], "questions": {"q": {"type": "noul"}}})
+    out.append({"model": "clef-flash", "state": "s", "images": [png], "media_kwargs": {"min_pixels": 99999999999999999999, "max_pixels": 99999999999999999999}, "questions": {"q": {"type": "noul"}}})
+    out.append({"model": "clef-flash", "state": "s", "images": [png], "media_kwargs": {"min_pixels": 1.5, "max_pixels": 65536}, "questions": {"q": {"type": "noul"}}})
+    out.append({"model": "clef-flash", "state": "s", "images": [png], "media_kwargs": {"min_pixels": 67108864, "max_pixels": 67108864}, "questions": {"q": {"type": "noul"}}})   # 40x40 -> 8192x8192
     return out
 
 
@@ -197,11 +217,24 @@ def py_encode(tok, request, processor=None):
         return "ERR"
     if request.get("images") and not isinstance(request["images"], list):
         return "ERR"
-    media_keys = set((request.get("media_kwargs") or {}).keys())
+    media = request.get("media_kwargs") or {}
+    media_keys = set(media.keys())
     if media_keys - {"min_pixels", "max_pixels"} or len(media_keys) == 1:   # a lone bound is ignored by the processor; rejected here
         return "ERR"
+    # documented divergence: the bounds must be positive integers within int32 (range-checked in C)
+    if any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 or v > 2**31 - 1 for v in media.values()):
+        return "ERR"
     try:
-        rec = dict(request, images=pil_images(request))
+        images = pil_images(request)
+        # documented divergence: an image whose resized grid exceeds the context is refused before any
+        # resize; the reference would build the patches and then fail on length
+        if images:
+            from transformers.models.qwen2_vl.image_processing_qwen2_vl import smart_resize
+            for im in images:
+                h, w = smart_resize(im.height, im.width, 32, media.get("min_pixels", 65536), media.get("max_pixels", 16777216))
+                if (h // 32) * (w // 32) > 16384:
+                    return "ERR"
+        rec = dict(request, images=images)
         e = encode_record(tok, rec, max_length=16384, processor=processor)
         if e.media is not None:
             # the reference fails later, scattering the image features over a mismatched token count
