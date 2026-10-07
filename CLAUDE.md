@@ -53,11 +53,16 @@ make clean
   cite lives in git-ignored `golden/<experiment>-<date>/` directories.
 - `third_party/iris/` holds the PNG/JPEG single-header decoders imported from ds4 (MIT,
   `THIRD_PARTY_NOTICES.md`); `clef_image.c` is their only includer and sets their decode limits.
-  Local changes are the two input checks listed in `jpeg.h`'s header comment (scan header
-  bounds, luma must be the most sampled component) and optional PNG inflate/CRC hooks.
+  Local changes are the input checks and arithmetic listed in `jpeg.h`'s header comment (scan
+  header bounds, luma must be the most sampled component, scans may only use defined Huffman
+  tables, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT) and
+  optional PNG inflate/CRC hooks. `clef_image.c` passes the per-call source-pixel limit through
+  the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
   the original dependency-free PNG implementation remains the fallback. Decoder changes
-  require `tests/test_image.py` against Pillow, including malformed streams and CRCs.
+  require `tests/test_image.py` against Pillow, including malformed streams and CRCs, and
+  `tests/test_jpeg_ub.c` (crafted JPEGs under UBSan and ASan, in `make test`). Treat any
+  undefined behavior the decoders can reach from a file as a bug even when the output is clamped.
 - `tools/evidence_archive.py OUT.tar.gz` builds the publishable evidence archive from `golden/`
   (rules and placeholders in its docstring; `--list` previews). Publishing it as a release asset is
   a release step and needs explicit approval. `tests/test_evidence_archive.py` covers the rules.

@@ -41,6 +41,7 @@ __pycache__/
 /tests/test-vision-buffers
 /tests/test-base64
 /tests/test-vision-config
+/tests/test-jpeg-ub
 /tests/vision-config/
 /gemm-tiles
 /gdn-bench

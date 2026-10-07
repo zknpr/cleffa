@@ -414,7 +414,7 @@ suffix; the measured hit times are under
 [Repeated, growing and edited contexts](#repeated-growing-and-edited-contexts).
 
 Images add their tokens to the backbone and the tower's own pass: a 336x252 webcam frame with
-three questions (373 tokens, 88 of them image) takes 134 ms on clef-flash and 416 ms on the 27B,
+three questions (373 tokens, 80 of them image) takes 134 ms on clef-flash and 416 ms on the 27B,
 a 1024x1024 photo (1,363 tokens, 1,024 image) 773 ms and 1,857 ms, warm single requests on
 2026-10-07 ([docs/vision.md](docs/vision.md)).
 
@@ -682,9 +682,11 @@ Requests and GGUF files are treated as untrusted:
   huge-PNG burst stays 10 MB above idle and the sixteen-request burst peaks 1.18 GB above idle
   instead of 2.07 GB; the remainder is the GPU passes' own vision scratch. Image tokens cost the
   same prefill as text.
-  The vendored JPEG decoder got two extra input checks here (scan-header bounds, sampling layout)
-  after crafted files overflowed the unmodified copy under AddressSanitizer
-  ([docs/vision.md](docs/vision.md)); both files are regression cases.
+  The vendored JPEG decoder got input checks here (scan-header bounds, sampling layout, defined
+  Huffman tables, DC symbols at most 15) and libjpeg's arithmetic widths (wrapping 16-bit DC
+  coefficients, a 64-bit IDCT) after crafted files overflowed the unmodified copy under
+  AddressSanitizer or reached undefined behavior under UBSan ([docs/vision.md](docs/vision.md));
+  every file is a regression case (`tests/test_image.py`, `tests/test_jpeg_ub.c`).
 - **Server exposure:** the server binds to localhost by default. Exposing it with `--host` puts
   the GPU behind one FIFO queue. A long request (16k tokens takes ~7 s on clef-flash) is never
   co-batched with short ones, but it does delay everything queued behind it. Connection slots

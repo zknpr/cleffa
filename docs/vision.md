@@ -116,6 +116,23 @@ Logits are byte-identical to the previous build on the text and vision corpora (
 scratch the startup warm-up allocates), and the 16,347-token text request's peak footprint falls
 from 6.72 to 6.44 GB. Probe script and logs: `golden/review3-memory-2026-10-07/`.
 
+A third round (on `767c02d`) found undefined behavior in the vendored JPEG decoder and a broken
+check in the cache benchmark. `tests/test_jpeg_ub.c` builds five crafted JPEGs and decodes them
+under UBSan and ASan; before the change each aborted: (11) a scan selecting a DC table no DHT
+defined read `values[-1]` of the zeroed table; (12) a DHT mapping a DC code to 255 shifted by 255
+bits; (13) a legal 1x1 baseline block with DC difference 2047 at quantizer 255 overflowed `int` in
+the IDCT's second pass; plus two cases the review did not name, (14) the same difference repeated
+over 8,192 blocks overflowing the DC prediction times the quantizer, and (15) a progressive DC
+scan with Al = 13 overflowing the prediction's shift. ASan reported no access outside a buffer
+(`values[-1]` stays inside the table struct); built without sanitizers, case 11 decoded instead
+of being refused and case 13 rendered a far-above-white block as black. The decoder now refuses
+scans that select undefined tables and DC symbols above 15 (both libjpeg's rules), wraps the DC
+predictor and stores the coefficient in 16 bits before dequantization (as libjpeg's JCOEF), and
+runs the IDCT in 64-bit integers (libjpeg's JLONG here); in-range blocks compute identically, so
+the 63-image parity and the vision corpus logits are unchanged. (16) The benchmark's reuse check
+from round one could never pass, because its sanitized environment dropped `CLEF_STAGE_TIME`,
+which prints the line it looks for; both arms now set it.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to
@@ -156,7 +173,7 @@ request, with and without a cache key.
 
 | Request | Image | Image tokens | Total tokens | clef-flash | Clef 27B |
 |---|---|---|---|---|---|
-| `v001` (webcam frame) | 336x252 JPEG | 88 | 373 | 145 ms | 435 ms |
+| `v001` (webcam frame) | 336x252 JPEG | 80 | 373 | 145 ms | 435 ms |
 | `v009` | 1024x1024 JPEG | 1,024 | 1,363 | 883 ms | 2,053 ms |
 
 The same requests on the final build of this change (after the attention, GEMM and fusion work
@@ -164,9 +181,10 @@ below), measured the same way on 2026-10-07 as the median of the last three of f
 passes: `v001` 134 ms on clef-flash and 416 ms on the 27B; `v009` 773 ms and 1,857 ms. The
 sections below hold the paired measurements that justify each step.
 
-The 27B's text-only 346-token request measures 439 ms in the README's table, so the webcam
-frame costs it roughly what its 88 extra tokens would as text; the tower is the same size on both
-models (the merger projects to 5,120 instead of 4,096).
+The 27B's text-only 346-token request measures 439 ms in the README's table, about what the
+373-token webcam request with its 80 image tokens costs, so on the 27B the backbone dominates and
+the tower adds little; the tower is the same size on both models (the merger projects to 5,120
+instead of 4,096).
 
 Serialized profiles (`CLEF_PROFILE=1`, not latency): on `v001` the tower's attention takes
 5 ms and its GEMMs about 19 ms more with f32 operands than with 16-bit ones; on `v009` the
@@ -180,7 +198,9 @@ resized image, up to the reference's 16,384 (16.7 megapixels). The server reject
 default, more than 4 images per request or an image above 1,024 tokens
 (`--max-images`, `--max-image-tokens`), naming the `media_kwargs.max_pixels` that would fit,
 rather than downscaling silently; the reference's own downscaling is available through
-`media_kwargs` with both bounds. clef-webcam's 336-pixel frames are about 90 to 110 tokens.
+`media_kwargs` with both bounds. A 336x252 webcam frame, clef-webcam's size for 4:3 video, resizes
+to 320x256: 80 tokens (a 16:9 frame at 336x189 is lifted to the 65,536-pixel floor, 352x192,
+66 tokens).
 
 ## FP32 attention optimization, 2026-10-07
 

@@ -32,6 +32,10 @@ def main():
         parser.error('another engine is running; measure with one GPU workload at a time')
     corpus = {r['id']: r for r in map(json.loads, args.requests.read_text().splitlines())}
     env = {k: v for k, v in os.environ.items() if not k.startswith('CLEF_')}
+    # Stage logging prints the 'image cache reused N features' line the cached arm is checked
+    # for; both arms get it so their timing conditions match (review #3: the sanitized
+    # environment had removed it, so the check could never pass).
+    env['CLEF_STAGE_TIME'] = '1'
     report = {'metric': 'warm CLI inference ms; excludes decode, encoding, loading and response serialization',
               'binary_sha256': hashlib.sha256((ROOT / 'clef').read_bytes()).hexdigest(), 'runs': [], 'summary': []}
     args.output.parent.mkdir(parents=True, exist_ok=True)

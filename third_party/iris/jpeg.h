@@ -44,7 +44,20 @@
  *     sampling factors: its plane is allocated from its own factors while the
  *     conversion loop reads it at full image resolution, so a legal but unusual
  *     layout such as Y 1x1 under Cb 2x2 read past the plane. libjpeg decodes such
- *     files; here they are refused (tests/test_image.py). */
+ *     files; here they are refused (tests/test_image.py).
+ * and, after a second review (tests/test_jpeg_ub.c, each case undefined behavior under
+ * UBSan before the change):
+ *   - a scan may only select Huffman tables a DHT defined, as libjpeg requires: a zeroed
+ *     table matched the all-zero code and indexed values[-1];
+ *   - DC table symbols above 15 are refused when the table is defined (libjpeg's
+ *     jpeg_make_d_derived_tbl bound): they are bit counts, and 255 shifted by 255;
+ *   - the DC predictor wraps in unsigned arithmetic and the coefficient is stored as
+ *     16 bits before dequantization, as libjpeg stores it in a JCOEF: a repeated
+ *     difference of 2047 overflowed int in the prediction, the dequantization and the
+ *     progressive shift by Al;
+ *   - the IDCT computes in 64-bit, as libjpeg's JLONG does on this platform: a legal
+ *     DC difference of 2047 at quantizer 255 overflowed int in the second pass and
+ *     wrapped a far-above-white block to black. In-range blocks compute identically. */
 #ifndef JPEG_MAX_INPUT_BYTES
 #define JPEG_MAX_INPUT_BYTES (64u * 1024u * 1024u)
 #endif
@@ -223,6 +236,7 @@ typedef struct {
 
     /* Huffman tables (DC: 0-1, AC: 2-3) */
     jpeg_huff_table huff[4];
+    unsigned huff_defined;   /* cleffa: bit t set once a DHT defined huff[t] */
 
     /* DC prediction for each component */
     int dc_pred[4];
@@ -417,12 +431,13 @@ static int jpeg_extend(int v, int bits) {
 
 /* Fast integer IDCT using AAN algorithm (Arai, Agui, Nakajima 1988) */
 static void jpeg_idct(int *block, uint8_t *out, int stride) {
-    int tmp0, tmp1, tmp2, tmp3;
-    int tmp10, tmp11, tmp12, tmp13;
-    int z1, z2, z3, z4, z5;
+    /* cleffa: 64-bit like libjpeg's JLONG here; a dequantized coefficient may be near 2^31 */
+    int64_t tmp0, tmp1, tmp2, tmp3;
+    int64_t tmp10, tmp11, tmp12, tmp13;
+    int64_t z1, z2, z3, z4, z5;
     int *blkptr;
     uint8_t *outptr;
-    int workspace[64];
+    int64_t workspace[64];
 
     /* Constants for IDCT */
     #define FIX_0_298 2446
@@ -440,12 +455,12 @@ static void jpeg_idct(int *block, uint8_t *out, int stride) {
 
     /* Pass 1: process columns */
     blkptr = block;
-    int *wsptr = workspace;
+    int64_t *wsptr = workspace;
     for (int col = 0; col < 8; col++) {
         /* Check for all-zero AC terms */
         if (blkptr[8] == 0 && blkptr[16] == 0 && blkptr[24] == 0 &&
             blkptr[32] == 0 && blkptr[40] == 0 && blkptr[48] == 0 && blkptr[56] == 0) {
-            int dc = blkptr[0] * 4;
+            int64_t dc = (int64_t)blkptr[0] * 4;
             wsptr[0] = wsptr[8] = wsptr[16] = wsptr[24] =
             wsptr[32] = wsptr[40] = wsptr[48] = wsptr[56] = dc;
             blkptr++;
@@ -608,8 +623,10 @@ static int jpeg_decode_block(jpeg_decoder *dec, int comp_idx, int *block) {
         dc_val = jpeg_extend(dc_val, dc_len);
     }
 
-    dec->dc_pred[comp_idx] += dc_val;
-    block[0] = dec->dc_pred[comp_idx] * qt[0];
+    /* cleffa: unsigned wrap, then a 16-bit coefficient as libjpeg's JCOEF, so the product
+     * with a quantizer of at most 65535 fits int (tests/test_jpeg_ub.c) */
+    dec->dc_pred[comp_idx] = (int)((unsigned)dec->dc_pred[comp_idx] + (unsigned)dc_val);
+    block[0] = (int16_t)dec->dc_pred[comp_idx] * qt[0];
 
     /* Decode AC coefficients */
     int k = 1;
@@ -838,8 +855,9 @@ static int jpeg_prog_decode_dc_first(jpeg_decoder *dec, int comp_idx, int16_t *c
         dc_val = jpeg_extend(dc_val, dc_len);
     }
 
-    dec->dc_pred[comp_idx] += dc_val;
-    coef[0] = (int16_t)(dec->dc_pred[comp_idx] * (1 << dec->al));
+    /* cleffa: as baseline, and the shift by Al in unsigned (libjpeg's LEFT_SHIFT) */
+    dec->dc_pred[comp_idx] = (int)((unsigned)dec->dc_pred[comp_idx] + (unsigned)dc_val);
+    coef[0] = (int16_t)(int)((unsigned)dec->dc_pred[comp_idx] << dec->al);
 
     return 0;
 }
@@ -1335,9 +1353,13 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 for (int i = 0; i < 16; i++) total += bits[i];
                 if (off + total > end) goto fail;
 
+                /* cleffa: a DC symbol is the bit count of the difference that follows;
+                 * libjpeg refuses DC tables with symbols above 15. */
+                if (tc == 0) for (int i = 0; i < total; i++) if (file_data[off + i] > 15) goto fail;
                 if (!jpeg_build_huffman(&dec.huff[table_idx], bits, file_data + off)) {
                     goto fail;
                 }
+                dec.huff_defined |= 1u << table_idx;
 
                 off += total;
             }
@@ -1418,6 +1440,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.ss != 0 && ns != 1) goto fail;          /* AC scans are one component */
             } else if (dec.ss != 0 || dec.se != 63 || dec.ah != 0 || dec.al != 0) {
                 goto fail;
+            }
+            /* cleffa: every table this scan decodes with must have been defined, as libjpeg
+             * requires (JERR_NO_HUFF_TABLE). Baseline scans use both; progressive DC first
+             * scans the DC table, AC scans the AC table, DC refinement neither. */
+            for (int i = 0; i < ns; i++) {
+                const int ci = scan_comps[i];
+                const bool dc = !dec.is_progressive || (dec.ss == 0 && dec.ah == 0);
+                const bool ac = !dec.is_progressive || dec.ss != 0;
+                if (dc && !(dec.huff_defined & (1u << dec.comp[ci].dc_idx))) goto fail;
+                if (ac && !(dec.huff_defined & (1u << (dec.comp[ci].ac_idx + 2)))) goto fail;
             }
 
             /* Setup bitstream for scan data */

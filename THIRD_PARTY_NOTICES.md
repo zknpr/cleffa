@@ -40,11 +40,13 @@ SOFTWARE.
 `third_party/iris/png.h` and `third_party/iris/jpeg.h` are single-header image decoders by
 Salvatore Sanfilippo, taken from ds4's `third_party/iris` copy, which carries ds4's decode limits
 for untrusted input and its JPEG changes for libjpeg agreement (centered chroma interpolation,
-rounded YCbCr conversion, retained progressive scan bits). cleffa adds two input checks to `jpeg.h`,
-documented in its header comment: scan headers (Ss/Se/Ah/Al) are validated before decoding, and a
-multi-component image's first component must carry the largest sampling factors. `clef_image.c`
-includes the headers; `tests/test_image.py` checks their output against Pillow and holds the two
-crafted files behind those checks. The PNG header also has optional inflate and CRC32 hooks;
+rounded YCbCr conversion, retained progressive scan bits). cleffa changes `jpeg.h` as documented
+in its header comment: scan headers (Ss/Se/Ah/Al) are validated before decoding, a multi-component
+image's first component must carry the largest sampling factors, scans may only select Huffman
+tables a DHT defined, DC table symbols above 15 are refused, the DC predictor wraps and is stored
+as 16 bits before dequantization, and the IDCT computes in 64-bit. `clef_image.c` includes the
+headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
+`tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header also has optional inflate and CRC32 hooks;
 cleffa supplies these through the system zlib library, preserving size and checksum validation.
 Their license (`third_party/iris/LICENSE`):
 
