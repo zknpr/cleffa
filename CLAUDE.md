@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `cleffa`: a C11 + Metal inference engine for Cloudflare's Clef (27B) and Clef-Flash (9B) joint-schema
-models. One prefill pass per SystemOne request, typed decisions out. Text, images and video, BF16
+models. One prefill pass per SystemOne request, typed decisions out. Text and images (no video), BF16
 weights, never quantized. Apple Silicon only (Metal 4 tensor ops, Accelerate). The README is current and
 detailed; read it for measured accuracy/latency numbers and the security notes. This file covers what
 the README does not: how the pieces fit, the parity contract, and the traps.
@@ -302,23 +302,6 @@ an image. A failed/overflowing pass never becomes reusable; template reuse clear
 Image requests qualify with a 32-token snapshot, since skipping the tower pays off even on short
 prefixes. Text keeps its 128-token minimum. `tests/test_vision_cache.py` checks full-corpus exact logits,
 image/text/schema/geometry transitions and overflow invalidation on both models.
-
-### Video input
-
-Video input uses the same GPU path. `clef_video.c` decodes bounded MP4/MOV uploads through FFmpeg
-custom memory IO, with external IO denied, or `clef_record.c` decodes selected PNG/JPEG frame arrays.
-The pinned Qwen3VLVideoProcessor defaults are in `clef_video.h`; both snapshots use them. Frames are
-sampled uniformly, resized against the complete video pixel budget, then paired into independent
-`clef_image_ref` entries with `video_group` and a timestamp. Each entry has two distinct temporal
-taps in its patch rows. Qwen3.5 vision attention is independent for each temporal group, so no
-kernel change is needed. The reference retains an outer vision wrapper around each video's
-timestamped groups; token parity requires both that wrapper and the inner wrappers.
-`images`/`n_images` in internal records therefore include video groups, and `n_image_tokens` is the
-total visual token count. This also makes GPU packing, overflow retries and exact patch caching
-apply to videos. `max_video_*` limits are independent of still-image count/token limits; source
-pixels and concurrent media-request admission use the existing image limits. The standalone video
-corpus preserves existing image golden data: `ref/corpus_video.py`, `--corpus video` on both oracles,
-`tests/test_video.py` for exact host bytes, `tests/test_server_video.py` for HTTP/cache transitions.
 
 ### GPU forward (clef_metal.m + metal/clef.metal)
 

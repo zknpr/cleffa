@@ -6,14 +6,10 @@ OBJCFLAGS = $(CFLAGS) -fobjc-arc
 # ones, so a struct change could link objects built against different layouts (review #4).
 DEPFLAGS = -MMD -MP
 LDLIBS  += -lz
-VIDEO_CFLAGS := $(shell pkg-config --cflags libavformat libavcodec libswscale libavutil)
-LDLIBS += $(shell pkg-config --libs libavformat libavcodec libswscale libavutil)
 LDFLAGS ?=
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
-HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o clef_video.o
-
-clef_video.o: CFLAGS += $(VIDEO_CFLAGS)
+HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o
 
 .PHONY: all clean test test-errors test-attention test-vision-attention test-vision-gemm test-gemm test-gdn test-head-tsan test-prefix-attention test-prefix-model unicode
 
@@ -180,7 +176,6 @@ test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/tes
 	tests/test-server-writes
 	.venv/bin/python -B tests/test_json.py
 	.venv/bin/python -B tests/test_image.py
-	.venv/bin/python -B tests/test_video.py
 	.venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
 	.venv/bin/python -B tests/test_verify_gguf.py
 	.venv/bin/python -B tests/test_verify_snapshot.py
