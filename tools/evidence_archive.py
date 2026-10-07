@@ -98,14 +98,15 @@ REWRITES = [
 ]
 # Anything matching after rewriting excludes the file, and a match in the final scan fails
 # the build. Case-insensitive: bearer schemes and variable names vary in case. Keep these broad: a false exclusion costs one evidence file, a miss publishes it.
-# A credential value is any run of sixteen or more characters that are not whitespace or a quote:
-# passwords carry punctuation and base64 tokens carry + / = (review #59).
+# A credential value is a quoted string of sixteen or more characters, spaces included, or an
+# unquoted run of sixteen or more characters that are not whitespace or a quote: passwords carry
+# punctuation and spaces, base64 tokens carry + / = (reviews #59, #63).
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*["\']?[^\s"\']{16,}', re.IGNORECASE)
+                       r'\b[A-Z0-9_]*(API_KEY|SECRET|TOKEN|PASSWORD)["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
 CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)$', re.IGNORECASE)
 
@@ -417,7 +418,10 @@ def collect(golden: Path):
 def collect_below(golden: Path, root_fd: int):
     included, excluded = [], {}
     total = 0
+    seen: list[tuple[str, frozenset[str], tuple[int, int]]] = []
     for dirpath, dirnames, filenames in os.walk(golden, onerror=walk_error):
+        st = os.stat(dirpath, follow_symlinks=False)
+        seen.append((dirpath, frozenset(dirnames) | frozenset(filenames), (st.st_dev, st.st_ino)))
         dirnames.sort()
         for name in list(dirnames):
             reason = path_reason(golden, Path(dirpath) / name, directory=True)
@@ -426,7 +430,10 @@ def collect_below(golden: Path, root_fd: int):
                 excluded[f'{reason} (directories)'] = excluded.get(f'{reason} (directories)', 0) + 1
         for name in sorted(filenames):
             path = Path(dirpath) / name
-            ok, reason = classify(golden, path)
+            try:
+                ok, reason = classify(golden, path)
+            except FileNotFoundError:
+                raise SystemExit(f'{path} vanished during collection') from None
             if not ok:
                 excluded[reason] = excluded.get(reason, 0) + 1
                 continue
@@ -449,6 +456,18 @@ def collect_below(golden: Path, root_fd: int):
             if total > MAX_TOTAL:
                 raise SystemExit(f'included evidence exceeds MAX_TOTAL ({MAX_TOTAL} bytes) at {path}')
             included.append((path.relative_to(golden).as_posix(), path, data, rewritten, source))
+    # Quiescence: a file created or removed after its directory was enumerated is seen by no
+    # per-file check, and the manifest would describe neither the tree at the start nor at the
+    # end. Every enumerated directory must still be the same directory with the same entries
+    # (review #65).
+    for dirpath, listed, ident in seen:
+        try:
+            st = os.stat(dirpath, follow_symlinks=False)
+            now = frozenset(os.listdir(dirpath))
+        except OSError as e:
+            raise SystemExit(f'{dirpath}: cannot re-list: {e.strerror}')
+        if (st.st_dev, st.st_ino) != ident or now != listed:
+            raise SystemExit(f'{dirpath} changed during collection')
     return included, excluded
 
 
@@ -501,23 +520,42 @@ def build(golden: Path, out: Path, label: str | None) -> dict:
             raise SystemExit(f'forbidden pattern survived rewriting in {rel}')
     out.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fh = open(out, 'xb')   # exclusive: the check above is not atomic with the create (review #47)
+        # The archive is written to a sibling and linked into place only once it is complete
+        # and synced, so the output path never holds a partial file that the next run would
+        # refuse to overwrite or that automation could take for a finished asset (review #64).
+        # link() rather than rename(): it fails if the output appeared meanwhile, so the
+        # existence check above stays atomic with the create (review #47).
+        partial = out.with_name(out.name + '.partial')
+        fh = open(partial, 'xb')
     except FileExistsError:
+        raise SystemExit(f'{partial} exists: a build was interrupted; remove it to continue') from None
+    try:
+        with fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
+                tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tar:
+            def add(name: str, data: bytes, mtime: float):
+                info = tarfile.TarInfo(f'{label}/{name}')
+                info.size = len(data)
+                info.mtime = int(mtime)
+                info.mode = 0o644
+                info.uid = info.gid = 0
+                info.uname = info.gname = ''
+                tar.addfile(info, io.BytesIO(data))
+            add('README.md', readme.encode(), 0)
+            add('manifest.json', json.dumps(manifest, indent=1).encode(), 0)
+            for rel, path, data, _, source in included:
+                add(rel, data, source['mtime_s'])
+            tar.close()
+            gz.close()
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.link(partial, out)
+    except FileExistsError:
+        partial.unlink()
         raise SystemExit(f'{out} exists; evidence archives are never overwritten') from None
-    with fh, gzip.GzipFile(filename='', mode='wb', fileobj=fh, mtime=0) as gz, \
-            tarfile.open(fileobj=gz, mode='w', format=tarfile.PAX_FORMAT) as tar:
-        def add(name: str, data: bytes, mtime: float):
-            info = tarfile.TarInfo(f'{label}/{name}')
-            info.size = len(data)
-            info.mtime = int(mtime)
-            info.mode = 0o644
-            info.uid = info.gid = 0
-            info.uname = info.gname = ''
-            tar.addfile(info, io.BytesIO(data))
-        add('README.md', readme.encode(), 0)
-        add('manifest.json', json.dumps(manifest, indent=1).encode(), 0)
-        for rel, path, data, _, source in included:
-            add(rel, data, source['mtime_s'])
+    except BaseException:
+        partial.unlink(missing_ok=True)
+        raise
+    partial.unlink()
     return manifest
 
 

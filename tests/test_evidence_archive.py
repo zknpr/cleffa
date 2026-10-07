@@ -505,6 +505,48 @@ class EvidenceArchive(unittest.TestCase):
             ea.build(self.root, out, 'ev')
         self.assertFalse(out.exists())
 
+    def test_quoted_credentials_with_spaces_are_caught(self):
+        # A quoted value with spaces has no sixteen-character run, and plain key=value text
+        # never reaches the JSON walk that normalizes whitespace.
+        exp = self.root / 'gemm-probe-20261004'
+        cases = {'quoted-space.log': 'PASSWORD="correct horse battery staple"\n',
+                 'quoted-space2.log': "api_key: 'correct horse battery staple'\n"}
+        for name, text in cases.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'quoted.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in cases:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_failed_write_leaves_no_archive(self):
+        # A write that fails part-way must not leave a file at the output path: the next run
+        # would refuse to overwrite it, and automation could take it for a finished archive.
+        import errno
+        from unittest.mock import patch
+        out = Path(self.tmp.name) / 'enospc.tar.gz'
+
+        def full(*args, **kwargs):
+            raise OSError(errno.ENOSPC, 'No space left on device')
+        with patch.object(ea.tarfile.TarFile, 'addfile', full), self.assertRaises(OSError):
+            ea.build(self.root, out, 'ev')
+        self.assertFalse(out.exists())
+        self.assertEqual([p.name for p in out.parent.iterdir() if p.name.startswith('enospc')], [])
+
+    def test_entries_changing_during_collection_abort(self):
+        # A file created after its directory was enumerated is read by nobody, so the manifest
+        # would describe neither the tree at the start nor at the end.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        real = ea.classify
+
+        def add_late(golden, path):
+            verdict = real(golden, path)
+            if path == exp / 'result.json':
+                (exp / 'late.json').write_text('{"ms": 2}')
+            return verdict
+        with patch.object(ea, 'classify', add_late), self.assertRaisesRegex(SystemExit, 'changed during collection'):
+            ea.build(self.root, Path(self.tmp.name) / 'late.tar.gz', 'ev')
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
