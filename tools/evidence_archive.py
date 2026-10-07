@@ -124,8 +124,14 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
+                       r'Authorization["\']?\s*[=:]\s*["\']?\s*(?:[A-Z][A-Z0-9-]*\s+)?[^\s"\']{16,}|'
+                       r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
+# An Authorization header carries a credential whatever its scheme (Bearer, Basic, token, ApiKey,
+# or none), so a header value of sixteen or more characters after an optional scheme word is
+# forbidden; a template such as `Bearer {token}` is shorter than that. GitHub tokens carry a
+# recognizable prefix and are forbidden on their own (review #81).
 # `Basic <base64>` authorization: the value decodes to user:password. Only a decoded colon makes
 # it a credential; "basic test" is the word before a word that happens to be valid base64 (review #66).
 BASIC_AUTH = re.compile(r'\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)

@@ -701,6 +701,27 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_authorization_headers_of_any_scheme_are_caught(self):
+        # Bearer and Basic were recognized by name; an Authorization header carries a credential
+        # whatever its scheme, and GitHub tokens are recognizable on their own.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'gh.log': 'Authorization: token ghp_abcdefghijklmnopqrstuvwxyz0123456789\n',
+                  'gh.json': '{"headers": {"Authorization": "Token abcdefghijklmnopqrstuvwxyz"}}',
+                  'apikey.log': 'authorization: ApiKey 0123456789abcdef0123\n',
+                  'noscheme.log': 'Authorization=abcdefghijklmnopqrstuvwxyz\n',
+                  'bare.log': 'found ghp_abcdefghijklmnopqrstuvwxyz0123456789 in the environment\n',
+                  'pat.log': 'github_pat_11ABCDEFG0123456789abcdefghijklmnopqrstuvwxyz\n'}
+        kept = {'tmpl.py': 'headers = {"Authorization": f"Bearer {token}"}\n',
+                'doc.md': 'Authorization: required, see the deployment notes.\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'schemes.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
