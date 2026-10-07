@@ -32,7 +32,8 @@ static void prep_run(id<MTLCommandQueue> queue, id<MTLComputePipelineState> ps,
     [enc setComputePipelineState:ps];
     [enc setBytes:&a length:cached ? sizeof(a) : sizeof(prep_args) atIndex:0];
     for (int i=0;i<9;i++) {
-        const NSUInteger offset = i==0 ? (NSUInteger)L*a.row*4 : i==3 ? (NSUInteger)L*4 : 0;
+        // pos is [T][3] (interleaved M-RoPE; text tokens repeat one value), so its suffix offset is 12 bytes per token
+        const NSUInteger offset = i==0 ? (NSUInteger)L*a.row*4 : i==3 ? (NSUInteger)L*12 : 0;
         [enc setBuffer:b[i] offset:offset atIndex:i+1];
     }
     [enc setBytes:&T length:sizeof(T) atIndex:10];
@@ -52,13 +53,13 @@ static void prep_checks(id<MTLDevice> dev, id<MTLCommandQueue> queue, const char
         const int T=lengths[ti], hd=256, nkv=4, row=2*(nh+nkv)*hd;
         const size_t nq=(size_t)nh*T*hd, nk=(size_t)nkv*T*hd;
         NSArray<id<MTLBuffer>> *full=@[buffer(dev,(size_t)T*row*4),buffer(dev,hd*4),buffer(dev,hd*4),
-            buffer(dev,T*4),buffer(dev,32*4),buffer(dev,nq*4),buffer(dev,nk*4),buffer(dev,nk*4),buffer(dev,nq*4)];
+            buffer(dev,T*12),buffer(dev,32*4),buffer(dev,nq*4),buffer(dev,nk*4),buffer(dev,nk*4),buffer(dev,nq*4)];
         for (size_t i=0;i<(size_t)T*row;i++) ((float *)full[0].contents)[i]=value((uint32_t)i+31)*3;
         for (int d=0;d<hd;d++) {
             ((float *)full[1].contents)[d]=1+value(d+71)*.2f;
             ((float *)full[2].contents)[d]=1+value(d+97)*.2f;
         }
-        for (int t=0;t<T;t++) ((int *)full[3].contents)[t]=t+13000;
+        for (int t=0;t<T;t++) for (int k=0;k<3;k++) ((int *)full[3].contents)[3*t+k]=t+13000;
         for (int d=0;d<32;d++) ((float *)full[4].contents)[d]=powf(1000000.0f,-(float)d/32);
         prep_px_args a={nh,nkv,hd,64,row,1e-6f,T,0};
         prep_run(queue,plain,a,full,T,0,false);

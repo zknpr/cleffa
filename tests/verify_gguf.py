@@ -32,7 +32,9 @@ def main() -> None:
         return handles[shard].get_tensor(name)
 
     head = safe_open(hf / "joint_head.safetensors", "pt")
-    cfg = json.loads((hf / "config.json").read_text())["text_config"]
+    config = json.loads((hf / "config.json").read_text())
+    cfg = config["text_config"]
+    vcfg = config["vision_config"]
 
     # Derive completeness from the source, independently of the converter and the
     # output table. Checking only tensors present made even an empty export pass.
@@ -47,6 +49,11 @@ def main() -> None:
         if kind not in ("full_attention", "linear_attention"):
             sys.exit(f"source config: unknown layer type {kind!r}")
         names.update(f"blk.{i}.{n}" for n in common | (full if kind == "full_attention" else linear))
+    names.update({"v.patch_embd.weight", "v.patch_embd.bias", "v.pos_embd.weight", "v.post_ln.weight", "v.post_ln.bias",
+                  "v.mm.0.weight", "v.mm.0.bias", "v.mm.2.weight", "v.mm.2.bias"})
+    vblock = {"ln1.weight", "ln1.bias", "ln2.weight", "ln2.bias", "attn_qkv.weight", "attn_qkv.bias",
+              "attn_out.weight", "attn_out.bias", "ffn_up.weight", "ffn_up.bias", "ffn_down.weight", "ffn_down.bias"}
+    names.update(f"v.blk.{i}.{n}" for i in range(vcfg["depth"]) for n in vblock)
 
     def expected(name: str) -> torch.Tensor:
         if name.startswith("head."):
@@ -58,6 +65,29 @@ def main() -> None:
             return src("lm_head.weight")
         if name == "output_norm.weight":
             return 1.0 + src(P + "norm.weight").float()
+        if name.startswith("v."):
+            V = "model.visual."
+            if name == "v.patch_embd.weight":
+                t = src(V + "patch_embed.proj.weight")
+                return t.reshape(t.shape[0], -1)
+            if name == "v.patch_embd.bias":
+                return src(V + "patch_embed.proj.bias").float()
+            if name == "v.pos_embd.weight":
+                return src(V + "pos_embed.weight")
+            if name.startswith("v.post_ln."):
+                return src(V + "merger.norm." + name[len("v.post_ln."):]).float()
+            if name.startswith("v.mm."):
+                _, _, k, part = name.split(".")
+                t = src(V + "merger." + {"0": "linear_fc1", "2": "linear_fc2"}[k] + "." + part)
+                return t if part == "weight" else t.float()
+            _, _, i, rest = name.split(".", 3)
+            vp = f"{V}blocks.{i}."
+            vmap = {"ln1": "norm1", "ln2": "norm2", "attn_qkv": "attn.qkv", "attn_out": "attn.proj",
+                    "ffn_up": "mlp.linear_fc1", "ffn_down": "mlp.linear_fc2"}
+            kind, part = rest.split(".")
+            t = src(vp + vmap[kind] + "." + part)
+            # matrices stay BF16; norms and biases are stored F32 (exact from BF16)
+            return t if (part == "weight" and kind.startswith(("attn", "ffn"))) else t.float()
         _, i, rest = name.split(".", 2)
         p = f"{P}layers.{i}."
         cat = lambda *ns: torch.cat([src(p + n) for n in ns], 0)  # noqa: E731

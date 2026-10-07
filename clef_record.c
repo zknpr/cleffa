@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 static const char SYSTEM_PROMPT[] =
     "Read the complete state and schema. Decide every field jointly. Each answer "
@@ -41,6 +42,42 @@ static void render(jbuf *b, const jval *v) {
     else json_dump(b, v, true);
 }
 
+/* One entry of a request's images list, decoded to the encoded file bytes. The hosted API's two
+ * forms (its input schema): a data URL string, or an object {"content_type": "image/png" |
+ * "image/jpeg" | "image/webp", "base64": "..."}. A bare base64 string is taken as well, an
+ * extension for the CLI and tests. The declared type is checked against the file's signature
+ * after decoding, so a mislabeled image is an error rather than a silently different format. */
+static bool image_bytes(const jval *im, size_t index, uint8_t **bytes, size_t *n, char *err, size_t errlen) {
+    char ierr[256];
+    const char *declared = NULL;
+    if (im->type == J_STRING) {
+        if (!clef_base64_decode(im->s, im->len, bytes, n, ierr, sizeof(ierr))) { snprintf(err, errlen, "images[%zu]: %s", index, ierr); return false; }
+        return true;
+    }
+    if (im->type != J_OBJECT) { snprintf(err, errlen, "images[%zu]: must be a data URL string or {\"content_type\", \"base64\"}", index); return false; }
+    const jval *ct = json_get(im, "content_type"), *b64 = json_get(im, "base64");
+    if (!ct || ct->type != J_STRING || !b64 || b64->type != J_STRING) {
+        snprintf(err, errlen, "images[%zu]: an image object needs content_type and base64 strings", index);
+        return false;
+    }
+    if (json_str_eq(ct, "image/png")) declared = "PNG";
+    else if (json_str_eq(ct, "image/jpeg")) declared = "JPEG";
+    else if (json_str_eq(ct, "image/webp")) { snprintf(err, errlen, "images[%zu]: WebP is not supported (PNG or JPEG only)", index); return false; }
+    else { snprintf(err, errlen, "images[%zu]: content_type must be image/png, image/jpeg or image/webp", index); return false; }
+    if (b64->len >= 5 && !strncasecmp(b64->s, "data:", 5)) { snprintf(err, errlen, "images[%zu]: base64 must not be a data URL", index); return false; }
+    if (!clef_base64_decode(b64->s, b64->len, bytes, n, ierr, sizeof(ierr))) { snprintf(err, errlen, "images[%zu]: %s", index, ierr); return false; }
+    const bool png = *n >= 8 && !memcmp(*bytes, "\x89PNG\r\n\x1a\n", 8);
+    const bool jpeg = *n >= 2 && (*bytes)[0] == 0xff && (*bytes)[1] == 0xd8;
+    if ((declared[0] == 'P') != png || (declared[0] == 'J') != jpeg) {
+        snprintf(err, errlen, "images[%zu]: content_type says %s but the data is %s", index, declared,
+                 png ? "PNG" : jpeg ? "JPEG" : "neither PNG nor JPEG");
+        free(*bytes);
+        *bytes = NULL;
+        return false;
+    }
+    return true;
+}
+
 /* split: strict mode for request-derived text (see clef_encode_opts.strict) */
 static bool tok_z(const clef_tokenizer *tok, const char *z, bool split, clef_tokens *out) {
     return clef_tok_encode_ex(tok, z, strlen(z), SIZE_MAX, split, out);
@@ -65,6 +102,8 @@ static int option_cmp(const void *a, const void *b) {
 
 void clef_record_free(clef_record *r) {
     clef_tokens_free(&r->ids);
+    for (int i = 0; i < r->n_images; i++) clef_image_patches_free(&r->images[i].pt);
+    free(r->images);
     for (int i = 0; i < r->q_alloc; i++) {
         free(r->q[i].opt_span);
         free(r->q[i].opt_id);
@@ -86,8 +125,22 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         return fail(err, errlen, "at least one question is required", NULL, 0);
     }
     const jval *images = json_get(req, "images"), *videos = json_get(req, "videos");
-    if (truthy(images) || truthy(videos)) {
-        return fail(err, errlen, "images and videos are not supported by this build (text-only)", NULL, 0);
+    /* Deliberate divergence: the reference also takes videos (frame arrays). */
+    if (truthy(videos)) return fail(err, errlen, "videos are not supported", NULL, 0);
+    /* The reference iterates record.get("images") or []: any JSON array of images; the engine
+     * takes encoded images in the hosted API's forms (image_bytes). */
+    if (truthy(images) && images->type != J_ARRAY) {
+        return fail(err, errlen, "images must be a list of data URLs or {\"content_type\", \"base64\"} objects (PNG or JPEG)", NULL, 0);
+    }
+    const size_t n_images = images && images->type == J_ARRAY ? images->n : 0;
+    if (n_images) {
+        const clef_vision_opts *v = &opts.vision;
+        if (!v->image_token_id) return fail(err, errlen, "images are not supported by this model file (no vision tower)", NULL, 0);
+        if (v->max_images > 0 && n_images > (size_t)v->max_images) {
+            snprintf(err, errlen, "too many images: %zu, at most %d per request", n_images, v->max_images);
+            return false;
+        }
+        if (n_images > INT32_MAX / 4) return fail(err, errlen, "too many images", NULL, 0);
     }
 
     size_t nq = questions->n;
@@ -128,6 +181,60 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     out->owned = malloc(owned_bytes + 16);
     if (!out->owned) return fail(err, errlen, "out of memory", NULL, 0);
     char *owned = out->owned;
+
+    if (n_images) {
+        /* media_kwargs: the reference forwards them to the processor; only its pixel bounds are
+         * taken here (deliberate divergence: other processor arguments are rejected, not ignored).
+         * The processor applies the bounds only when both are given and silently ignores a lone
+         * one (Qwen2VLImageProcessor._standardize_kwargs); a lone bound is rejected here instead. */
+        clef_image_params prm = opts.vision.image;
+        const jval *mk = json_get(req, "media_kwargs");
+        if (mk && mk->type != J_NULL) {
+            if (mk->type != J_OBJECT) return fail(err, errlen, "media_kwargs must be an object", NULL, 0);
+            if (mk->n == 1) return fail(err, errlen, "media_kwargs: give both min_pixels and max_pixels (the reference ignores one alone)", NULL, 0);
+            for (size_t i = 0; i < mk->n; i++) {
+                const jmember *m = &mk->members[i];
+                const bool is_min = m->klen == 10 && !memcmp(m->key, "min_pixels", 10);
+                const bool is_max = m->klen == 10 && !memcmp(m->key, "max_pixels", 10);
+                if (!is_min && !is_max) return fail(err, errlen, "media_kwargs: only min_pixels and max_pixels are supported, not %.*s", m->key, m->klen);
+                long value = m->val->type == J_INT ? atol(m->val->s) : 0;
+                if (m->val->type != J_INT || value <= 0 || value > INT32_MAX) {
+                    return fail(err, errlen, "media_kwargs: %.*s must be a positive integer", m->key, m->klen);
+                }
+                if (is_min) prm.min_pixels = value; else prm.max_pixels = value;
+            }
+            if (prm.min_pixels > prm.max_pixels) return fail(err, errlen, "media_kwargs: min_pixels exceeds max_pixels", NULL, 0);
+        }
+        out->images = calloc(n_images, sizeof(*out->images));
+        if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
+        for (size_t i = 0; i < n_images; i++) {
+            const jval *im = images->items[i];
+            char ierr[256];
+            uint8_t *bytes = NULL;
+            size_t n = 0;
+            clef_rgb rgb = {0};
+            out->n_images = (int)i + 1;   /* freed by clef_record_free even when this one fails */
+            if (!image_bytes(im, i, &bytes, &n, err, errlen)) return false;
+            bool ok = clef_image_decode(bytes, n, &rgb, ierr, sizeof(ierr)) &&
+                      clef_image_preprocess(&rgb, &prm, &out->images[i].pt, ierr, sizeof(ierr));
+            const int width = rgb.width, height = rgb.height;
+            free(bytes);
+            clef_rgb_free(&rgb);
+            if (!ok) { snprintf(err, errlen, "images[%zu]: %s", i, ierr); return false; }
+            const long tokens = out->images[i].pt.n_tokens;
+            if (opts.vision.max_image_tokens > 0 && tokens > opts.vision.max_image_tokens) {
+                /* one token per merge window of patch*merge pixels on each side */
+                const long px_per_token = (long)prm.patch * prm.patch * prm.merge * prm.merge;
+                snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens, above the limit of %ld per image; "
+                         "downscale it or pass media_kwargs.max_pixels <= %ld",
+                         i, width, height, tokens, opts.vision.max_image_tokens,
+                         opts.vision.max_image_tokens * px_per_token);
+                return false;
+            }
+            if (out->n_image_tokens > INT32_MAX - tokens) return fail(err, errlen, "too many image tokens", NULL, 0);
+            out->n_image_tokens += (int32_t)tokens;
+        }
+    }
 
     clef_tokens schema = {0}, prefix = {0}, suffix = {0}, state_ids = {0};
     jbuf b = {0};
@@ -249,6 +356,23 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         jbuf_puts(&b, SYSTEM_PROMPT);
         jbuf_puts(&b, "<|im_end|>\n<|im_start|>user\nSTATE:\n");
         ok = tok_jbuf(tok, &b, false, &prefix);   /* template: real control tokens */
+        if (ok && n_images) {
+            /* _encode_media: "<|vision_start|><|image_pad|><|vision_end|>" per image, then "\n",
+             * tokenized by the processor, which expands each <|image_pad|> to the image's tokens.
+             * These are engine-made control tokens, never request text, in both modes. */
+            for (size_t i = 0; ok && i < n_images; i++) {
+                clef_image_ref *ir = &out->images[i];
+                ok = clef_tokens_push(&prefix, opts.vision.start_token_id);
+                ir->tok_start = (int32_t)prefix.len;
+                for (int k = 0; ok && k < ir->pt.n_tokens; k++) ok = clef_tokens_push(&prefix, opts.vision.image_token_id);
+                ok = ok && clef_tokens_push(&prefix, opts.vision.end_token_id);
+            }
+            clef_tokens nl = {0};
+            ok = ok && tok_z(tok, "\n", false, &nl);
+            if (ok && nl.len != 1) ok = false;   /* the tokenizer's newline is one token */
+            for (size_t i = 0; ok && i < nl.len; i++) ok = clef_tokens_push(&prefix, nl.ids[i]);
+            clef_tokens_free(&nl);
+        }
         ok = ok && tok_z(tok, "\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:", false, &suffix);
         /* only max_length - fixed state tokens can survive truncation (and max_state_tokens) */
         const size_t fixed0 = prefix.len + schema.len + suffix.len;
@@ -301,7 +425,71 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
             out->q[i].opt_span[k][1] += offset;
         }
     }
+    if (out->n_images) {
+        /* In parity mode a literal "<|image_pad|>" in request text becomes the placeholder token;
+         * the reference then fails scattering the image features ("Image features and image tokens
+         * do not match"). Fail the same way instead of guessing which tokens are the images. */
+        int32_t pads = 0;
+        for (size_t i = 0; i < out->ids.len; i++) pads += out->ids.ids[i] == opts.vision.image_token_id;
+        if (pads != out->n_image_tokens) {
+            snprintf(err, errlen, "image placeholder tokens in request content: %d image tokens for %d image features",
+                     pads, out->n_image_tokens);
+            return false;
+        }
+    }
     return true;
+}
+
+bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, size_t errlen) {
+    uint32_t patch, merge, temporal, min_px, max_px, image_id, start_id, end_id, video_id;
+    if (!gguf_find_kv(f, "clef.vision.image_token_id")) {
+        /* a model file converted without the vision tower: text only */
+        v->image_token_id = 0;
+        return true;
+    }
+    if (!gguf_get_u32(f, "clef.vision.patch_size", &patch) || !gguf_get_u32(f, "clef.vision.spatial_merge_size", &merge) ||
+        !gguf_get_u32(f, "clef.vision.temporal_patch_size", &temporal) ||
+        !gguf_get_u32(f, "clef.vision.image.min_pixels", &min_px) || !gguf_get_u32(f, "clef.vision.image.max_pixels", &max_px) ||
+        !gguf_get_u32(f, "clef.vision.image_token_id", &image_id) || !gguf_get_u32(f, "clef.vision.start_token_id", &start_id) ||
+        !gguf_get_u32(f, "clef.vision.end_token_id", &end_id) || !gguf_get_u32(f, "clef.vision.video_token_id", &video_id)) {
+        snprintf(err, errlen, "model: incomplete clef.vision.* keys");
+        return false;
+    }
+    /* Geometry the preprocessing and kernels assume (clef_image.c, the vision tower). */
+    if (patch != 16 || merge != 2 || temporal != 2 || min_px == 0 || max_px < min_px || max_px > INT32_MAX ||
+        !image_id || !start_id || !end_id || !video_id || image_id > INT32_MAX || start_id > INT32_MAX || end_id > INT32_MAX) {
+        snprintf(err, errlen, "model: unsupported vision geometry (patch %u, merge %u, temporal %u)", patch, merge, temporal);
+        return false;
+    }
+    v->image = (clef_image_params){ (long)min_px, (long)max_px, (int)patch, (int)merge, (int)temporal };
+    v->image_token_id = (int32_t)image_id;
+    v->start_token_id = (int32_t)start_id;
+    v->end_token_id = (int32_t)end_id;
+    v->video_token_id = (int32_t)video_id;
+    return true;
+}
+
+void clef_record_positions(const clef_record *r, int32_t *pos3) {
+    const int32_t T = (int32_t)r->ids.len;
+    int32_t cur = 0, t = 0;
+    int next = 0;   /* images are in token order */
+    while (t < T) {
+        if (next < r->n_images && r->images[next].tok_start == t) {
+            const clef_image_ref *ir = &r->images[next++];
+            const int h = ir->pt.grid_h / 2, w = ir->pt.grid_w / 2;   /* merged grid */
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++, t++) {
+                    pos3[3 * t] = cur;
+                    pos3[3 * t + 1] = cur + y;
+                    pos3[3 * t + 2] = cur + x;
+                }
+            cur += h > w ? h : w;
+        } else {
+            pos3[3 * t] = pos3[3 * t + 1] = pos3[3 * t + 2] = cur;
+            cur++;
+            t++;
+        }
+    }
 }
 
 bool clef_encode_request(const clef_tokenizer *tok, const jval *req, clef_encode_opts opts,

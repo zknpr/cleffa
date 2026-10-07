@@ -24,8 +24,8 @@ usage() {
 cleffa model setup: download, verify, convert to GGUF, verify.
 
 Usage:
-  ./download_models.sh clef-flash [--skip-download] [--token TOKEN]   # 9B, ~18 GB  -> gguf/clef-flash.gguf
-  ./download_models.sh clef       [--skip-download] [--token TOKEN]   # 27B, ~54 GB -> gguf/clef.gguf
+  ./download_models.sh clef-flash [--skip-download] [--token TOKEN]   # 9B, ~19 GB  -> gguf/clef-flash.gguf
+  ./download_models.sh clef       [--skip-download] [--token TOKEN]   # 27B, ~55 GB -> gguf/clef.gguf
   ./download_models.sh all        [--skip-download] [--token TOKEN]
 
   --skip-download  use the snapshot already in model-flash/ or model/ (it is still verified)

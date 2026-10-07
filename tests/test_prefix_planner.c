@@ -39,9 +39,10 @@ size_t mock_prefix_bytes(const clef_gpu_prefix *p) {
 bool mock_prefix_supported(const clef_gpu *g) { (void)g;return true; }
 int mock_prefix_class(const clef_engine *e,int length) { return e->cfg.H==5120 && length>=4096; }
 
-bool mock_forward_prefix(clef_gpu *g,const clef_engine *e,clef_gpu_prefix *p,const int32_t *ids,int T,
-                         int L,const clef_prefix_plan *plan,bool *overflow,clef_head_inputs *in,char *err,size_t errlen) {
-    (void)g;passes++;
+bool mock_forward_prefix(clef_gpu *g,const clef_engine *e,clef_gpu_prefix *p,const int32_t *ids,const int32_t *pos3,int T,
+                         int L,const clef_prefix_plan *plan,bool *overflow,clef_head_inputs *in,const clef_gpu_images *imgs,
+                         char *err,size_t errlen) {
+    (void)g;(void)pos3;(void)imgs;passes++;
     assert(L>=0 && L<T && L%32==0);
     assert(plan->n>=0 && plan->n<CLEF_PREFIX_CKPT);
     assert(L>0 || plan->n>0);
@@ -85,8 +86,8 @@ bool mock_forward_prefix(clef_gpu *g,const clef_engine *e,clef_gpu_prefix *p,con
 
 bool mock_forward(clef_gpu *g,const clef_engine *e,const int32_t *ids,const int32_t *pos,
                   const int32_t *ss,const int32_t *bounds,int n_seq,int T,bool bf16_only,bool *overflow,
-                  clef_head_inputs *in,float *dump,int dump_rows,char *err,size_t errlen) {
-    (void)g;(void)e;(void)pos;(void)ss;(void)bounds;(void)dump;(void)dump_rows;(void)err;(void)errlen;
+                  clef_head_inputs *in,float *dump,int dump_rows,const clef_gpu_images *imgs,char *err,size_t errlen) {
+    (void)g;(void)e;(void)pos;(void)ss;(void)bounds;(void)dump;(void)dump_rows;(void)imgs;(void)err;(void)errlen;
     assert(n_seq==1);
     if(bf16_only)bf16_reruns++;
     if(overflow)*overflow=failure==4 && !bf16_only;

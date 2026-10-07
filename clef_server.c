@@ -2,6 +2,7 @@
  *
  *   clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] [--batch-tokens 4096]
  *               [--max-body 8388608] [--max-conn 256] [--no-keep-warm] [--prefix-cache-mb 0]
+ *               [--max-images 4] [--max-image-tokens 1024]
  *
  *   POST /v1/systemone   SystemOne request body -> SystemOne response body
  *   GET  /health         {"status":"ok","model":...}
@@ -73,6 +74,12 @@ static struct {
     int batch;
     size_t batch_tokens;
     bool truncate;           /* default off: over-long state is rejected (--truncate = reference) */
+    /* Images per request and tokens per image after the model's own resizing (--max-images,
+     * --max-image-tokens; 0 = no limit). Over the limit a request is rejected with the count and
+     * the media_kwargs.max_pixels that would fit, never downscaled silently: the reference keeps up
+     * to 16,384 tokens per image, and image tokens cost the same prefill as text. */
+    int max_images;
+    long max_image_tokens;
     bool strict;             /* default on: content cannot inject chat-control tokens (--no-strict = reference) */     /* token budget per forward pass (the head job is always admitted) */
     size_t max_body;
     int max_conn;
@@ -506,6 +513,9 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
     opts.strict = S.strict;
     opts.reject_truncation = !S.truncate;
+    opts.vision = S.e->vision;
+    opts.vision.max_images = S.max_images;
+    opts.vision.max_image_tokens = S.max_image_tokens;
     if (!req || !clef_encode_request(S.e->tok, req, opts, &j.rec, err, sizeof(err))) {
         bool sent = respond_error(fd, 400, err, keep_alive);
         jarena_free(a);
@@ -642,6 +652,8 @@ int main(int argc, char **argv) {
     S.batch = 8;
     S.batch_tokens = 4096;
     S.strict = true;
+    S.max_images = 4;
+    S.max_image_tokens = 1024;
     S.max_body = 8u << 20;
     S.max_conn = 256;
     S.io_timeout = IO_TIMEOUT_S;
@@ -671,9 +683,12 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--template-cache")) S.template_cache = true;
         else if (!strcmp(argv[i], "--max-conn") && i + 1 < argc) S.max_conn = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) S.max_images = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) S.max_image_tokens = atol(argv[++i]);
         else {
             fprintf(stderr, "usage: clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] "
-                            "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N]\n");
+                            "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N] "
+                            "[--max-images N] [--max-image-tokens N]\n");
             return 2;
         }
     }
@@ -681,6 +696,7 @@ int main(int argc, char **argv) {
     if (getenv("CLEF_DEBUG_KEEPWARM_MS")) S.keep_warm_ms = atoi(getenv("CLEF_DEBUG_KEEPWARM_MS"));
     if (S.keep_warm_ms < 0) S.keep_warm_ms = 0;
     if (!model || S.batch < 1 || port <= 0 || port > 65535 || S.max_conn < 1) { fprintf(stderr, "clef-server: bad arguments\n"); return 2; }
+    if (S.max_images < 0 || S.max_image_tokens < 0) { fprintf(stderr, "clef-server: --max-images and --max-image-tokens must be non-negative\n"); return 2; }
     signal(SIGPIPE, SIG_IGN);
 
     char err[512];
@@ -707,6 +723,9 @@ int main(int argc, char **argv) {
     fprintf(stderr, "clef-server: %s on http://%s:%d (batch %d, %s)\n", model, host, port, S.batch,
             S.strict ? "strict: content cannot emit control tokens" : "no-strict: reference tokenization, injectable");
     fprintf(stderr, "clef-server: over-long state is %s\n", S.truncate ? "truncated silently (reference behaviour)" : "rejected");
+    if (S.e->vision.image_token_id)
+        fprintf(stderr, "clef-server: images: at most %d per request, %ld tokens each after resizing (0 = unlimited)\n", S.max_images, S.max_image_tokens);
+    else fprintf(stderr, "clef-server: this model file has no vision tower; requests with images are rejected\n");
     if (S.keep_warm_ms) fprintf(stderr, "clef-server: keep-warm pass every %d ms while idle\n", S.keep_warm_ms);
     else fprintf(stderr, "clef-server: keep-warm off\n");
     if (S.cache_bytes) fprintf(stderr, "clef-server: prefix cache of %zu MB for requests with X-Clef-Prefix-Cache\n", S.cache_bytes >> 20);

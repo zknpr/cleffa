@@ -19,6 +19,11 @@ The README's "Repeated, growing and edited contexts" and "Reuse the fixed prompt
 give the user-facing numbers. This document records how each mechanism was qualified. The
 implementation notes an agent needs are in `CLAUDE.md`.
 
+Keyed entries also support images: exact owned patch bytes, geometry, placement and image order
+identify reusable vision features. Those CPU copies and the GPU features count toward the cache
+budget. Changed images invalidate the associated backbone prefix. See [vision](vision.md#caches)
+for the matching rules, changed-question timing and image-specific regressions.
+
 ## Exact FP32 prefix reuse
 
 The candidates under `golden/prefix-fp32-20261005/` adapt the parallel cache implementation

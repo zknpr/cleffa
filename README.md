@@ -12,18 +12,19 @@ cleffa is built after [ds4](https://github.com/antirez/ds4) by antirez and the d
 would not exist without it (see [Acknowledgements](#acknowledgements)). It is an independent
 project, not affiliated with or endorsed by Cloudflare.
 
-Text-only (v1). BF16 weights, never quantized.
+Text and images. BF16 weights, never quantized. Videos are not supported.
 
 ## Requirements
 
 - **Tested hardware:** only an M5 Max with 128 GB, on macOS 27.
 - **Metal 4:** the GEMMs use Metal 4 tensor ops (MetalPerformancePrimitives). Earlier Apple GPUs
   are untested.
-- **Memory:** the weights are mapped whole. clef-flash's GGUF is 18 GB, so plan on 32 GB of RAM
-  or more. The 27B's is 54 GB, so plan on 64 GB or more. Long inputs add a few GB of activations
+- **Memory:** the weights are mapped whole. clef-flash's GGUF is 19 GB, so plan on 32 GB of RAM
+  or more. The 27B's is 55 GB, so plan on 64 GB or more. Long inputs add a few GB of activations
   on top.
-- **Tools:** Xcode command-line tools (`clang`, `xxd`). Python 3.12 is needed only for
-  conversion and tests: `uv` if installed, otherwise `python3.12`, plus `requirements.txt`.
+- **Tools:** Xcode command-line tools (`clang`, `xxd`) and macOS's system zlib (`-lz`).
+  Python 3.12 is needed only for conversion and tests: `uv` if installed, otherwise `python3.12`,
+  plus `requirements.txt`.
 
 ## Use
 
@@ -47,6 +48,34 @@ What `./download_models.sh` does for each model:
 
 Use `clef` for the 27B, `all` for both, and `--skip-download` to use (and still verify) a snapshot
 already in `model/` or `model-flash/`.
+
+### Images
+
+A request's `images` list takes the two forms of Workers AI's `@cf/cloudflare/clef` input schema
+(`src/content/workers-ai-models/clef.json` in Cloudflare's docs): a `data:` URL, or an object
+`{"content_type": "image/png" | "image/jpeg", "base64": "..."}`. A bare base64 string is accepted
+too, as an extension. The images go before the state, as the reference places them:
+
+```sh
+img=$(base64 -i receipt.png)
+printf '{"model":"clef","state":{"task":"Review the attached receipt."},"images":[{"content_type":"image/png","base64":"%s"}],"questions":{"legible":{"type":"noul","instructions":"Is the receipt total legible?"}}}\n' "$img" \
+  | ./clef -m gguf/clef-flash.gguf
+```
+
+The hosted schema also lists `image/webp`, which this build rejects (PNG and JPEG only), and it
+caps each image at 4 MiB and 16 megapixels with 4 images per request; the engine's own caps are
+in the security notes. A `content_type` that contradicts the file's signature is an error.
+
+The engine reproduces the reference's image processor byte for byte (PIL decoding, `smart_resize`,
+torchvision's uint8 bicubic resize, normalization, patch layout) and runs the Qwen3.5 vision
+tower on the GPU. An image costs one backbone token per 32x32 pixels of the resized image, from
+64 tokens up to the reference's 16,384 (16.7 megapixels), so a raw phone photo is thousands of
+tokens: shrink images before sending, or pass the reference's own bounds as
+`"media_kwargs": {"min_pixels": 65536, "max_pixels": 1048576}` (both are required; the processor
+silently ignores one alone, which the engine rejects instead). The server accepts at most 4 images
+per request and 1,024 tokens per image by default (`--max-images`, `--max-image-tokens`; 0 = the
+reference's limits) and rejects an image over the limit with the `max_pixels` that would fit.
+Measured parity, costs and the unsupported formats are in [docs/vision.md](docs/vision.md).
 
 Missing files, extra files and symbolic links fail verification; only `.cache/huggingface/`
 download bookkeeping is excluded. Remove stale `__pycache__` bytecode in an existing snapshot
@@ -147,6 +176,11 @@ curl -s localhost:8080/v1/systemone \
   --data-binary @request.json
 ```
 
+Repeated images use the same options. An entry retains exact processed-image bytes and merged
+features, so changing questions or text can reuse the image tower's result. Pixel content,
+image order, placement and grid geometry must match. These retained bytes count against the
+budget; failed or overflowing passes cannot supply reusable features.
+
 The server cache is off by default. Keyed requests run individually; requests
 without a key continue through ordinary micro-batching. A key has 1–64 ASCII
 letters, digits, dots, underscores or hyphens; the server validates the header whether or
@@ -155,7 +189,7 @@ assign keys per tenant and conversation: callers sharing a key can observe one
 another's cache hits through latency. Keys are not authentication credentials.
 
 The server retains at most 32 entries and evicts least recently used entries
-after a request exceeds the budget. The budget uses MiB and limits the cache's buffers:
+after a request exceeds the budget. The budget uses MiB and limits the cache's GPU buffers and owned image patches:
 a request whose entry would exceed it is served uncached without allocating one, and an
 entry that would grow past it is dropped first. It does not bound total process memory, and
 capacity growth copies an entry's planes, so a growing entry transiently needs up to twice
@@ -190,10 +224,14 @@ for the full-input comparisons, memory costs and validation scope.
 
 `--batch N` packs N requests per forward pass, `--time` prints latency to stderr,
 `--logits` prints raw logits, and `--dump FILE` writes per-layer residuals for the first request.
+`--max-images N` and `--max-image-tokens N` apply the server's image limits (the CLI, as the test
+harness, defaults to the reference's).
 For diagnostics, `CLEF_PROFILE=1` reports GPU time per kernel category (it serializes the GPU,
 so don't use it for latency) and `CLEF_ATTN_REF=1` switches to the simple reference attention
 kernel. `CLEF_ATTN_TU=0` selects the prior tiled FP32 attention path; the
-default uses compensated tensor-unit attention with FP32 accumulation.
+default uses compensated tensor-unit attention with FP32 accumulation. The vision tower keeps
+FP32 residual GEMMs and compensates non-residual projections; `CLEF_VIS_COMP=0` restores direct
+FP32 products throughout. `CLEF_VIS_F32=0` selects plain 16-bit vision operands (see Accuracy).
 
 The model snapshots are pinned to revisions `2f3de3dd` (clef) and `17f0b0ad` (clef-flash).
 `joint_schema_model.py` from those revisions has been reviewed, and only the oracle imports it.
@@ -314,8 +352,19 @@ Host-side pieces must match Python byte for byte, and they do:
 |---|---|
 | Tokenizer vs HF | 25,677 / 25,677 strings, including an NFC control arm |
 | `json.dumps` / `repr(float)` / `round()` | 404k floats, 240k roundings, 20k documents |
-| Request encoding (`encode_record`) | 3,027 requests |
-| Response building (`systemone_answer`) | 1,293 responses |
+| Request encoding (`encode_record`) | 3,081 requests, 41 with images (ids, spans, image runs, 3D positions) |
+| Response building (`systemone_answer`) | 1,336 responses |
+| Image decoding, resizing, normalization, patches, position interpolation | 60 PNG/JPEG images of every color type, byte-identical to PIL, torchvision and the processor |
+
+**Images.** The vision tower runs its 27 layers before any text is read, so operand rounding there
+compounds. Its producers retain f32 outputs. Non-residual GEMMs use compensated high/residual
+FP16 operands with FP32 accumulation; residual GEMMs keep direct FP32 inputs. On the
+16-request / 41-question vision corpus (`ref/corpus_vision.py`, 1 to 3 images per request, 16 to
+1,024 image tokens) against the FP32 oracle, clef-flash answers 41/41 with max |Δp| 0.0009,
+and the 27B 41/41 with max |Δp| 0.0010; with
+16-bit tower operands (`CLEF_VIS_F32=0`) two of clef-flash's questions exceed the limits (max |Δp|
+0.0025, features 2.9e-3 away). The text corpus is unchanged on both models. Details and costs:
+[docs/vision.md](docs/vision.md).
 
 ## Speed
 
@@ -355,6 +404,11 @@ from the table above. The gap to Cloudflare's hosted API on long inputs is not c
 With the opt-in prefix cache, a request whose tokens match a cached prefix pays only for its
 suffix; the measured hit times are under
 [Repeated, growing and edited contexts](#repeated-growing-and-edited-contexts).
+
+Images add their tokens to the backbone and the tower's own pass: a 336x252 webcam frame with
+three questions (373 tokens, 88 of them image) takes 134 ms on clef-flash and 416 ms on the 27B,
+a 1024x1024 photo (1,363 tokens, 1,024 image) 773 ms and 1,857 ms, warm single requests on
+2026-10-07 ([docs/vision.md](docs/vision.md)).
 
 ### Against PyTorch
 
@@ -474,7 +528,11 @@ length: 3× (flash) to 11× (27B) at 2k tokens, 39× to 127× at 16k.
 - **`clef_json.c`:** a JSON DOM with Python semantics: exact integer digits, `repr()` floats,
   `NaN`/`Infinity`, and for duplicate keys the last value at the first position.
 - **`clef_record.c`:** `encode_record`, `systemone()` validation and `systemone_answer`,
-  including CPython 3.12's Neumaier `sum()`.
+  including CPython 3.12's Neumaier `sum()`; with images, the placeholder runs and the 3D
+  rotary positions of `get_rope_index`.
+- **`clef_image.c`:** base64, the PNG/JPEG decoders imported from ds4's `iris`, and the
+  reference's image processor: `smart_resize`, PyTorch's uint8 antialiased bicubic kernel
+  arithmetic for arithmetic, normalization and the merge-window patch layout.
 - **`metal/clef.metal`:**
   - MPP tensor-op GEMM, BF16 weights × FP16 activations with f32 accumulation. Tiles are
     32×128, 32×256 or 64×128 by packed token count and matrix shape, with identical
@@ -486,6 +544,10 @@ length: 3× (flash) to 11× (27B) at 2k tokens, 39× to 127× at 16k.
   - Gated DeltaNet: conv, prep, a sequential scan (8 lanes per value column) or, for 27B
     records of at least 4,096 tokens, a 32-token FP32 block recurrence, and the gated norm.
   - RMSNorm, LayerNorm, SwiGLU.
+  - The Qwen3.5 vision tower: patch embedding and position resampling, LayerNorm, 2D rotary
+    embedding, bidirectional attention on simdgroup matrices (FP32 matrix primitives from 2,048 patches), GELU MLP and the merger, one
+    dispatch sequence per image; features replace the placeholder embeddings, and the
+    backbone's rotary prep applies interleaved M-RoPE from per-token 3D positions.
 - **`clef_head.c`:** the joint schema head, in f32 on the CPU via Accelerate, with packed
   transposed weight copies, per-record option batching in the residual scorer and two workers
   for large projections and attention calls. The memory-side K/V projections run on the GPU,
@@ -501,13 +563,20 @@ The tests need `gguf/clef-flash.gguf` and `model-flash/` (`./download_models.sh 
 parity tests also need golden data from the PyTorch oracles (below).
 
 ```sh
-make test                                            # host parity, HTTP write failures, verifier/parity, cache-planner and collector regressions
+make test                                            # host parity (incl. images), HTTP write failures, verifier/parity, cache-planner and collector regressions
 make test-errors                                     # CLI allocation/output errors, HTTP errors, Metal failures
 make test-attention                                  # production attention vs float64 samples, packing and tail guards; no model needed
 make test-gemm                                       # production GEMM tile/packing parity, float64 and NaN guards; no model needed
 make test-gdn                                        # chunked recurrence, offsets/tails, float64, NaN guards and allocation recovery
 .venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
-.venv/bin/python -B tests/test_record.py gguf/clef-flash.gguf model-flash model-flash
+.venv/bin/python -B tests/test_record.py gguf/clef-flash.gguf model-flash model-flash   # includes image requests and 3D positions
+.venv/bin/python -B tests/test_image.py                                                  # decode/resize/patch parity with PIL, torchvision, the processor
+.venv/bin/python -B ref/oracle.py model-flash --name clef-flash-vision-f32 --dtype float32 --corpus vision   # vision corpus, FP32
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-vision-f32 --dump
+tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl    # also with CLEF_VIS_F32=0
+tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl   # also with CLEF_VIS_F32=0 and CLEF_ATTN_REF=1
+.venv/bin/python -B tests/test_server_images.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl   # starts its own servers: HTTP bytes, limits, strict mode, caches
+.venv/bin/python -B tests/test_vision_cache.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl    # repeat with clef/27B
 .venv/bin/python -B ref/oracle.py model-flash --name clef-flash                  # BF16 oracle (MPS)
 .venv/bin/python -B ref/oracle.py model-flash --name clef-flash-f32 --dtype float32
 .venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump   # vs FP32: vs BF16 it fails where BF16 is wrong
@@ -555,6 +624,7 @@ It upcasts one layer at a time and is bitwise identical to the full FP32 oracle 
 ```sh
 .venv/bin/python -B ref/oracle.py model --name clef --safe-attn
 .venv/bin/python -B ref/oracle_f32_stream.py model --name clef-f32 --safe-attn
+.venv/bin/python -B ref/oracle_f32_stream.py model --name clef-vision-f32 --safe-attn --corpus vision
 .venv/bin/python -B tests/compare3.py golden/clef golden/clef-f32 golden/engine_logits_clef.jsonl
 .venv/bin/python -B ref/mps_sdpa_bug.py              # the MPS attention bug, standalone
 ```
@@ -588,6 +658,13 @@ Requests and GGUF files are treated as untrusted:
   linear-time. Earlier quadratic versions were measured at 3.8 s and 4.7 s from sub-MB inputs.
 - **Batching:** batch items own their input buffers. A shared buffer leaked one tenant's strings
   into another tenant's response; that bug is fixed and `tests/test_batch.sh` guards it.
+- **Images:** encoded images are capped at 64 MiB, decoded ones at 16,384 pixels a side and 64
+  megapixels, with every chunk, length and index bounds-checked in the decoders; the server
+  further caps images per request (4) and tokens per image (1,024). Image tokens cost the same
+  prefill as text, and a request's image bytes live on the connection thread until it is answered.
+  The vendored JPEG decoder got two extra input checks here (scan-header bounds, sampling layout)
+  after crafted files overflowed the unmodified copy under AddressSanitizer
+  ([docs/vision.md](docs/vision.md)); both files are regression cases.
 - **Server exposure:** the server binds to localhost by default. Exposing it with `--host` puts
   the GPU behind one FIFO queue. A long request (16k tokens takes ~7 s on clef-flash) is never
   co-batched with short ones, but it does delay everything queued behind it. Connection slots
@@ -646,11 +723,18 @@ differently:
 - score criteria that are not a list;
 - noul criteria given as a list of pairs;
 - a question with an empty id and no instructions (the reference returns NaN);
-- images and videos (text-only build).
+- videos;
+- `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
+  processor silently ignores a lone bound);
+- images the vendored decoders do not read: 16-bit, low-bit grayscale or interlaced PNGs, CMYK,
+  12-bit, arithmetic-coded or luma-under-chroma-sampled JPEGs, WebP; and images over the decode
+  limits;
+- a literal `<|image_pad|>` in request text in parity mode (the reference raises later, on the
+  placeholder count).
 
 ## Not done yet
 
-- Vision.
+- Videos and WebP ([docs/vision.md](docs/vision.md)).
 - Full-input latency parity with Cloudflare's hosted API on long inputs
   ([hosted comparison](docs/hosted-comparison.md)).
 
@@ -663,8 +747,9 @@ took ds4's approach whole:
 - correctness established by testing against the reference implementation, not by inspection;
 - a script that makes the model setup reproducible.
 
-Parts of the code are adapted from ds4, notably the Qwen pre-tokenizer
-([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). Without ds4 there would be no cleffa.
+Parts of the code are adapted from ds4, notably the Qwen pre-tokenizer, and the PNG/JPEG
+decoders are ds4's copy of iris ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)). The vision
+path follows ds4's Qwen3-VL tower structure. Without ds4 there would be no cleffa.
 
 Thanks to Cloudflare for releasing Clef and Clef-Flash under Apache-2.0, along with the reference
 implementation this engine is tested against.

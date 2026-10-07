@@ -32,6 +32,16 @@ class CliErrors(unittest.TestCase):
                 self.assertIn("--template-cache", p.stderr)
                 self.assertNotIn("cannot open", p.stderr)
 
+    def test_image_limit_flags_are_validated_before_model_open(self):
+        for args in (["--max-images", "-1"], ["--max-image-tokens", "-5"]):
+            for binary in ("clef", "clef-server"):
+                with self.subTest(binary=binary, args=args):
+                    p = subprocess.run([ROOT / binary, "-m", "/nonexistent", *args, *(["--port", "1"] if binary == "clef-server" else [])],
+                                       capture_output=True, text=True, timeout=10)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn(args[0], p.stderr)
+                    self.assertNotIn("cannot open", p.stderr)
+
     def test_server_size_flags_are_validated_before_model_open(self):
         # strtoull accepts "-1" (wrapping to ULLONG_MAX) and trailing junk, and the MiB shift can
         # overflow; each size flag must be a whole number that fits, or the server exits 2.
@@ -47,11 +57,11 @@ class CliErrors(unittest.TestCase):
                            capture_output=True, text=True)
         self.assertEqual(p.returncode, 1, p.stderr)   # the flag is fine; opening the model is what fails
 
-    def test_simd_width_guard_covers_every_rescaling_pipeline(self):
+    def test_simd_width_guard_covers_attention_pipelines(self):
         # rescale_fragment reads a SIMDgroup's two local fragment elements; every pipeline that
-        # uses it must refuse to open on a device reporting another width, including the cached
-        # FP32 attention path. The hook fakes one pipeline's reported width.
-        for name in ("attention_reuse_4", "attention_prefetch_64", "attention_prefix_64"):
+        # uses it must refuse to open on a device reporting another width. Vision MPP's
+        # softmax also assumes 32 lanes. The hook fakes one pipeline's reported width.
+        for name in ("attention_reuse_4", "attention_prefetch_64", "attention_prefix_64", "vis_attention_mpp"):
             with self.subTest(pipeline=name):
                 env = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
                 env["CLEF_DEBUG_SIMD_WIDTH_FOR"] = name

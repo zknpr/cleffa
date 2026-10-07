@@ -10,6 +10,7 @@
 #include "clef_tok.h"
 
 #define CLEF_MAX_LAYERS 128
+#define CLEF_MAX_VLAYERS 64
 
 typedef struct {
     int n_layer, H, ffn, nh, nkv, hd, n_rot;
@@ -19,6 +20,9 @@ typedef struct {
     int vocab;
     /* joint head */
     int W, routing_layers, head_layers, head_heads, head_ff;
+    /* vision tower (Qwen3_5VisionModel); has_vision is 0 for a model file converted without it */
+    int has_vision, v_layers, v_E, v_ff, v_heads, v_hd, v_patch, v_merge, v_temporal, v_pos_side, v_in;
+    float v_eps;
 } clef_config;
 
 typedef struct {
@@ -28,8 +32,15 @@ typedef struct {
 } clef_layer_w;
 
 typedef struct {
+    const gguf_tensor *ln1_w, *ln1_b, *qkv_w, *qkv_b, *out_w, *out_b, *ln2_w, *ln2_b, *up_w, *up_b, *down_w, *down_b;
+} clef_vlayer_w;
+
+typedef struct {
     const gguf_tensor *token_embd, *output_norm, *output;
     clef_layer_w layer[CLEF_MAX_LAYERS];
+    /* vision tower: BF16 matrices, F32 norms and biases, the BF16 position table */
+    const gguf_tensor *v_patch_w, *v_patch_b, *v_pos, *v_post_ln_w, *v_post_ln_b, *v_mm0_w, *v_mm0_b, *v_mm2_w, *v_mm2_b;
+    clef_vlayer_w vlayer[CLEF_MAX_VLAYERS];
 } clef_weights;
 
 typedef struct clef_head clef_head;
@@ -45,7 +56,20 @@ typedef struct {
     clef_head *head;
     clef_gpu *gpu;
     uint64_t instance_id;  /* cache ownership; unique for each successful or attempted open */
+    clef_vision_opts vision;   /* for clef_encode_opts.vision: the model's image preprocessing; limits left at 0 */
 } clef_engine;
+
+/* The images of one packed batch, for the GPU: each image's patches, the pass row whose record
+ * overflow slot it reports to, and its first row in the feature buffer. img_row[t] is the feature
+ * row that replaces token t's embedding, -1 for a text token (clef_record_positions-style
+ * bookkeeping done by clef.c). */
+typedef struct { const clef_image_patches *pt; int ovf_row, feat_row; } clef_gpu_image;
+/* cache/reuse are only for a keyed prefix entry whose owner checked exact image identity.
+ * Cached descriptors retain all images, including ones entirely before the resumed row. */
+typedef struct {
+    const clef_gpu_image *img; int n; const int32_t *img_row;
+    bool cache, reuse;
+} clef_gpu_images;
 
 /* GPU outputs the head consumes, for one packed batch (row-major, token-major). */
 typedef struct {
@@ -70,14 +94,15 @@ void clef_free_probs(const clef_record *recs, int n, float ***probs);
  * left its tokens (clef.c). Logits are bitwise those of clef_run_ex for the
  * same record: the pass resumes on the tile and block boundaries an uncached pass has, and an
  * entry is used only by records in the same DeltaNet class (clef_gpu_prefix_class). A record
- * that shares no checkpoint with the entry is computed whole and replaces it. *reused gets the
+ * that shares no checkpoint recomputes the backbone. Exact canonical image identity may still
+ * reuse merged vision features; owned pixels and features are charged to the entry. *reused gets the
  * tokens taken from the entry. An entry binds to its first engine; using another engine returns an error,
  * including after closing and reopening a model. Scope an entry to one tenant: whether a request hits it shows in its latency. */
 clef_prefix *clef_prefix_new(void);
 void clef_prefix_free(clef_prefix *p);
-size_t clef_prefix_bytes(const clef_prefix *p);   /* GPU memory the entry holds */
+size_t clef_prefix_bytes(const clef_prefix *p);   /* GPU buffers plus owned canonical image patches */
 bool clef_prefix_usable(const clef_prefix *p);    /* holds state a matching record can resume from */
-/* GPU memory the entry would hold after clef_run_prefix on this record (an upper bound; 0 when the
+/* GPU buffers and owned image patches after clef_run_prefix on this record (an upper bound; 0 when the
  * pass would take the plain path), for a caller that enforces a budget before anything is allocated. */
 size_t clef_prefix_estimate(const clef_engine *e, const clef_prefix *p, const clef_record *rec);
 bool clef_prefix_keep_warm(clef_engine *e, const clef_prefix *p, char *err, size_t errlen);
@@ -108,16 +133,19 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
 clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen);
 void clef_gpu_close(clef_gpu *g);
 bool clef_gpu_keepalive(clef_gpu *g, char *err, size_t errlen);
-/* Backbone + head-side GPU work for a packed batch. On success *in points into GPU
+/* Backbone + head-side GPU work for a packed batch. pos3 is [T][3]: each token's temporal, row and
+ * column rotary position (clef_record_positions), all equal to its index in a record without
+ * images. imgs lists the batch's images (NULL or n = 0 for none). On success *in points into GPU
  * buffers that stay valid until the next call. dump_layers (optional, [n_layer+2][R][H]: embedding, every
  * layer, final norm; R = dump_rows last token rows, or all T when dump_rows <= 0).
  * bf16_only forces BF16 GEMM activations. overflow ([n_seq]; required unless bf16_only or FP16 is
  * off) reports the records whose FP16 activations left FP16's range or were NaN: their outputs
  * are invalid and must be recomputed with bf16_only (clef_run_ex does). The other records'
  * outputs are unaffected (act16 keeps the discarded values finite). */
-bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos,
+bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos3,
                       const int32_t *seq_start, const int32_t *seq_bounds, int n_seq, int T, bool bf16_only,
-                      bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows, char *err, size_t errlen);
+                      bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows,
+                      const clef_gpu_images *imgs, char *err, size_t errlen);
 /* An entry keeps the DeltaNet state and conv tail of up to this many rows of its record, one
  * per slot. Which row a slot holds is the caller's bookkeeping. */
 #define CLEF_PREFIX_CKPT 12
@@ -132,12 +160,15 @@ typedef struct { int load, n, row[CLEF_PREFIX_CKPT], slot[CLEF_PREFIX_CKPT]; } c
 clef_gpu_prefix *clef_gpu_prefix_new(void);
 void clef_gpu_prefix_free(clef_gpu_prefix *px);
 size_t clef_gpu_prefix_bytes(const clef_gpu_prefix *px);
-size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts);
+size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts, int image_rows);
 bool clef_gpu_prefix_slot_allocated(const clef_gpu_prefix *px, int slot);   /* ck_reserve would allocate otherwise */
 bool clef_gpu_prefix_supported(const clef_gpu *g);
 bool clef_gpu_prefix_keepalive(clef_gpu *g, const clef_gpu_prefix *px, char *err, size_t errlen);
 int clef_gpu_prefix_class(const clef_engine *e, int length);
-bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix *px, const int32_t *ids, int T,
-                             int L, const clef_prefix_plan *plan, bool *overflow, clef_head_inputs *in, char *err, size_t errlen);
+/* pos3 and ids cover the whole record; imgs (optional) the images with rows in the computed part,
+ * img_row indexed by pass row. */
+bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix *px, const int32_t *ids, const int32_t *pos3,
+                             int T, int L, const clef_prefix_plan *plan, bool *overflow, clef_head_inputs *in,
+                             const clef_gpu_images *imgs, char *err, size_t errlen);
 
 #endif

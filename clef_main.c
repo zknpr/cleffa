@@ -14,6 +14,11 @@
  *   --strict      tokenize request content without special-token recognition (see README)
  *   --truncate    opt into reference behavior that cuts state to fit the context limit
  *   --no-truncate reject requests whose state does not fit (default)
+ *   --max-images N        reject requests with more images (default: no limit, as the reference)
+ *   --max-image-tokens N  reject an image that resizes to more tokens (default: no limit; the
+ *                 reference's own bound is 16,384 tokens, 16.7 megapixels)
+ * Images are data URLs or {"content_type","base64"} objects (the hosted API's forms; bare base64
+ * is accepted too) in the request's "images" list.
  */
 
 #include <errno.h>
@@ -82,8 +87,12 @@ int main(int argc, char **argv) {
     bool logits = false, timing = false, strict = false, no_truncate = true, prefix_cache = false, template_cache = false;
     int batch = 1;
     int dump_last = 0;
+    int max_images = 0;
+    long max_image_tokens = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) max_images = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) max_image_tokens = atol(argv[++i]);
         else if (!strcmp(argv[i], "--logits")) logits = true;
         else if (!strcmp(argv[i], "--time")) timing = true;
         else if (!strcmp(argv[i], "--strict")) strict = true;
@@ -102,9 +111,10 @@ int main(int argc, char **argv) {
             prefix_cache = template_cache = true;
         }
         else if (argv[i][0] != '-' && !input) input = argv[i];
-        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
+        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-images N] [--max-image-tokens N] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
     }
     if (!model || batch < 1) { fprintf(stderr, "clef: -m MODEL.gguf is required\n"); return 2; }
+    if (max_images < 0 || max_image_tokens < 0) { fprintf(stderr, "clef: --max-images and --max-image-tokens must be non-negative\n"); return 2; }
     if (prefix_cache && (batch != 1 || dump_path)) { fprintf(stderr, "clef: %s takes one request per pass and no --dump\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
     FILE *in = input ? fopen(input, "r") : stdin;
     if (!in) { fprintf(stderr, "clef: cannot open %s\n", input); return 1; }
@@ -154,6 +164,9 @@ int main(int argc, char **argv) {
             clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
             opts.strict = strict;
             opts.reject_truncation = no_truncate;
+            opts.vision = e->vision;
+            opts.vision.max_images = max_images;
+            opts.vision.max_image_tokens = max_image_tokens;
             it->ok = it->encoded = it->req && clef_encode_request(e->tok, it->req, opts, &it->rec, it->err, sizeof(it->err));
         }
         /* getline() returns -1 for EOF and for a read error (EISDIR, EIO, ENOMEM) alike; an error

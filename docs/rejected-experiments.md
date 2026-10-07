@@ -1033,3 +1033,29 @@ text unchanged. All were rejected under a predeclared no-regression condition:
 
 Keep the original rubric. The existing prefix cache cannot reuse a state-dependent schema
 across unrelated records.
+
+## Vision follow-up, 2026-10-07
+
+Evidence lives in `golden/vision-exhaust-2026-10-07/`; `experiments.json` records the acceptance
+rule. No quantization, resolution reduction, decision regression or relaxed tolerance was
+allowed. The following candidates passed their isolated exact-output comparisons but did
+not earn a production dispatch change:
+
+- Compensated GEMM plus bias/GELU epilogues. Medium block-up shapes sometimes improved in
+  isolation, while small and merger shapes regressed. Paired complete requests failed to
+  establish a broad gain; the 27B medium-image median was 2.15% slower.
+- Thirteen backbone tile/order variants at twelve actual matrix shapes. These covered
+  16/32/64/128-row tiles, 64/128/256-column tiles and grouped/column-major traversal. All
+  screened outputs matched exactly. The short-request candidate's apparent gain on `v001`
+  did not generalize: `v000` was 5.08% slower. A separate long-Flash expansion candidate
+  was 0.73% slower on `v009` and 5.46% slower on `v010` in its paired request runs.
+- FP32 vision attention with a multiply-only score product, removing explicit accumulator
+  clearing. All output bits matched at 2,048, 2,052, 4,092, 4,096 and 4,100 patches, including
+  poisoned tails, narrow outputs and overflow checks. Timing varied by about 1% with no
+  consistent improvement.
+- Compiling the image pipeline with `-O3` instead of `-O2`. The three PNG screening fixtures
+  were approximately 5–9% slower, so the existing compiler optimization setting stays.
+
+Desktop activity caused substantial absolute timing variation. These are screening results,
+not hardware limits. The experiments remain reproducible in the evidence directory; none
+justifies claiming that every possible kernel optimization has been exhausted.

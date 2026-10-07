@@ -8,8 +8,10 @@ from __future__ import annotations
 import json
 
 
-def encoded_line(request: dict, encoded) -> str:
-    return json.dumps({
+def encoded_line(request: dict, encoded, position_ids=None) -> str:
+    """position_ids: the [3][T] rotary positions of a record with images (Qwen3_5Model.get_rope_index);
+    with them the line also lists each image's first token index and patch grid."""
+    line = {
         "id": request["id"],
         "input_ids": list(encoded.input_ids),
         "questions": [
@@ -22,4 +24,13 @@ def encoded_line(request: dict, encoded) -> str:
             }
             for q in encoded.questions
         ],
-    }, ensure_ascii=False) + "\n"
+    }
+    if position_ids is not None:
+        starts, t = [], encoded.media["token_offset"]
+        for g in encoded.media["image_grid_thw"].tolist():
+            t += 1   # <|vision_start|>
+            starts.append([t, g[1], g[2]])
+            t += g[1] * g[2] // 4 + 1
+        line["images"] = starts
+        line["position_ids"] = position_ids
+    return json.dumps(line, ensure_ascii=False) + "\n"
