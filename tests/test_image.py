@@ -190,9 +190,9 @@ def with_fill_bytes(jpeg: bytes) -> bytes:
 
 def with_padded_stuffing(jpeg: bytes) -> bytes:
     """Every stuffed FF 00 in the entropy-coded data written as FF FF 00, fill before a stuffed zero,
-    which is not standard JPEG. libjpeg documents it as one FF data byte, but Pillow's libjpeg-turbo
-    decodes it differently through its fast Huffman path, silently, once enough input is buffered,
-    so the engine refuses it (review #3, found by tests/fuzz_jpeg_diff.c)."""
+    which is not standard JPEG. libjpeg's slow path reads it as one FF data byte, but libjpeg-turbo's
+    result for it was measured to depend on how its input is buffered (docs/vision.md), so the engine
+    refuses it (review #3, found by tests/fuzz_jpeg_diff.c)."""
     sos = jpeg.index(b"\xff\xda")
     head, body = jpeg[:sos], jpeg[sos:]
     seg = int.from_bytes(body[2:4], "big")

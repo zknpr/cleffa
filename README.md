@@ -763,7 +763,7 @@ differently:
   12-bit, lossless, arithmetic-coded or luma-under-chroma-sampled JPEGs, progressive JPEGs whose
   scans stop before full precision (libjpeg reconstructs those with block smoothing), JPEG
   entropy data with fill bytes before a stuffed zero (`FF FF 00`, not standard; libjpeg-turbo's
-  own result for it depends on which Huffman path it takes), WebP; and images over the decode
+  own result for it depends on how its input is buffered), WebP; and images over the decode
   limits;
 - a literal `<|image_pad|>` in request text in parity mode (the reference raises later, on the
   placeholder count).

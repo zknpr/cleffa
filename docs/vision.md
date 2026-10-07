@@ -206,13 +206,19 @@ reading past an EOI preceded by a fill byte: both marker loops stepped over `FF 
 in `FF FF D9` the EOI's own `FF` was consumed as fill, where libjpeg's `next_marker` skips fill bytes
 one at a time. Pillow-written JPEGs with a fill byte before every marker were refused outright by
 the old loops; two such files are now cases in `tests/test_image.py` (69 images). The second run
-found the decoder ending a scan at `FF FF` inside entropy data. libjpeg's source documents a run
-of FFs followed by `00` as one FF data byte, but Pillow decoded a file with `FF FF 00` in place of
-each stuffed byte differently from the original, silently: libjpeg-turbo's fast Huffman path, used
-once enough input is buffered, treats the second FF as a marker, fills zero bits and leaves that
-pass's coefficients behind when it redecodes the MCU on its slow path. Small files take the slow
-path and match the documented reading, larger ones do not, so the reference has no stable answer
-for this pattern, which the standard does not allow. Such scans are now refused; the fuzz finding
+found the decoder ending a scan at `FF FF` inside entropy data. libjpeg's slow path reads a run
+of FFs followed by `00` as one FF data byte (`jpeg_fill_bit_buffer`), but Pillow decoded noise
+JPEGs with stuffed bytes rewritten as `FF FF 00` differently from the originals, without a
+warning. Measured on 48x64 to 512x512 files: padding only the last stuffed byte decoded as
+documented everywhere; padding the first one changed the pixels in three of four files, and
+padding all of them in every file, and the result depended on how the input was buffered. The same Homebrew libjpeg-turbo 3.2 differed from itself
+by up to 142 levels reading the same file from memory and through `djpeg`'s 4 KiB stdio buffers,
+and Pillow's bundled 3.1 differed from both on some files, so version or Pillow's own buffering
+may contribute too. In libjpeg-turbo's `jdhuff.c`, `decode_mcu` takes a fast path only when
+`bytes_in_buffer >= BUFSIZE * blocks_in_MCU`, and `decode_mcu_fast` returns FALSE on a marker after
+writing coefficients, leaving the slow path to redecode that MCU; that is the likely mechanism,
+not traced further (measurements: `golden/fuzz-image-2026-10-07/ff-ff-00/`). The reference has no stable answer for this pattern, which the standard does
+not allow, so such scans are now refused; the fuzz finding
 and a padded Pillow file are expected refusals in `tests/test_image.py`. The third run found a
 one-component frame declaring 2x1 sampling decoded with its blocks misplaced: libjpeg ignores a
 one-component frame's factors (each block is its own MCU, in raster order), and the decoder now

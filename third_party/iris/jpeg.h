@@ -77,7 +77,7 @@
  *     does;
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
  *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
- *     result for it depends on which Huffman path it takes. */
+ *     result for it depends on how its input is buffered. */
 #ifndef JPEG_MAX_INPUT_BYTES
 #define JPEG_MAX_INPUT_BYTES (64u * 1024u * 1024u)
 #endif
@@ -1541,10 +1541,12 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             /* Find end of scan data (next marker). cleffa: fill FFs before a restart marker stay
              * in the scan; after any other run of FFs the scan ends at the run's first FF (a marker
              * with fill bytes). "FF FF 00", fill before a stuffed zero, is not standard JPEG and is
-             * refused: libjpeg documents it as one FF data byte, but libjpeg-turbo's fast Huffman
-             * path decodes it differently, without a warning, whenever enough input remains
-             * buffered, so the reference's result for it depends on file size. Stopping at "FF FF"
-             * had also ended such scans early (tests/fuzz_jpeg_diff.c, tests/test_image.py). */
+             * refused: libjpeg's slow path reads it as one FF data byte, but libjpeg-turbo first
+             * tries a fast Huffman path whenever enough input is buffered (jdhuff.c decode_mcu),
+             * and the measured result then depends on how the input is buffered: one 3.2 build
+             * decoded the same file differently from memory and from 4 KiB stdio reads, without
+             * a warning (docs/vision.md). The reference has no stable answer for it. Stopping at
+             * "FF FF" had also ended such scans early (tests/fuzz_jpeg_diff.c, tests/test_image.py). */
             size_t scan_end = scan_data_start;
             while (scan_end < file_size - 1) {
                 if (file_data[scan_end] == 0xFF) {
