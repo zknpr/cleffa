@@ -113,6 +113,9 @@ REWRITES = [
 # token_neuron_estimate or token_negative_control is a measurement, not a credential
 # (review #79). The capital test is case-sensitive inside an otherwise case-insensitive pattern.
 KEY_WORDS = 'access|key|id|secret|token|value|hash|str|string|pass|pwd|auth|private|signing'
+# The words that name a credential: API keys, key material named for its use (private, signing,
+# encryption, access), secrets, tokens and passwords (review #80). Public keys are not secrets.
+SENSITIVE = r'API[_-]?KEY|PRIVATE[_-]?KEY|SIGNING[_-]?KEY|ENCRYPTION[_-]?KEY|ACCESS[_-]?KEY|SECRET|TOKEN|PASSWORD'
 KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
               '|'.join(w.capitalize() for w in KEY_WORDS.split('|')) + r')))*')
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
@@ -121,13 +124,13 @@ FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
-                       r'\b[A-Z0-9_-]*(API[_-]?KEY|SECRET|TOKEN|PASSWORD)' + KEY_SUFFIX +
+                       r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
 # `Basic <base64>` authorization: the value decodes to user:password. Only a decoded colon makes
 # it a credential; "basic test" is the word before a word that happens to be valid base64 (review #66).
 BASIC_AUTH = re.compile(r'\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
-CREDENTIAL_KEY = re.compile(r'(api[_-]?key|secret|token|password)' + KEY_SUFFIX + '$', re.IGNORECASE)
+CREDENTIAL_KEY = re.compile('(' + SENSITIVE + ')' + KEY_SUFFIX + '$', re.IGNORECASE)
 
 
 def is_text(path: Path) -> bool:

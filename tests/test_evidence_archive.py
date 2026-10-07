@@ -680,6 +680,27 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_key_material_assignments_are_caught(self):
+        # Key material without PEM delimiters is named for what it is; public keys are not secrets.
+        exp = self.root / 'gemm-probe-20261004'
+        material = 'VGhpcyBpcyBhIHByaXZhdGUga2V5IG1hdGVyaWFsCg=='
+        caught = {'pk.log': f'PRIVATE_KEY={material}\n',
+                  'pk.json': f'{{"private_key": "{material}"}}',
+                  'pk-camel.json': f'{{"privateKey": "{material}"}}',
+                  'sign.log': f'SIGNING_KEY: {material}\n',
+                  'enc.json': f'{{"encryption_key": "{material}"}}',
+                  'aws-id.log': 'AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE\n'}
+        kept = {'pub.json': '{"public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEXAMPLEEXAMPLEEXAMPLE"}',
+                'keys.log': 'key_count=16\nprimary_key_column=request_identifier_value\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'material.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
