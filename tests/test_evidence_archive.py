@@ -898,6 +898,43 @@ class EvidenceArchive(unittest.TestCase):
         self.assertNotIn('gemm-probe-20261004/fold.yml', names)
         self.assertIn('gemm-probe-20261004/steps.yaml', names)
 
+    def test_short_authorization_values_are_caught(self):
+        # Once the key is Authorization, a value is a credential whatever its length; a template
+        # placeholder and prose after the colon are not.
+        exp = self.root / 'gemm-probe-20261004'
+        caught = {'short-bearer.log': 'Authorization: Bearer hunter2\n',
+                  'short-token.log': 'Authorization: token abc123\n',
+                  'short-apikey.json': '{"Authorization": "ApiKey ab12"}',
+                  'short-plain.log': 'authorization=xyz789\n'}
+        kept = {'tmpl3.py': 'headers = {"Authorization": f"Bearer {token}"}\n',
+                'doc3.md': 'Authorization: required, see the deployment notes.\n',
+                'ph.log': 'Authorization: Bearer <token>\nAuthorization: ${AUTH}\n',
+                'concat.py': 'headers["Authorization"] = "Bearer " + token\n'}   # the scheme word alone is no value
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'shortauth.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_labeled_account_ids_are_caught(self):
+        exp = self.root / 'gemm-probe-20261004'
+        hexid = '0123456789abcdef0123456789abcdef'
+        caught = {'graphql.json': '{"variables":{"account":"' + hexid + '"}}',
+                  'tag.log': f'accountTag: {hexid}\n',
+                  'camel.json': '{"accountId": "' + hexid + '"}'}
+        kept = {'other.json': '{"account": "team-main", "file_sha": "' + hexid + '"}'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'account.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):

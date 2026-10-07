@@ -153,11 +153,20 @@ PLACEHOLDER = r'(?:null|none|nil|true|false|\*+|<[^>\s]*>|\$\{[^}]*\}|\{\{[^}]*\
 # rewrite could alter the bytes around a secret before the pattern sees them; review #94).
 PATH_PATTERNS = (r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                  re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
-                 r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|Zknpr|session_id|'
-                 r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}')
+                 r'squid|\.personal|pop_v22|Zknpr|session_id|accounts/[0-9a-f]{32}|'
+                 # a 32-hex value under any account label: account, account_id, accountId,
+                 # accountTag, CLOUDFLARE_ACCOUNT_ID (review #99)
+                 r'account(?:[_-]?(?:id|tag))?["\']?\s*[=:]\s*["\']?[0-9a-f]{32}\b')
 CREDENTIAL_PATTERNS = (r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
                        r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
+                       # the key is explicitly Authorization: any value that is not a placeholder, however
+                       # short, when it ends the line or the quoted string; prose after the colon runs on,
+                       # and a scheme word standing alone (`"Bearer " + token` in code) is no value
+                       # (review #98)
+                       r'Authorization["\']?[ \t]*[=:][ \t]*["\']?(?:[A-Z][A-Z0-9-]*[ \t]+)?(?!' + PLACEHOLDER + r')'
+                       r'(?!(?:Bearer|Basic|Token|ApiKey|Digest|Negotiate|NTLM|OAuth|HOBA)[ \t]*(?:\r?\n|$|["\']))'
+                       r'[A-Z0-9][^\s"\']{3,}[ \t]*(?:\r?\n|$|["\'])|'
                        r'Authorization["\']?\s*[=:]\s*(["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!\1)[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z][A-Z0-9+.-]*://[^\s/:@"\']*:[^\s/@"\']+@|'
