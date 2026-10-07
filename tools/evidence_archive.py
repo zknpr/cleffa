@@ -121,20 +121,25 @@ KEY_SUFFIX = (r'(?:[_-](?:' + KEY_WORDS + r')|(?-i:(?:' +
 FORBIDDEN = re.compile(r'/Users/[A-Za-z]|/home/[a-z]|/root/|/var/root/|' +
                        re.escape(str(Path.home())) + '|' + re.escape(str(Path(__file__).resolve().parent.parent)) + '|'
                        r'squid|\.personal|pop_v22|account_id["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
-                       r'Bearer\s+[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
+                       r'Bearer\s+["\']?[^\s"\']{16,}|CLOUDFLARE_API_TOKEN=\S|Zknpr|session_id|'
                        r'accounts/[0-9a-f]{32}|CLOUDFLARE_ACCOUNT_ID["\']?\s*[=:]\s*["\']?[0-9a-f]{32}|'
                        r'-----BEGIN [A-Z ]*PRIVATE KEY|'
-                       r'Authorization["\']?\s*[=:]\s*["\']?\s*(?:[A-Z][A-Z0-9-]*\s+)?[^\s"\']{16,}|'
+                       r'Authorization\s*[=:]\s*(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\']{16,}|[^\n]*?["\'=][^\n]{8,})|'
+                       r'Authorization["\']?\s*[=:]\s*(["\'])(?:[A-Z][A-Z0-9-]*\s+)?(?:[^\s"\'\\]{16,}|(?:(?!\1)[^\\\n])*?(?:=|\\["\'])[^\n]{8,})|'
                        r'\bgh[pousr]_[A-Z0-9]{20,}|\bgithub_pat_[A-Z0-9_]{20,}|'
                        r'\b[A-Z0-9_-]*(' + SENSITIVE + r')' + KEY_SUFFIX +
                        r'["\']?\s*[=:]\s*(?:"[^"\n]{16,}"|\'[^\'\n]{16,}\'|["\']?[^\s"\']{16,})', re.IGNORECASE)
 # An Authorization header carries a credential whatever its scheme (Bearer, Basic, token, ApiKey,
-# or none), so a header value of sixteen or more characters after an optional scheme word is
-# forbidden; a template such as `Bearer {token}` is shorter than that. GitHub tokens carry a
-# recognizable prefix and are forbidden on their own (review #81).
+# Digest or none). Unquoted (first form): the value has a run of sixteen or more characters
+# after an optional scheme word, or carries a quote or an '=' followed by eight or more
+# characters, which is a quoted token or Digest parameters. Quoted, as a JSON field or a YAML
+# value (second form): the same, with inner quotes escaped and the match confined to the
+# quoted string, so a template such as `f"Bearer {api_token}"` followed by other fields on the
+# line stays. GitHub tokens carry a recognizable prefix and are forbidden on their own
+# (reviews #81, #82).
 # `Basic <base64>` authorization: the value decodes to user:password. Only a decoded colon makes
 # it a credential; "basic test" is the word before a word that happens to be valid base64 (review #66).
-BASIC_AUTH = re.compile(r'\bBasic\s+([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)
+BASIC_AUTH = re.compile(r'\bBasic\s+["\']?([A-Za-z0-9+/]{4,}={0,2})', re.IGNORECASE)   # the value may be quoted
 # A credential stored as a JSON field: a key named like one, with a string value long enough to be one.
 CREDENTIAL_KEY = re.compile('(' + SENSITIVE + ')' + KEY_SUFFIX + '$', re.IGNORECASE)
 
@@ -259,16 +264,18 @@ def json_strings(text: str) -> str | None:
     return '\n'.join(found)
 
 
-ESCAPE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))')
+ESCAPE = re.compile(r'\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2})|([/"\\bfnrt]))')
+SIMPLE_ESCAPES = {'/': '/', '"': '"', '\\': '\\', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
 
 
 def unescape(text: str) -> str:
-    """The text with \\uXXXX and \\xXX escapes replaced by the characters they denote. A token
-    written as `abcdefgh\\u002dijkl` in a log line, or in a JSON document that is not parsed as a
-    whole, would otherwise never line up with the FORBIDDEN pattern (review #53)."""
+    """The text with \\uXXXX, \\xXX and the simple JSON escapes (\\/ \\" \\\\ \\n ...) replaced by the
+    characters they denote. A token written as `abcdefgh\\u002dijkl` in a log line, or an
+    `accounts\\/<id>` URL inside a JSON fragment that is not parsed as a whole, would otherwise
+    never line up with the FORBIDDEN pattern (reviews #53, #83)."""
     if '\\' not in text:
         return text
-    return ESCAPE.sub(lambda m: chr(int(m.group(1) or m.group(2), 16)), text)
+    return ESCAPE.sub(lambda m: SIMPLE_ESCAPES[m.group(3)] if m.group(3) else chr(int(m.group(1) or m.group(2), 16)), text)
 
 
 def basic_credential(text: str) -> bool:
@@ -442,7 +449,8 @@ def read_snapshot(root_fd: int, rel: Path, limit: int) -> tuple[bytes | None, os
         raise SystemExit(f'{rel} was replaced while it was being archived')
     if len(raw) > limit:
         return None, before
-    same = (before.st_size, before.st_ino, before.st_dev, before.st_mtime_ns) == (after.st_size, after.st_ino, after.st_dev, after.st_mtime_ns)
+    same = ((before.st_size, before.st_ino, before.st_dev, before.st_mtime_ns, before.st_ctime_ns) ==
+            (after.st_size, after.st_ino, after.st_dev, after.st_mtime_ns, after.st_ctime_ns))
     if not same or len(raw) != before.st_size:
         raise SystemExit(f'{rel} changed while it was being archived')
     return raw, before
@@ -467,10 +475,12 @@ def collect_below(golden: Path, root_fd: int):
     total = 0
     seen: list[tuple[str, frozenset[str], tuple[int, int]]] = []
     children: list[tuple[str, tuple[int, int]]] = []   # retained child directories, as enumerated
-    snapshots: list[tuple[Path, tuple[int, int, int, int]]] = []   # what each enumerated file was when examined
+    snapshots: list[tuple[Path, tuple[int, int, int, int, int]]] = []   # what each enumerated file was when examined
 
     def note(path: Path, st: os.stat_result):
-        snapshots.append((path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)))
+        # ctime included: a writer can restore size and mtime after an in-place rewrite, but
+        # not ctime (review #84).
+        snapshots.append((path, (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)))
     for dirpath, dirnames, filenames in os.walk(golden, onerror=walk_error):
         st = os.stat(dirpath, follow_symlinks=False)
         seen.append((dirpath, frozenset(dirnames) | frozenset(filenames), (st.st_dev, st.st_ino)))
@@ -548,7 +558,7 @@ def collect_below(golden: Path, root_fd: int):
             st = os.stat(path, follow_symlinks=False)
         except OSError as e:
             raise SystemExit(f'{path}: cannot re-stat: {e.strerror}')
-        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns) != ident:
+        if (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns) != ident:
             raise SystemExit(f'{path} changed after it was examined')
     return included, excluded
 

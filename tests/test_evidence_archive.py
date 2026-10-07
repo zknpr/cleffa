@@ -722,6 +722,58 @@ class EvidenceArchive(unittest.TestCase):
         for name in kept:
             self.assertIn(f'gemm-probe-20261004/{name}', names, name)
 
+    def test_quoted_and_digest_authorization_values_are_caught(self):
+        # The header value may be quoted, or be Digest parameters with quoted nonce and response;
+        # a template or a prose line after "Authorization:" is neither.
+        exp = self.root / 'gemm-probe-20261004'
+        digest = ('Digest username="alice", realm="api", nonce="dcd98b7102dd2f0e8b11d0f600bfb0c093", '
+                  'uri="/v1", response="6629fae49393a05397450978507c4ef1"')
+        caught = {'quoted-basic.log': 'Authorization: Basic "dXNlcjpwYXNzd29yZA=="\n',
+                  'quoted-bearer.log': "Authorization: Bearer 'abcdefghijklmnopqrstuvwxyz'\n",
+                  'digest.log': f'Authorization: {digest}\n',
+                  'digest.json': '{"headers": {"Authorization": "' + digest.replace('"', '\\"') + '"}}',
+                  'basic-json.json': '{"Authorization": "Basic \\"dXNlcjpwYXNzd29yZA==\\""}'}
+        kept = {'tmpl2.py': 'headers = {"Authorization": f"Bearer {api_token}", "Content-Type": "application/json"}\n',
+                'doc2.md': 'Authorization: required, see the deployment notes.\n'}
+        for name, text in {**caught, **kept}.items():
+            (exp / name).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'quoted.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        for name in caught:
+            self.assertNotIn(f'gemm-probe-20261004/{name}', names, name)
+        for name in kept:
+            self.assertIn(f'gemm-probe-20261004/{name}', names, name)
+
+    def test_json_fragment_escapes_are_decoded(self):
+        # A JSON fragment inside a log line is not parsed as a document; its \/ escapes must be
+        # decoded in the scanning view or an escaped account URL never lines up with the pattern.
+        exp = self.root / 'gemm-probe-20261004'
+        (exp / 'frag.log').write_text('prefix: {"url":"accounts\\/0123456789abcdef0123456789abcdef"}\n')
+        (exp / 'frag2.log').write_text('note: {"auth":"Bearer \\"abcdefghijklmnopqrstuvwxyz\\""}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'frag.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertNotIn('gemm-probe-20261004/frag.log', names)
+        self.assertNotIn('gemm-probe-20261004/frag2.log', names)
+
+    def test_overwrite_with_restored_mtime_aborts(self):
+        # A same-size rewrite with the original mtime restored defeats size and mtime; ctime
+        # cannot be restored by an ordinary writer.
+        from unittest.mock import patch
+        exp = self.root / 'gemm-probe-20261004'
+        target = exp / 'result.json'
+        original = target.read_bytes()
+        st = target.stat()
+        real = ea.classify
+
+        def rewrite_earlier(golden, path):
+            verdict = real(golden, path)
+            if path == exp / 'run.py':   # sorted after result.json, already read by now
+                target.write_bytes(original[:-1] + b' ')   # same size, different bytes
+                os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns))
+            return verdict
+        with patch.object(ea, 'classify', rewrite_earlier), self.assertRaisesRegex(SystemExit, 'changed after it was examined'):
+            ea.build(self.root, Path(self.tmp.name) / 'ctime.tar.gz', 'ev')
+
     def test_rejects_unsafe_label(self):
         # The label becomes every tar member's leading path component.
         for label in ('../outside', 'x/y', '.hidden', '', 'a b'):
