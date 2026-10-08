@@ -29,12 +29,22 @@ struct clef_gpu {
     id<MTLBuffer> attn_blk;           // attention_tu query blocks: 8 ints each, at most one block per token
     id<MTLBuffer> kv[16];
     int n_kv;
+    // vision tower (encode_vision): per-pass patch uploads sized by the pass's patches, activations
+    // by its largest image; feat holds every image's features, img_row maps tokens to them
+    id<MTLBuffer> vis_inv_freq;
+    int vcap, vcap_total;             // patch capacity of the per-image activations and of the uploads
+    id<MTLBuffer> vpatch, vpatch16, vposidx, vposw;
+    id<MTLBuffer> vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit;
+    id<MTLBuffer> img_row, feat;
     int act_f16;                      // FP16 GEMM inputs per producer class (ACT_*), else BF16
     float f16_lim;                    // magnitude past which an FP16 operand counts as overflow
     bool head_f32;                    // head inputs unrounded, head GEMMs on f32 activations
     int scan_lpc;                     // lanes per value column in gdn_scan (CLEF_SCAN_LPC)
     bool attn_ref;                    // CLEF_ATTN_REF=1: the simple reference attention kernel
     bool attn_tu;                     // attention_tu in FP16 passes; false = FP32 kernels everywhere (CLEF_ATTN_TU=0)
+    bool vis_mpp;                     // CLEF_VIS_MPP=0 keeps simdgroup vision attention
+    bool vis_comp;                    // CLEF_VIS_COMP=0 keeps direct FP32 vision GEMMs
+    bool vis_f32;                     // retain FP32 vision operands; non-residual GEMMs may compensate (vis_comp)
     bool debug_poison;                // CLEF_DEBUG_POISON=1 (tests): fill every activation buffer with NaN before each forward
     bool flash_gemm;                  // Flash matrix shapes qualify for selected short 64-row tiles
     bool profile;                     // CLEF_PROFILE=1: GPU time per kernel category (serializes!)
@@ -49,6 +59,7 @@ struct clef_gpu {
 // buffer are the record's own token indices, so a later request that starts with the same tokens
 // computes only its remaining rows and reads the rest here.
 struct clef_gpu_prefix {
+    id<MTLBuffer> vision;                                // exact merged features, all images in request order
     int cap;                                              // token rows of capacity, a multiple of 1024
     id<MTLBuffer> K[CLEF_MAX_LAYERS], V[CLEF_MAX_LAYERS]; // attention layers: FP32 [nkv][cap][hd], then 64 zero rows
     // Checkpoints: the DeltaNet layers' state [n][Hv][dk][dv] and conv tail [n][ksize-1][C] at one
@@ -57,12 +68,13 @@ struct clef_gpu_prefix {
     id<MTLBuffer> kv[16];                                 // the head's memory K|V rows [cap][2W]
 };
 
-enum { P_GEMM, P_ATTN, P_SCAN, P_NORM, P_ATTNPREP, P_CONV, P_GDNOUT, P_SWIGLU, P_HEAD, P_N };
-// GEMM input classes, by the kernel that produces them
-enum { ACT_NORM = 1, ACT_ATTN = 2, ACT_GDN = 4, ACT_MLP = 8 };
+enum { P_GEMM, P_ATTN, P_SCAN, P_NORM, P_ATTNPREP, P_CONV, P_GDNOUT, P_SWIGLU, P_HEAD, P_VISION, P_N };
+// GEMM input classes, by the kernel that produces them; ACT_VIS covers every vision-tower operand
+enum { ACT_NORM = 1, ACT_ATTN = 2, ACT_GDN = 4, ACT_MLP = 8, ACT_VIS = 16 };
 enum { X_BF16, X_F16, X_F32 };
-// norm includes the embedding; conv_prep is ssm_conv + gdn_prep; head is the final norm and the GPU half of the head
-static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "norm", "attn_prep", "conv_prep", "gdn_out", "swiglu", "head" };
+// norm includes the embedding; conv_prep is ssm_conv + gdn_prep; head is the final norm and the GPU half of the head;
+// vision is the whole tower, every image
+static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "norm", "attn_prep", "conv_prep", "gdn_out", "swiglu", "head", "vision" };
 
 // Command buffers and encoders are nullable (device loss, resource exhaustion). Messages to nil
 // are no-ops and a nil buffer has no .error, so a missing one let the pass "succeed" without
@@ -117,8 +129,10 @@ static id<MTLComputePipelineState> pipeline(clef_gpu *g, id<MTLLibrary> lib, con
     // test hook (tests/test_cli_errors.py): CLEF_DEBUG_SIMD_WIDTH_FOR=NAME reports that pipeline as 16 lanes wide
     const char *fake = getenv("CLEF_DEBUG_SIMD_WIDTH_FOR");
     const NSUInteger width = fake && !strcmp(fake, name) ? 16 : p.threadExecutionWidth;
-    // attention_prefix_64 (cached FP32 attention) shares that rescaling (review #38).
-    if ((!strcmp(name, "attention_reuse_4") || !strcmp(name, "attention_prefetch_64") || !strcmp(name, "attention_prefix_64")) &&
+    // attention_prefix_64 shares that rescaling (review #38). Vision MPP softmax partitions
+    // each 32-lane SIMDgroup into four-thread rows, so it requires the same width.
+    if ((!strcmp(name, "attention_reuse_4") || !strcmp(name, "attention_prefetch_64") || !strcmp(name, "attention_prefix_64") ||
+         !strcmp(name, "vis_attention_mpp")) &&
         width != 32) {
         snprintf(err, errlen, "metal: %s requires a 32-lane SIMDgroup", name);
         return nil;
@@ -159,12 +173,14 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         const char *names[] = { "gemm_bf16_32x128", "gemm_bf16_acc_32x128", "gemm_f16_32x128", "gemm_f16_acc_32x128",
                                 "gemm_f16_64x128", "gemm_f16_acc_64x128", "gemm_f16_g4_64x128", "gemm_f16_g4_acc_64x128",
                                 "gemm_f16_32x256", "gemm_f16_acc_32x256",
-                                "gemm_f32_32x128", "gemm_f32_acc_32x128", "embed", "rmsnorm_act", "rmsnorm_f32", "layernorm",
+                                "gemm_f32_32x128", "gemm_f32_acc_32x128", "gemm_f32_16x128", "gemm_f32_acc_16x128", "embed", "rmsnorm_act", "rmsnorm_f32", "layernorm",
                                 "f32_to_bf16", "fill_zero", "keepalive", "attn_prep", "attention", "attention_fa", "attention_reuse_4", "attention_prefetch_64",
                                 "attn_prep_prefix", "attention_prefix_64", "attn_prep_split", "attention_tu", "ssm_conv", "ssm_conv_tail", "ssm_tail_save", "gdn_prep", "gdn_scan_2", "gdn_scan_4", "gdn_scan_8",
                                 "gdn_scan_st_2", "gdn_scan_st_4", "gdn_scan_st_8",
                                 "gdn_chunk_prep_32", "gdn_chunk_scan_32_16", "gdn_chunk_scan_32_32",
-                                "gdn_chunk_scan_st_32_16", "gdn_chunk_scan_st_32_32", "gdn_out", "swiglu" };
+                                "gdn_chunk_scan_st_32_16", "gdn_chunk_scan_st_32_32", "gdn_out", "swiglu",
+                                "vis_split_gemm", "vis_gemm_comp_32x128", "vis_gemm_comp_64x128",
+                                "vis_act", "vis_embed", "layernorm_act", "layernorm_bias_act", "vis_qkv_rope", "vis_attention", "vis_attention_mma", "vis_attention_mpp", "add_bias", "vis_bias_gelu" };
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             if (!pipeline(g, lib, names[i], err, errlen)) { free(g); return NULL; }
         }
@@ -178,6 +194,14 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         }
         g->inv_freq = [g->dev newBufferWithBytes:inv length:sizeof(inv) options:MTLResourceStorageModeShared];
         if (!g->inv_freq) { gerr(err, errlen, "cannot allocate rope table"); free(g); return NULL; }
+        if (c->has_vision) {
+            // Qwen3_5VisionRotaryEmbedding(hd / 2): 1 / 10000 ** (arange(0, hd/2, 2) / (hd/2)), f32
+            float vinv[64];
+            const int dim = c->v_hd / 2;
+            for (int j = 0; j < dim / 2; j++) vinv[j] = 1.0f / powf(10000.0f, (float)(2 * j) / (float)dim);
+            g->vis_inv_freq = [g->dev newBufferWithBytes:vinv length:sizeof(vinv) options:MTLResourceStorageModeShared];
+            if (!g->vis_inv_freq) { gerr(err, errlen, "cannot allocate vision rope table"); free(g); return NULL; }
+        }
         g->keep = [g->dev newBufferWithLength:16 options:MTLResourceStorageModeShared];
         if (!g->keep) { gerr(err, errlen, "cannot allocate keep-warm buffer"); free(g); return NULL; }
         g->n_kv = c->routing_layers + c->head_layers;
@@ -190,6 +214,18 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         const char *tu = getenv("CLEF_ATTN_TU");
         g->attn_tu = !tu || strcmp(tu, "0") != 0;
         g->debug_poison = getenv("CLEF_DEBUG_POISON") != NULL;
+        // The vision tower's 27 layers run before any text is read, so operand rounding there
+        // compounds: FP16 operands put the image features 2.9e-3 (relative L2) from the FP32
+        // oracle and two of 41 vision questions past the parity limits; f32 operands put them at
+        // about 1e-5 and every question within, for ~15 ms more on a 336-pixel image (docs/vision.md).
+        const char *vf = getenv("CLEF_VIS_F32");
+        g->vis_f32 = !vf || strcmp(vf, "0") != 0;
+        // Compensate non-residual projections only; residual GEMMs retain FP32 operands.
+        // BF16 retries and ACT_VIS=0 also retain direct FP32 GEMMs throughout the tower.
+        const char *vc = getenv("CLEF_VIS_COMP");
+        g->vis_comp = !vc || strcmp(vc, "0") != 0;
+        const char *vm = getenv("CLEF_VIS_MPP");
+        g->vis_mpp = !vm || strcmp(vm, "0") != 0;
         g->scan_lpc = getenv("CLEF_SCAN_LPC") ? atoi(getenv("CLEF_SCAN_LPC")) : 8;
         if (g->scan_lpc != 2 && g->scan_lpc != 4 && g->scan_lpc != 8) g->scan_lpc = 8;
         // Precision (README "Accuracy"): the target is the FP32 reference. GEMM activations are
@@ -197,7 +233,7 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         // GEMM rate); CLEF_ACT_F16=<mask of ACT_*> narrows that, 0 = BF16 everywhere as in the
         // HF BF16 path. The head takes the f32 hidden state and runs its GEMMs on f32 activations
         // (tiny GEMMs); CLEF_HEAD_BF16=1 restores the BF16 rounding the HF BF16 path applies there.
-        g->act_f16 = getenv("CLEF_ACT_F16") ? atoi(getenv("CLEF_ACT_F16")) & 15 : ACT_NORM | ACT_ATTN | ACT_GDN | ACT_MLP;
+        g->act_f16 = getenv("CLEF_ACT_F16") ? atoi(getenv("CLEF_ACT_F16")) & 31 : ACT_NORM | ACT_ATTN | ACT_GDN | ACT_MLP | ACT_VIS;
         g->head_f32 = getenv("CLEF_HEAD_BF16") == NULL;
         g->nil_cb_at = getenv("CLEF_DEBUG_NIL_CMDBUF") ? atoi(getenv("CLEF_DEBUG_NIL_CMDBUF")) : 0;
         g->ck_fail_at = getenv("CLEF_DEBUG_PREFIX_CKPT_FAIL") ? atoi(getenv("CLEF_DEBUG_PREFIX_CKPT_FAIL")) : 0;
@@ -216,6 +252,8 @@ void clef_gpu_close(clef_gpu *g) {
         g->x = g->xn = g->P = g->Q = g->K = g->V = g->G = g->A = g->Xc = g->beta = g->gate = g->O = nil;
         g->hfin = g->nh32 = g->nh16 = g->mem = g->mem16 = g->mn16 = g->mn32 = g->ovf = g->attn_blk = g->inv_freq = g->keep = nil;
         g->gdn_w = g->gdn_u = g->gdn_ke = g->gdn_a = g->gdn_e = nil;
+        g->vis_inv_freq = g->vpatch = g->vpatch16 = g->vposidx = g->vposw = g->vx = g->vxn = g->vqkv = nil;
+        g->vq = g->vk = g->vv = g->va = g->vff = g->vff16 = g->vm = g->vm16 = g->img_row = g->feat = g->vsplit = nil;
         for (int i = 0; i < 16; i++) g->kv[i] = nil;
     }
     free(g);
@@ -241,12 +279,16 @@ bool clef_gpu_keepalive(clef_gpu *g, char *err, size_t errlen) {
         // capacity on the 27B), so each gets its own one-thread dispatch too. They are nil before the first
         // forward. CLEF_DEBUG_KEEPWARM_NOWEIGHTS leaves the weights out: the control that shows
         // the weights reference is what removes the large delay.
-        id<MTLBuffer> bufs[64];
-        int n = 0;
-        if (!getenv("CLEF_DEBUG_KEEPWARM_NOWEIGHTS")) bufs[n++] = g->weights;
         id<MTLBuffer> act[] = { g->ids, g->pos, g->seq_start, g->seq_bounds, g->x, g->xn, g->P, g->Q, g->K, g->V, g->G,
                                 g->A, g->Xc, g->beta, g->gate, g->O, g->hfin, g->nh32, g->nh16, g->mem, g->mem16,
-                                g->mn16, g->mn32, g->ovf, g->attn_blk, g->gdn_w, g->gdn_u, g->gdn_ke, g->gdn_a, g->gdn_e };
+                                g->mn16, g->mn32, g->ovf, g->attn_blk, g->gdn_w, g->gdn_u, g->gdn_ke, g->gdn_a, g->gdn_e,
+                                g->img_row, g->feat, g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv,
+                                g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit };
+        // Include every possible activation and KV buffer, plus the weights. Adding vision
+        // scratch must not overflow this list when all 16 head KV slots are populated.
+        id<MTLBuffer> bufs[1 + sizeof(act) / sizeof(act[0]) + sizeof(g->kv) / sizeof(g->kv[0])];
+        int n = 0;
+        if (!getenv("CLEF_DEBUG_KEEPWARM_NOWEIGHTS")) bufs[n++] = g->weights;
         for (size_t i = 0; i < sizeof(act) / sizeof(act[0]); i++) if (act[i]) bufs[n++] = act[i];
         for (int i = 0; i < g->n_kv; i++) if (g->kv[i]) bufs[n++] = g->kv[i];
         for (int i = 0; i < n; i++) {
@@ -309,9 +351,14 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
     // later requests that fit the old capacity then ran against nil bindings and returned
     // silently wrong logits (tests/test_grow_fail.sh).
     id<MTLBuffer> ids, pos, seq_start, seq_bounds, x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32, ovf, attn_blk;
+    id<MTLBuffer> img_row;
     id<MTLBuffer> kv[16] = { nil };
     @autoreleasepool {
-        ids = buf(g, Tc * 4); pos = buf(g, Tc * 4); seq_start = buf(g, Tc * 4); seq_bounds = buf(g, (Tc + 1) * 4); ovf = buf(g, Tc * 4);
+        ids = buf(g, Tc * 4); pos = buf(g, Tc * 12); seq_start = buf(g, Tc * 4); seq_bounds = buf(g, (Tc + 1) * 4); ovf = buf(g, Tc * 4);
+        // image features live in the vision scratch, sized by the pass's image rows: a
+        // [capacity][H] FP32 buffer here cost every text-only workload 256 MiB on Flash at
+        // 16,384 tokens (review #3); embed binds img_row in its place when there are no images
+        img_row = buf(g, Tc * 4);
         attn_blk = buf(g, Tc * 32);
         x = buf(g, Tc * c->H * 4); xn = buf(g, Tc * c->H * 2);
         P = buf(g, Tc * maxN * 4);
@@ -334,7 +381,7 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
         mn32 = buf(g, h32 * Tc * c->W * 4);
         for (int i = 0; i < g->n_kv; i++) kv[i] = buf(g, Tc * 2 * c->W * 4);
     }
-    id<MTLBuffer> all[] = { ids, pos, seq_start, seq_bounds, x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32, ovf, attn_blk };
+    id<MTLBuffer> all[] = { ids, pos, seq_start, seq_bounds, x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32, ovf, attn_blk, img_row };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         if (!all[i]) return gerr(err, errlen, "cannot allocate activation buffers (previous buffers kept)");
     }
@@ -344,8 +391,46 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
     g->Q = Q; g->K = K; g->V = V; g->G = G; g->A = A; g->Xc = Xc; g->beta = beta; g->gate = gate; g->O = O;
     g->hfin = hfin; g->nh32 = nh32; g->nh16 = nh16; g->mem = mem; g->mem16 = mem16; g->mn16 = mn16; g->mn32 = mn32; g->ovf = ovf;
     g->attn_blk = attn_blk;
+    g->img_row = img_row;
     for (int i = 0; i < g->n_kv; i++) g->kv[i] = kv[i];
     g->cap = cap;
+    return true;
+}
+
+// Vision scratch: the pass's patch uploads (every image, each [P][in] f32 plus the 16-bit operand
+// and the position interpolation), the merged features of every image (one row per merge window,
+// total patches / merge^2) and one image's activations at the largest patch count. Grown by
+// doubling and committed only when every allocation succeeded, like ensure_capacity.
+static bool ensure_vision_capacity(clef_gpu *g, const clef_config *c, int max_patches, int total_patches, char *err, size_t errlen) {
+    if (max_patches <= g->vcap && total_patches <= g->vcap_total) return true;
+    int cap = g->vcap ? g->vcap : 1024, total = g->vcap_total ? g->vcap_total : 1024;
+    while (cap < max_patches) cap *= 2;
+    while (total < total_patches) total *= 2;
+    const size_t Pc = (size_t)cap, Tp = (size_t)total, E = (size_t)c->v_E, F = (size_t)c->v_ff, In = (size_t)c->v_in;
+    const size_t M = E * (size_t)c->v_merge * c->v_merge;   // merger width, four patches per row
+    const size_t ob = g->vis_f32 ? 4 : 2;                     // bytes per GEMM operand element
+    id<MTLBuffer> vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit, feat;
+    @autoreleasepool {
+        feat = buf(g, Tp / ((size_t)c->v_merge * c->v_merge) * c->H * 4);
+        vpatch = buf(g, Tp * In * 4); vpatch16 = buf(g, g->vis_f32 ? 0 : Tp * In * 2); vposidx = buf(g, Tp * 16); vposw = buf(g, Tp * 16);
+        vx = buf(g, Pc * E * 4); vxn = buf(g, Pc * E * ob); vqkv = buf(g, Pc * 3 * E * 4);
+        vq = buf(g, Pc * E * 4 + 128 * 72 * 4); vk = buf(g, Pc * E * 4 + 128 * 72 * 4); vv = buf(g, Pc * E * 4 + 128 * 72 * 4); va = buf(g, Pc * E * ob);
+        vff = buf(g, Pc * F * 4); vff16 = buf(g, Pc * F * ob);
+        vm = buf(g, Pc / 4 * M * 4 + 16); vm16 = buf(g, Pc / 4 * M * ob + 16);
+        // Only patch embedding needs a separate split. Norm/GELU producers write the
+        // same high/residual planes directly into their existing four-byte buffers.
+        vsplit = buf(g, g->vis_f32 && g->vis_comp ? Pc * In * 4 : 0);
+    }
+    id<MTLBuffer> all[] = { vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit, feat };
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
+        if (!all[i]) return gerr(err, errlen, "cannot allocate vision buffers (previous buffers kept)");
+    }
+    g->feat = feat;
+    g->vpatch = vpatch; g->vpatch16 = vpatch16; g->vposidx = vposidx; g->vposw = vposw;
+    g->vx = vx; g->vxn = vxn; g->vqkv = vqkv; g->vq = vq; g->vk = vk; g->vv = vv; g->va = va;
+    g->vff = vff; g->vff16 = vff16; g->vm = vm; g->vm16 = vm16; g->vsplit = vsplit;
+    g->vcap = cap;
+    g->vcap_total = total;
     return true;
 }
 
@@ -413,6 +498,53 @@ typedef struct { int Hk, Hv, dk, dv, row, C; } gdn_prep_args;
 typedef struct { int Hk, Hv, dk, dv, C; } gdn_args;
 typedef struct { int Hv, dv, row, zoff; float eps; } gdn_out_args;
 typedef struct { int I; } swiglu_args;
+typedef struct { int P, E, heads, hd, grid_w, merge; float eps, scale; } vis_args;
+typedef struct { int H; float eps; int rows; } ln_act_args;
+typedef struct { int N, mode, rows; } bias_act_args;
+
+static void vision_gemm(clef_gpu *g, id<MTLComputeCommandEncoder> enc, int xt, bool acc,
+                        id<MTLBuffer> X, NSUInteger xoff, NSUInteger w_off, int N, int K,
+                        id<MTLBuffer> Y, NSUInteger yoff, int T, const act_args *ac, NSUInteger ovf_off, bool presplit) {
+    if (!g->vis_comp || acc || xt != X_F32 || !ac->f16) {
+        if (xt != X_F32) {
+            gemm(g, enc, xt, acc, X, xoff, w_off, N, K, Y, yoff, T);
+            return;
+        }
+        // The 16-row FP32 tile preserves reductions and saves work at short/ragged shapes.
+        const gemm_args a = { T, N, K };
+        [enc setComputePipelineState:g->ps[acc ? @"gemm_f32_acc_16x128" : @"gemm_f32_16x128"]];
+        [enc setBytes:&a length:sizeof(a) atIndex:0];
+        [enc setBuffer:X offset:xoff atIndex:1];
+        [enc setBuffer:g->weights offset:w_off atIndex:2];
+        [enc setBuffer:Y offset:yoff atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake((N + 127) / 128, (T + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        return;
+    }
+    if (!presplit) {
+        const long n = (long)T * K;
+        [enc setComputePipelineState:g->ps[@"vis_split_gemm"]];
+        [enc setBuffer:X offset:xoff atIndex:0];
+        [enc setBuffer:g->vsplit offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc setBytes:ac length:sizeof(*ac) atIndex:3];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:4];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        X = g->vsplit;
+        xoff = 0;
+    }
+    // Selection uses this image's rows, never the packed batch's length.
+    const int tm = T >= 1024 ? 64 : 32;
+    NSString *name = tm == 64 ? @"vis_gemm_comp_64x128" : @"vis_gemm_comp_32x128";
+    const gemm_args a = { T, N, K };
+    [enc setComputePipelineState:g->ps[name]];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];
+    [enc setBuffer:X offset:xoff atIndex:1];
+    [enc setBuffer:g->weights offset:w_off atIndex:2];
+    [enc setBuffer:Y offset:yoff atIndex:3];
+    [enc dispatchThreadgroups:MTLSizeMake((N + 127) / 128, (T + tm - 1) / tm, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+}
 
 static void encode_gdn_scan(clef_gpu *g, id<MTLComputeCommandEncoder> enc, const clef_config *c,
                             int C, const int32_t *bounds, int first, int count) {
@@ -506,6 +638,7 @@ clef_gpu_prefix *clef_gpu_prefix_new(void) { return (clef_gpu_prefix *)calloc(1,
 void clef_gpu_prefix_free(clef_gpu_prefix *px) {
     if (!px) return;
     @autoreleasepool {
+        px->vision = nil;
         for (int i = 0; i < CLEF_MAX_LAYERS; i++) px->K[i] = px->V[i] = nil;
         for (int i = 0; i < 16; i++) px->kv[i] = nil;
         for (int i = 0; i < CLEF_PREFIX_CKPT; i++) px->ck_state[i] = px->ck_tail[i] = nil;
@@ -514,7 +647,7 @@ void clef_gpu_prefix_free(clef_gpu_prefix *px) {
 }
 
 size_t clef_gpu_prefix_bytes(const clef_gpu_prefix *px) {
-    size_t n = 0;
+    size_t n = px->vision.length;
     for (int i = 0; i < CLEF_PREFIX_CKPT; i++) n += px->ck_state[i].length + px->ck_tail[i].length;
     for (int i = 0; i < CLEF_MAX_LAYERS; i++) n += px->K[i].length + px->V[i].length;
     for (int i = 0; i < 16; i++) n += px->kv[i].length;
@@ -532,7 +665,7 @@ bool clef_gpu_prefix_slot_allocated(const clef_gpu_prefix *px, int slot) {
     return slot >= 0 && slot < CLEF_PREFIX_CKPT && px->ck_state[slot] && px->ck_tail[slot];
 }
 
-size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts) {
+size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const clef_gpu_prefix *px, int rows, int new_ckpts, int image_rows) {
     size_t cap = (size_t)px->cap;
     if ((size_t)rows > cap) {
         size_t want = (size_t)rows;
@@ -546,7 +679,16 @@ size_t clef_gpu_prefix_estimate(const clef_gpu *g, const clef_config *c, const c
     const size_t ckpt = (size_t)n_gdn * c->Hv * c->dk * c->dv * 4 + (size_t)n_gdn * (c->ssm_kernel - 1) * C * 4;
     size_t n = (size_t)n_attn * 2 * kvb + (size_t)g->n_kv * memb;
     for (int i = 0; i < CLEF_PREFIX_CKPT; i++) n += px->ck_state[i].length + px->ck_tail[i].length;
-    return n + (size_t)new_ckpts * ckpt;
+    return n + (size_t)new_ckpts * ckpt + (size_t)image_rows * c->H * sizeof(float);
+}
+
+// Allocate before replacing; a failed growth preserves the old allocation for cleanup.
+static bool prefix_vision_reserve(clef_gpu *g, clef_gpu_prefix *px, size_t bytes, char *err, size_t errlen) {
+    if (px->vision.length == bytes) return true;
+    id<MTLBuffer> next = bytes ? buf(g, bytes) : nil;
+    if (bytes && !next) return gerr(err, errlen, "cannot allocate prefix image features");
+    px->vision = next;
+    return true;
 }
 
 // Keep-warm for an entry's buffers, as clef_gpu_keepalive does for the engine's: without it a hit
@@ -560,11 +702,11 @@ bool clef_gpu_prefix_keepalive(clef_gpu *g, const clef_gpu_prefix *px, char *err
         if (!cb || !enc) return gerr(err, errlen, "cannot create a command buffer (prefix keep-warm)");
         [enc setComputePipelineState:g->ps[@"keepalive"]];
         [enc setBuffer:g->keep offset:0 atIndex:1];
-        for (int i = 0; i < 2 * CLEF_MAX_LAYERS + 16 + 2 * CLEF_PREFIX_CKPT; i++) {
+        for (int i = 0; i <= 2 * CLEF_MAX_LAYERS + 16 + 2 * CLEF_PREFIX_CKPT; i++) {
             const int k = i - 2 * CLEF_MAX_LAYERS - 16;   // the checkpoint buffers follow the K, V and memory planes
             id<MTLBuffer> b = i < CLEF_MAX_LAYERS ? px->K[i] : i < 2 * CLEF_MAX_LAYERS ? px->V[i - CLEF_MAX_LAYERS]
                             : k < 0 ? px->kv[i - 2 * CLEF_MAX_LAYERS]
-                            : k < CLEF_PREFIX_CKPT ? px->ck_state[k] : px->ck_tail[k - CLEF_PREFIX_CKPT];
+                            : k < CLEF_PREFIX_CKPT ? px->ck_state[k] : k < 2 * CLEF_PREFIX_CKPT ? px->ck_tail[k - CLEF_PREFIX_CKPT] : px->vision;
             if (!b) continue;
             [enc setBuffer:b offset:0 atIndex:0];
             [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
@@ -719,6 +861,177 @@ static bool encode_attention_tu(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, 
     return prof(g, cb, encp, P_ATTN, err, errlen);
 }
 
+// One image through the vision tower (metal/clef.metal "vision tower"), its features into the
+// feat rows [img->feat_row, + tokens). patch_off is the image's first row in the pass's patch
+// uploads. The tower's GEMM operands are the ACT_VIS class: f32 by default (CLEF_VIS_F32=1), else x_vis/ac select FP16 or BF16, and an
+// overflow flags the image's record (ovf_row) like any backbone operand.
+static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *encp,
+                          const clef_gpu_image *img, int patch_off, int x_vis, const act_args *ac, char *err, size_t errlen) {
+    id<MTLComputeCommandEncoder> enc = *encp;
+    const clef_config *c = &e->cfg;
+    const clef_weights *w = &e->w;
+    const clef_image_patches *pt = img->pt;
+    const int P = pt->n_patch, E = c->v_E, F = c->v_ff, In = c->v_in, H = c->H;
+    // CLEF_PROFILE: the tower's GEMMs and attention in their own categories, the rest as "vision"
+#define VPROF(cat) do { if (!prof(g, cb, encp, (cat), err, errlen)) return false; enc = *encp; } while (0)
+    const int window = c->v_merge * c->v_merge, M = E * window, Pm = P / window;
+    const NSUInteger ovf_off = (NSUInteger)img->ovf_row * 4;
+    const vis_args va = { P, E, c->v_heads, c->v_hd, pt->grid_w, c->v_merge, c->v_eps, 1.0f / sqrtf((float)c->v_hd) };
+    const ln_act_args la = { E, c->v_eps, P };
+    // CLEF_VIS_F32: the operand producers write f32 into the same buffers (allocated at f32 size)
+    // and the GEMMs take float; the patches are then read as uploaded.
+    const int f32out = g->vis_f32;
+    // Mode 2 stores compensated halves with the same rounding as FP32 output followed
+    // by vis_split_gemm. Residual projections still consume mode 1 FP32 operands.
+    const int compout = g->vis_comp && x_vis == X_F32 && ac->f16 ? 2 : f32out;
+    // Small images favor the simdgroup kernel; selection depends only on this image.
+    const bool mpp = g->vis_mpp && !g->attn_ref && P >= 2048;
+    if (x_vis == X_F32) {
+        VPROF(P_VISION);
+        vision_gemm(g, enc, x_vis, false, g->vpatch, (NSUInteger)patch_off * In * 4, woff(w->v_patch_w), E, In, g->vx, 0, P, ac, ovf_off, false);
+        VPROF(P_GEMM);
+    } else {
+        const long n = (long)P * In;
+        [enc setComputePipelineState:g->ps[@"vis_act"]];
+        [enc setBuffer:g->vpatch offset:(NSUInteger)patch_off * In * 4 atIndex:0];
+        [enc setBuffer:g->vpatch16 offset:(NSUInteger)patch_off * In * 2 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];
+        [enc setBytes:ac length:sizeof(*ac) atIndex:3];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:4];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        // patch embedding: Conv3d as one GEMM over the flattened patch, then bias and position
+        VPROF(P_VISION);
+        vision_gemm(g, enc, x_vis, false, g->vpatch16, (NSUInteger)patch_off * In * 2, woff(w->v_patch_w), E, In, g->vx, 0, P, ac, ovf_off, false);
+        VPROF(P_GEMM);
+    }
+    [enc setComputePipelineState:g->ps[@"vis_embed"]];
+    [enc setBytes:&va length:sizeof(va) atIndex:0];
+    [enc setBuffer:g->vx offset:0 atIndex:1];
+    [enc setBuffer:g->weights offset:woff(w->v_patch_b) atIndex:2];
+    [enc setBuffer:g->weights offset:woff(w->v_pos) atIndex:3];
+    [enc setBuffer:g->vposidx offset:(NSUInteger)patch_off * 16 atIndex:4];
+    [enc setBuffer:g->vposw offset:(NSUInteger)patch_off * 16 atIndex:5];
+    [enc dispatchThreads:MTLSizeMake(E, P, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    for (int l = 0; l < c->v_layers; l++) {
+        const clef_vlayer_w *lw = &w->vlayer[l];
+        // Each residual bias is applied by the next norm, which writes the rounded sum
+        // back to vx before it is reused. This removes two standalone passes per block.
+        // x + attn(norm1(x))
+        [enc setComputePipelineState:g->ps[l ? @"layernorm_bias_act" : @"layernorm_act"]];
+        [enc setBytes:&la length:sizeof(la) atIndex:0];
+        [enc setBuffer:g->vx offset:0 atIndex:1];
+        [enc setBuffer:g->weights offset:woff(lw->ln1_w) atIndex:2];
+        [enc setBuffer:g->weights offset:woff(lw->ln1_b) atIndex:3];
+        [enc setBuffer:g->vxn offset:0 atIndex:4];
+        [enc setBytes:ac length:sizeof(*ac) atIndex:5];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
+        [enc setBuffer:g->vxn offset:0 atIndex:7];
+        [enc setBytes:&compout length:sizeof(compout) atIndex:8];
+        if (l) [enc setBuffer:g->weights offset:woff(w->vlayer[l - 1].down_b) atIndex:9];
+        rows_kernel(g, enc, l ? @"layernorm_bias_act" : @"layernorm_act", P, E);
+        VPROF(P_VISION);
+        vision_gemm(g, enc, x_vis, false, g->vxn, 0, woff(lw->qkv_w), 3 * E, E, g->vqkv, 0, P, ac, ovf_off, true);
+        VPROF(P_GEMM);
+        [enc setComputePipelineState:g->ps[@"vis_qkv_rope"]];
+        [enc setBytes:&va length:sizeof(va) atIndex:0];
+        [enc setBuffer:g->vqkv offset:0 atIndex:1];
+        [enc setBuffer:g->weights offset:woff(lw->qkv_b) atIndex:2];
+        [enc setBuffer:g->vis_inv_freq offset:0 atIndex:3];
+        [enc setBuffer:g->vq offset:0 atIndex:4];
+        [enc setBuffer:g->vk offset:0 atIndex:5];
+        [enc setBuffer:g->vv offset:0 atIndex:6];
+        const int tail_rows = mpp ? 128 : 32;
+        [enc setBytes:&tail_rows length:sizeof(tail_rows) atIndex:7];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)c->v_hd / 2, (NSUInteger)c->v_heads, (NSUInteger)P)
+             threadsPerThreadgroup:MTLSizeMake((NSUInteger)c->v_hd / 2, 1, 1)];
+        VPROF(P_VISION);   // a boundary must precede the pipeline and buffer setup of the next dispatch
+        [enc setComputePipelineState:g->ps[g->attn_ref ? @"vis_attention" : mpp ? @"vis_attention_mpp" : @"vis_attention_mma"]];
+        [enc setBytes:&va length:sizeof(va) atIndex:0];
+        [enc setBuffer:g->vq offset:0 atIndex:1];
+        [enc setBuffer:g->vk offset:0 atIndex:2];
+        [enc setBuffer:g->vv offset:0 atIndex:3];
+        [enc setBuffer:g->va offset:0 atIndex:4];
+        [enc setBytes:ac length:sizeof(*ac) atIndex:5];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
+        [enc setBuffer:g->va offset:0 atIndex:7];
+        [enc setBytes:&f32out length:sizeof(f32out) atIndex:8];
+        if (g->attn_ref) [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(P + 7) / 8, (NSUInteger)c->v_heads, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        else [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(P + 31) / 32, (NSUInteger)c->v_heads, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        VPROF(P_ATTN);
+        vision_gemm(g, enc, x_vis, true, g->va, 0, woff(lw->out_w), E, E, g->vx, 0, P, ac, ovf_off, false);
+        VPROF(P_GEMM);
+        // x + mlp(norm2(x))
+        [enc setComputePipelineState:g->ps[@"layernorm_bias_act"]];
+        [enc setBytes:&la length:sizeof(la) atIndex:0];
+        [enc setBuffer:g->vx offset:0 atIndex:1];
+        [enc setBuffer:g->weights offset:woff(lw->ln2_w) atIndex:2];
+        [enc setBuffer:g->weights offset:woff(lw->ln2_b) atIndex:3];
+        [enc setBuffer:g->vxn offset:0 atIndex:4];
+        [enc setBytes:ac length:sizeof(*ac) atIndex:5];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
+        [enc setBuffer:g->vxn offset:0 atIndex:7];
+        [enc setBytes:&compout length:sizeof(compout) atIndex:8];
+        [enc setBuffer:g->weights offset:woff(lw->out_b) atIndex:9];
+        rows_kernel(g, enc, @"layernorm_bias_act", P, E);
+        VPROF(P_VISION);
+        vision_gemm(g, enc, x_vis, false, g->vxn, 0, woff(lw->up_w), F, E, g->vff, 0, P, ac, ovf_off, true);
+        VPROF(P_GEMM);
+        const bias_act_args ga = { F, 0, P };
+        [enc setComputePipelineState:g->ps[@"vis_bias_gelu"]];
+        [enc setBytes:&ga length:sizeof(ga) atIndex:0];
+        [enc setBuffer:g->vff offset:0 atIndex:1];
+        [enc setBuffer:g->weights offset:woff(lw->up_b) atIndex:2];
+        [enc setBuffer:g->vff16 offset:0 atIndex:3];
+        [enc setBytes:ac length:sizeof(*ac) atIndex:4];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:5];
+        [enc setBuffer:g->vff16 offset:0 atIndex:6];
+        [enc setBytes:&f32out length:sizeof(f32out) atIndex:7];
+        [enc dispatchThreads:MTLSizeMake((NSUInteger)F, (NSUInteger)P, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        VPROF(P_VISION);
+        vision_gemm(g, enc, x_vis, true, g->vff16, 0, woff(lw->down_w), E, F, g->vx, 0, P, ac, ovf_off, false);
+        VPROF(P_GEMM);
+    }
+    // merger: LayerNorm per patch, then each merge window's four rows as one row of 4E
+    [enc setComputePipelineState:g->ps[@"layernorm_bias_act"]];
+    [enc setBytes:&la length:sizeof(la) atIndex:0];
+    [enc setBuffer:g->vx offset:0 atIndex:1];
+    [enc setBuffer:g->weights offset:woff(w->v_post_ln_w) atIndex:2];
+    [enc setBuffer:g->weights offset:woff(w->v_post_ln_b) atIndex:3];
+    [enc setBuffer:g->vxn offset:0 atIndex:4];
+    [enc setBytes:ac length:sizeof(*ac) atIndex:5];
+    [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
+    [enc setBuffer:g->vxn offset:0 atIndex:7];
+    [enc setBytes:&compout length:sizeof(compout) atIndex:8];
+    [enc setBuffer:g->weights offset:woff(w->vlayer[c->v_layers - 1].down_b) atIndex:9];
+    rows_kernel(g, enc, @"layernorm_bias_act", P, E);
+    VPROF(P_VISION);
+    vision_gemm(g, enc, x_vis, false, g->vxn, 0, woff(w->v_mm0_w), M, M, g->vm, 0, Pm, ac, ovf_off, true);
+    VPROF(P_GEMM);
+    const bias_act_args ma = { M, 1, Pm };
+    [enc setComputePipelineState:g->ps[@"vis_bias_gelu"]];
+    [enc setBytes:&ma length:sizeof(ma) atIndex:0];
+    [enc setBuffer:g->vm offset:0 atIndex:1];
+    [enc setBuffer:g->weights offset:woff(w->v_mm0_b) atIndex:2];
+    [enc setBuffer:g->vm16 offset:0 atIndex:3];
+    [enc setBytes:ac length:sizeof(*ac) atIndex:4];
+    [enc setBuffer:g->ovf offset:ovf_off atIndex:5];
+    [enc setBuffer:g->vm16 offset:0 atIndex:6];
+    [enc setBytes:&compout length:sizeof(compout) atIndex:7];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)M, (NSUInteger)Pm, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    const NSUInteger feat_off = (NSUInteger)img->feat_row * H * 4;
+    VPROF(P_VISION);
+    vision_gemm(g, enc, x_vis, false, g->vm16, 0, woff(w->v_mm2_w), H, M, g->feat, feat_off, Pm, ac, ovf_off, true);
+    VPROF(P_GEMM);
+    [enc setComputePipelineState:g->ps[@"add_bias"]];
+    [enc setBytes:&H length:sizeof(H) atIndex:0];
+    [enc setBuffer:g->feat offset:feat_off atIndex:1];
+    [enc setBuffer:g->weights offset:woff(w->v_mm2_b) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)H, (NSUInteger)Pm, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    VPROF(P_VISION);
+#undef VPROF
+    return true;
+}
+
 static const gguf_tensor *head_t(const clef_engine *e, const char *name) { return gguf_find_tensor(&e->gguf, name); }
 
 // px (with L and plan, else NULL, 0, NULL): the pass is one record whose first L tokens are in
@@ -728,7 +1041,7 @@ static const gguf_tensor *head_t(const clef_engine *e, const char *name) { retur
 // computes is what a pass over the whole record computes for these rows.
 static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos,
                     const int32_t *seq_start, const int32_t *seq_bounds, int n_seq, int T, bool bf16_only,
-                    bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows,
+                    bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows, const clef_gpu_images *imgs,
                     clef_gpu_prefix *px, int L, const clef_prefix_plan *plan, char *err, size_t errlen) {
     const int R = dump_rows > 0 && dump_rows < T ? dump_rows : T;   /* dump the last R token rows */
     const clef_config *c = &e->cfg;
@@ -736,6 +1049,28 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
     // FP16 operands are only safe with the overflow flags read back (and acted on) by the caller
     if (!bf16_only && g->act_f16 && !overflow) return gerr(err, errlen, "FP16 activations need the overflow flags (pass overflow or bf16_only)");
     if (!ensure_capacity(g, c, T, n_seq, err, errlen)) return false;
+    const int n_img = imgs ? imgs->n : 0;
+    if (n_img && !c->has_vision) return gerr(err, errlen, "images with a model file without the vision tower");
+    const bool cache_images = px && n_img && imgs->cache;
+    const bool reuse_images = cache_images && imgs->reuse;
+    if (imgs && imgs->reuse && !cache_images) return gerr(err, errlen, "image reuse requires a keyed prefix entry");
+    int max_patches = 0, total_patches = 0, image_rows = 0;
+    for (int i = 0; i < n_img; i++) {
+        const clef_image_patches *pt = imgs->img[i].pt;
+        if (pt->n_patch <= 0 || pt->patch_dim != c->v_in || pt->grid_h % c->v_merge || pt->grid_w % c->v_merge ||
+            pt->n_patch > INT_MAX - total_patches || pt->n_tokens <= 0 ||
+            imgs->img[i].feat_row != image_rows || pt->n_tokens > (reuse_images ? T + L : T) - image_rows)
+            return gerr(err, errlen, "invalid image patches");
+        if (pt->n_patch > max_patches) max_patches = pt->n_patch;
+        total_patches += pt->n_patch;
+        image_rows += pt->n_tokens;
+    }
+    if (n_img) for (int t = 0; t < T; t++)
+        if (imgs->img_row[t] < -1 || imgs->img_row[t] >= image_rows) return gerr(err, errlen, "invalid image feature row");
+    const size_t image_bytes = (size_t)image_rows * c->H * sizeof(float);
+    if (reuse_images && px->vision.length != image_bytes) return gerr(err, errlen, "cached image feature size mismatch");
+    if (px && !reuse_images && !prefix_vision_reserve(g, px, cache_images ? image_bytes : 0, err, errlen)) return false;
+    if (n_img && !reuse_images && !ensure_vision_capacity(g, c, max_patches, total_patches, err, errlen)) return false;
     int gdn_longest = 0;
     for (int i = 0; i < n_seq; i++) {
         const int length = seq_bounds[i + 1] - seq_bounds[i];
@@ -757,12 +1092,27 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
                     memset_pattern4(scratch[i].contents, &nan, scratch[i].length);
             }
             for (int i = 0; i < g->n_kv; i++) memset_pattern4(g->kv[i].contents, &nan, g->kv[i].length);
+            if (g->vcap) {
+                id<MTLBuffer> vis[] = { g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv, g->vq, g->vk, g->vv,
+                                        g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat };
+                for (size_t i = 0; i < sizeof(vis) / sizeof(vis[0]); i++) memset_pattern4(vis[i].contents, &nan, vis[i].length);
+            }
         }
         memcpy(g->ids.contents, ids, (size_t)T * 4);
-        memcpy(g->pos.contents, pos, (size_t)T * 4);
+        memcpy(g->pos.contents, pos, (size_t)T * 12);
         memcpy(g->seq_start.contents, seq_start, (size_t)T * 4);
         memcpy(g->seq_bounds.contents, seq_bounds, (size_t)(n_seq + 1) * 4);
         memset(g->ovf.contents, 0, (size_t)T * 4);
+        if (n_img) memcpy(g->img_row.contents, imgs->img_row, (size_t)T * 4);
+        else memset(g->img_row.contents, 0xff, (size_t)T * 4);   // -1: every token is text
+        // the images' patches and position interpolation, each image at its own rows
+        for (int i = 0, off = 0; !reuse_images && i < n_img; i++) {
+            const clef_image_patches *pt = imgs->img[i].pt;
+            memcpy((float *)g->vpatch.contents + (size_t)off * c->v_in, pt->patches, (size_t)pt->n_patch * c->v_in * 4);
+            clef_image_pos_interp(pt->grid_h, pt->grid_w, c->v_pos_side, c->v_merge,
+                                  (int32_t *)g->vposidx.contents + (size_t)off * 4, (float *)g->vposw.contents + (size_t)off * 4);
+            off += pt->n_patch;
+        }
 
         const int H = c->H, W = c->W;
         const int C = 2 * c->Hk * c->dk + c->Hv * c->dv;
@@ -773,6 +1123,8 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
         const act_args ac_gdn = { f_gdn, g->f16_lim }, ac_mlp = { f_mlp, g->f16_lim };
         const int x_norm = f_norm ? X_F16 : X_BF16, x_attn = f_attn ? X_F16 : X_BF16;
         const int x_gdn = f_gdn ? X_F16 : X_BF16, x_mlp = f_mlp ? X_F16 : X_BF16;
+        const int f_vis = !!(f16 & ACT_VIS), x_vis = g->vis_f32 ? X_F32 : f_vis ? X_F16 : X_BF16;
+        const act_args ac_vis = { f_vis, g->f16_lim };
         const int n_ssm = C + c->Hv * c->dv + 2 * c->Hv;
         const int n_attn = c->nh * 2 * c->hd + 2 * c->nkv * c->hd;
         // Tensor-unit attention takes half operands, so it runs only where the pass acts on the
@@ -801,7 +1153,13 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
         g->cb_failed = false;
         if (!new_cb(g, &cb, &enc)) return gerr(err, errlen, "cannot create a command buffer");
 
-        // embedding
+        // vision tower, one image after another, before the embedding reads its features
+        for (int i = 0, off = 0; !reuse_images && i < n_img; i++) {
+            if (!encode_vision(g, e, &cb, &enc, &imgs->img[i], off, x_vis, &ac_vis, err, errlen)) return false;
+            off += imgs->img[i].pt->n_patch;
+        }
+
+        // embedding, with image features in place of their placeholder tokens
         {
             [enc setComputePipelineState:g->ps[@"embed"]];
             int h = H;
@@ -809,6 +1167,10 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             [enc setBuffer:g->ids offset:0 atIndex:1];
             [enc setBuffer:g->weights offset:woff(e->w.token_embd) atIndex:2];
             [enc setBuffer:g->x offset:0 atIndex:3];
+            [enc setBuffer:g->img_row offset:0 atIndex:4];
+            // without images every img_row is -1 and embed never reads this binding; img_row
+            // stands in so a text-only engine needs no feature buffer at all
+            [enc setBuffer:reuse_images ? px->vision : n_img ? g->feat : g->img_row offset:0 atIndex:5];
             [enc dispatchThreads:MTLSizeMake(H, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
         if (dump_layers) {
@@ -1097,6 +1459,7 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
         if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
         if (g->cb_failed) return gerr(err, errlen, "cannot create a command buffer (mid-pass)");   // see new_cb
         if (g->stage_time) {
+            if (reuse_images) fprintf(stderr, "clef: image cache reused %d features\n", image_rows);
             // encode: host time to build the pass; wait: commit to completion; exec: the GPU's own
             // interval for the (last) command buffer. wait - exec is how late the GPU started.
             fprintf(stderr, "clef: stage T=%d n=%d: encode %.2f ms, wait %.2f ms, exec %.2f ms\n", T, n_seq,
@@ -1114,6 +1477,10 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             const int32_t *flag = (const int32_t *)g->ovf.contents;
             for (int r = 0; r < n_seq; r++) overflow[r] = flag[seq_bounds[r]] != 0;
         }
+        // A flagged or failed pass never becomes reusable. The host commits its image
+        // identity and prefix only after the head succeeds; no other key can see this buffer.
+        if (cache_images && !reuse_images && overflow && !overflow[0])
+            memcpy(px->vision.contents, g->feat.contents, image_bytes);
         in->nh = (const float *)g->nh32.contents;
         in->nh_skip = L;
         in->n_kv = g->n_kv;
@@ -1122,15 +1489,17 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
     return true;
 }
 
-bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos,
+bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos3,
                       const int32_t *seq_start, const int32_t *seq_bounds, int n_seq, int T, bool bf16_only,
-                      bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows, char *err, size_t errlen) {
-    return forward(g, e, ids, pos, seq_start, seq_bounds, n_seq, T, bf16_only, overflow, in, dump_layers, dump_rows,
-                   NULL, 0, NULL, err, errlen);
+                      bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows,
+                      const clef_gpu_images *imgs, char *err, size_t errlen) {
+    return forward(g, e, ids, pos3, seq_start, seq_bounds, n_seq, T, bf16_only, overflow, in, dump_layers, dump_rows,
+                   imgs, NULL, 0, NULL, err, errlen);
 }
 
-bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix *px, const int32_t *ids, int T,
-                             int L, const clef_prefix_plan *plan, bool *overflow, clef_head_inputs *in, char *err, size_t errlen) {
+bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix *px, const int32_t *ids, const int32_t *pos3,
+                             int T, int L, const clef_prefix_plan *plan, bool *overflow, clef_head_inputs *in,
+                             const clef_gpu_images *imgs, char *err, size_t errlen) {
     if (!clef_gpu_prefix_supported(g)) return gerr(err, errlen, "the prefix cache needs tiled attention with FP16 output");
     // 32 aligns both attention paths' query tiles and the DeltaNet block: resuming there
     // reproduces the tiles and blocks of a pass over the whole record
@@ -1151,11 +1520,11 @@ bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix 
     if (!prefix_reserve(g, &e->cfg, px, T, L, err, errlen)) return false;
     for (int i = 0; i < plan->n; i++) if (!ck_reserve(g, &e->cfg, px, plan->slot[i], err, errlen)) return false;
     const int n = T - L;
-    int32_t *pos = malloc((size_t)n * 4), *ss = calloc((size_t)n, 4);
-    if (!pos || !ss) { free(pos); free(ss); return gerr(err, errlen, "out of memory (prefix pass)"); }
-    for (int i = 0; i < n; i++) pos[i] = L + i;
+    int32_t *ss = calloc((size_t)n, 4);
+    if (!ss) return gerr(err, errlen, "out of memory (prefix pass)");
     const int32_t bounds[2] = { 0, n };
-    const bool ok = forward(g, e, ids + L, pos, ss, bounds, 1, n, false, overflow, in, NULL, 0, px, L, plan, err, errlen);
-    free(pos); free(ss);
+    // the record's own positions from row L on: text continues its count, image rows keep their grid
+    const bool ok = forward(g, e, ids + L, pos3 + 3 * (size_t)L, ss, bounds, 1, n, false, overflow, in, NULL, 0, imgs, px, L, plan, err, errlen);
+    free(ss);
     return ok;
 }

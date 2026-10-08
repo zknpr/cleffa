@@ -59,6 +59,23 @@ class VerifyGguf(unittest.TestCase):
                 cls.tensors[b + "ssm_dt.bias"] = weight(p + "dt_bias", (1,)).float()
                 cls.tensors[b + "ssm_a"] = -weight(p + "A_log", (1,)).float().exp()
                 cls.tensors[b + "ssm_norm.weight"] = weight(p + "norm.weight", (1,)).float()
+        # one vision block: matrices BF16, norms and biases F32, the Conv3d weight viewed as a matrix
+        V = "model.visual."
+        cls.tensors["v.patch_embd.weight"] = weight(V + "patch_embed.proj.weight", (2, 3, 2, 1, 1)).reshape(2, 6)
+        cls.tensors["v.patch_embd.bias"] = weight(V + "patch_embed.proj.bias", (2,)).float()
+        cls.tensors["v.pos_embd.weight"] = weight(V + "pos_embed.weight", (4, 2))
+        for hf_name, name in (("norm1", "ln1"), ("norm2", "ln2")):
+            for part in ("weight", "bias"):
+                cls.tensors[f"v.blk.0.{name}.{part}"] = weight(f"{V}blocks.0.{hf_name}.{part}", (2,)).float()
+        for hf_name, name, shape in (("attn.qkv", "attn_qkv", (6, 2)), ("attn.proj", "attn_out", (2, 2)),
+                                     ("mlp.linear_fc1", "ffn_up", (3, 2)), ("mlp.linear_fc2", "ffn_down", (2, 3))):
+            cls.tensors[f"v.blk.0.{name}.weight"] = weight(f"{V}blocks.0.{hf_name}.weight", shape)
+            cls.tensors[f"v.blk.0.{name}.bias"] = weight(f"{V}blocks.0.{hf_name}.bias", (shape[0],)).float()
+        for part in ("weight", "bias"):
+            cls.tensors[f"v.post_ln.{part}"] = weight(f"{V}merger.norm.{part}", (2,)).float()
+        for hf_name, name, shape in (("linear_fc1", "mm.0", (8, 8)), ("linear_fc2", "mm.2", (3, 8))):
+            cls.tensors[f"v.{name}.weight"] = weight(f"{V}merger.{hf_name}.weight", shape)
+            cls.tensors[f"v.{name}.bias"] = weight(f"{V}merger.{hf_name}.bias", (shape[0],)).float()
         head = {"projection.weight": torch.ones((2, 3), dtype=torch.bfloat16),
                 "scale": torch.tensor(1.0, dtype=torch.bfloat16)}
         cls.tensors.update({"head." + k: v.reshape(v.shape or (1,)) for k, v in head.items()})
@@ -68,7 +85,7 @@ class VerifyGguf(unittest.TestCase):
             "weight_map": {k: "weights.safetensors" for k in source}}))
         (cls.hf / "config.json").write_text(json.dumps({"text_config": {
             "num_hidden_layers": 2, "layer_types": ["full_attention", "linear_attention"],
-            "linear_conv_kernel_dim": 2}}))
+            "linear_conv_kernel_dim": 2}, "vision_config": {"depth": 1}}))
 
     def verify(self, tensors):
         path = self.hf / "test.gguf"
@@ -97,16 +114,17 @@ class VerifyGguf(unittest.TestCase):
 
     def test_missing_tensors_fail(self):
         for name in ("output.weight", "blk.0.attn_norm.weight", "blk.0.attn_qkv.weight",
-                     "blk.1.ssm_conv1d.weight", "head.projection.weight"):
+                     "blk.1.ssm_conv1d.weight", "head.projection.weight", "v.blk.0.attn_qkv.bias", "v.mm.2.weight"):
             with self.subTest(tensor=name):
                 p = self.verify({k: v for k, v in self.tensors.items() if k != name})
                 self.assertNotEqual(p.returncode, 0, p.stdout)
                 self.assertIn(name, p.stdout + p.stderr)
 
     def test_equal_size_wrong_shapes_fail(self):
-        for name in ("token_embd.weight", "head.projection.weight"):
+        for name in ("token_embd.weight", "head.projection.weight", "v.patch_embd.weight"):
             with self.subTest(tensor=name):
-                p = self.verify({**self.tensors, name: self.tensors[name].reshape(3, 2)})
+                t = self.tensors[name]
+                p = self.verify({**self.tensors, name: t.reshape(t.shape[1], t.shape[0])})
                 self.assertNotEqual(p.returncode, 0, p.stdout)
                 self.assertIn(name, p.stdout + p.stderr)
 

@@ -417,7 +417,8 @@ static void prep_check(id<MTLDevice> dev, id<MTLCommandQueue> queue, const char 
     const int lengths[] = { 5, 40, 32 }, row = nh * 2 * HD + 2 * NKV * HD;
     id<MTLComputePipelineState> ps32 = kernel_pipeline(dev, source, @"attn_prep");
     id<MTLComputePipelineState> ps16 = kernel_pipeline(dev, source, @"attn_prep_split");
-    id<MTLBuffer> qkv = buffer(dev, (size_t)T * row * 4), w = buffer(dev, HD * 4), pos = buffer(dev, T * 4);
+    // pos is [T][3]: interleaved M-RoPE, one value per axis; text tokens repeat the same position
+    id<MTLBuffer> qkv = buffer(dev, (size_t)T * row * 4), w = buffer(dev, HD * 4), pos = buffer(dev, T * 12);
     id<MTLBuffer> freq = buffer(dev, 32 * 4), seq = buffer(dev, T * 4);
     float *x = qkv.contents, *wv = w.contents, *fr = freq.contents;
     int *p = pos.contents, *s = seq.contents;
@@ -425,7 +426,7 @@ static void prep_check(id<MTLDevice> dev, id<MTLCommandQueue> queue, const char 
     for (int d = 0; d < HD; d++) wv[d] = 2 + value(d * 97u);
     for (int j = 0; j < 32; j++) fr[j] = powf(10000.0f, -(float)j / 32);
     for (int r = 0, start = 0; r < 3; start += lengths[r++]) {
-        for (int t = 0; t < lengths[r]; t++) { s[start + t] = start; p[start + t] = t; }
+        for (int t = 0; t < lengths[r]; t++) { s[start + t] = start; for (int k = 0; k < 3; k++) p[3 * (start + t) + k] = t; }
     }
     for (int t = 5; t < 45; t++) for (int i = nh * 2 * HD + NKV * HD; i < row; i++) x[(size_t)t * row + i] *= 100000;
     const attn_args a = { nh, NKV, HD, T, 0 };

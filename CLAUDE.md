@@ -5,10 +5,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `cleffa`: a C11 + Metal inference engine for Cloudflare's Clef (27B) and Clef-Flash (9B) joint-schema
-models. One prefill pass per SystemOne request, typed decisions out. Text-only, BF16 weights, never
-quantized. Apple Silicon only (Metal 4 tensor ops, Accelerate). The README is current and detailed;
-read it for measured accuracy/latency numbers and the security notes. This file covers what the README
-does not: how the pieces fit, the parity contract, and the traps.
+models. One prefill pass per SystemOne request, typed decisions out. Text and images (no video), BF16
+weights, never quantized. Apple Silicon only (Metal 4 tensor ops, Accelerate). The README is current and
+detailed; read it for measured accuracy/latency numbers and the security notes. This file covers what
+the README does not: how the pieces fit, the parity contract, and the traps.
 
 Git repository `cleffa`, imported 2026-10-03. Model snapshots, GGUFs, golden data,
 `.venv` and build outputs are git-ignored (`.gitignore`); stage explicit paths. Built after ds4
@@ -47,10 +47,37 @@ make clean
 - `bench/compare_mlx.py T K N --output OUT.json` compares the MPP GEMM algorithm with MLX on
   identical FP16/BF16 operands and FP32 output. It requires optional MLX/NumPy dependencies;
   see `docs/rejected-experiments.md` for isolated installation, measurements and rejected probes.
-- `docs/` holds six topic reports indexed by `docs/README.md`: performance history, attention,
-  prefix cache, hosted comparison, long-request timing and rejected experiments. Add new
+- `docs/` holds seven topic reports indexed by `docs/README.md`: performance history, attention,
+  prefix cache, hosted comparison, long-request timing, rejected experiments and vision. Add new
   measurements to the matching report rather than starting a dated file. The raw evidence they
   cite lives in git-ignored `golden/<experiment>-<date>/` directories.
+- `third_party/iris/` holds the PNG/JPEG single-header decoders imported from ds4 (MIT,
+  `THIRD_PARTY_NOTICES.md`); `clef_image.c` is their only includer and sets their decode limits.
+  Local changes are the input checks and arithmetic listed in `jpeg.h`'s header comment (scan
+  header bounds, luma must be the most sampled component, scans may only use defined Huffman
+  tables and name each component once, DC symbols at most 15, wrapping DC prediction stored as 16 bits, a 64-bit IDCT,
+  single-component progressive DC scans in raster order, libjpeg's h1v2 (4:4:0) upsampling, SOF1
+  as baseline, libjpeg's write for a run overshooting its band (refinement, first scan or baseline), refusal of progressive images
+  libjpeg would smooth, fill bytes before markers skipped one at a time, `FF FF 00` in entropy
+  data refused (libjpeg-turbo's result for it is not stable), one-component frames as 1x1,
+  three-component frames copied as RGB under libjpeg's JFIF/Adobe/component-id rule, a progressive
+  frame with no scan refused, quantization tables required by and latched at each component's
+  first scan, blocks with IDCT output beyond [-512, 511] refused because libjpeg's C and NEON paths
+  disagree there, sequential frames split across scans buffered and finished like progressive
+  ones, a scan before the frame header or a second frame header refused, scan components looked up
+  from the scan position on as libjpeg does, refinement scans required to have Al = Ah - 1, a scan
+  whose entropy data ends early refused, EOI required) and
+  optional PNG inflate/CRC hooks, and `png.h` skips empty IDAT chunks. `clef_image.c` passes the per-call source-pixel limit through
+  the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
+  `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
+  the original dependency-free PNG implementation remains the fallback. Decoder changes
+  require `tests/test_image.py` against Pillow, including malformed streams and CRCs, and
+  `tests/test_jpeg_ub.c` (crafted JPEGs under UBSan and ASan, in `make test`), plus
+  `make test-image-diff` (files from cjpeg, sips, ffmpeg and Pillow against Pillow) and fuzz runs on
+  the result (`make fuzz-image`, `make fuzz-jpeg-diff`, below). Treat any undefined behavior the
+  decoders can reach from a file as a bug even when the output is clamped, and any pixel that
+  differs from libjpeg on a file it decodes without warnings as a parity bug: sanitizers and plain
+  fuzzing never catch the second kind.
 - `tools/evidence_archive.py OUT.tar.gz` builds the publishable evidence archive from `golden/`
   (rules and placeholders in its docstring; `--list` previews). Publishing it as a release asset is
   a release step and needs explicit approval. `tests/test_evidence_archive.py` covers the rules.
@@ -63,12 +90,17 @@ make clean
 |---|---|
 | `model/` | HF snapshot Cloudflare/clef, pinned rev `2f3de3dd` |
 | `model-flash/` | HF snapshot Cloudflare/clef-flash, pinned rev `17f0b0ad` |
-| `gguf/clef.gguf`, `gguf/clef-flash.gguf` | converter output (54 GB / 18 GB) |
+| `gguf/clef.gguf`, `gguf/clef-flash.gguf` | converter output (55 GB / 19 GB, vision tower included) |
 | `golden/<name>/` | oracle output: `requests.jsonl`, `encoded.jsonl`, `logits.safetensors`, `layers/<id>.safetensors`, `latency.json` |
 
 Golden names in use: `clef-flash` (HF BF16), `clef-flash-f32` (HF FP32, the ground truth),
 `clef-flash-f32s` (streamed FP32, validated bitwise against the full FP32 run), `clef` (27B BF16)
-and `clef-f32` (27B streamed FP32), both generated with `--safe-attn`. `clef-unsafe-attn` and
+and `clef-f32` (27B streamed FP32), both generated with `--safe-attn`. The vision corpus
+(`ref/corpus_vision.py`, `--corpus vision` on both oracles) has `clef-flash-vision-f32` (full FP32),
+`clef-flash-vision-f32s` (streamed, bitwise identical to it) and `clef-vision-f32` (27B streamed,
+`--safe-attn`). Vision golden `encoded.jsonl` lines also carry each image's token run and the
+reference's 3D `position_ids`; their `layers/` dumps hold the embeddings after the image features
+were scattered in, plus `vision.<k>` per image. `clef-unsafe-attn` and
 `clef-f32-unsafe-attn` are the first 27B runs without it, kept as evidence of the MPS SDPA bug
 (wrong `r021`, and `r020` in FP32); don't compare against them. The `clef-f32-r020*`/`*-r021*`
 directories are single-request diagnostic runs with last-512-row layer dumps.
@@ -113,13 +145,19 @@ engine and the reference disagree on a long input, check the reference first
 `smoke_test.py` loads `model/` in PyTorch on MPS and runs the README example; it is a sanity check
 for the HF snapshot, not an engine test. `golden-*.log` files at the root are oracle stdout.
 
+The converter exports the vision tower (`v.*` tensors, `clef.vision.*` keys including the image
+processor's pixel bounds and token ids); `tests/verify_gguf.py` checks them. A GGUF without
+those keys still loads, text-only (`cfg.has_vision`, `clef_vision_opts.image_token_id == 0`), and
+requests with images are rejected.
+
 ## Tests
 
-`make test` runs the head and UTF-8 error unit tests, JSON byte parity, tokenizer parity against
-`gguf/clef-flash.gguf` + `model-flash`, HTTP write-failure handling, snapshot/GGUF verifier and
-numerical parity regressions using tiny generated fixtures, the model-free prefix-cache ownership,
-planner and test-mode checks, the Cloudflare collector/comparator unit tests, and the checkout
-latency report test.
+`make test` runs the head and UTF-8 error unit tests, JSON byte parity, the image pipeline parity
+(`tests/test_image.py`: decode, resize, patches and position interpolation against PIL, torchvision
+and the processor), tokenizer parity against `gguf/clef-flash.gguf` + `model-flash`, HTTP
+write-failure handling, snapshot/GGUF verifier and numerical parity regressions using tiny generated
+fixtures, the model-free prefix-cache ownership, planner and test-mode checks, the Cloudflare
+collector/comparator unit tests, and the checkout latency report test.
 `make test-errors` uses the flash GGUF to check CLI allocation/output failures, CLI/HTTP error responses, and
 Metal execution-error propagation and recovery. Everything else is run explicitly, with the model
 and golden directory as arguments. Use clef-flash for iteration; the 27B is for final parity only.
@@ -135,6 +173,24 @@ and golden directory as arguments. Use clef-flash for iteration; the 27B is for 
 .venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump
 ./clef -m gguf/clef-flash.gguf --logits golden/clef-flash/requests.jsonl > golden/engine_logits.jsonl
 .venv/bin/python -B tests/compare3.py golden/clef-flash golden/clef-flash-f32 golden/engine_logits.jsonl golden/engine_dump.bin
+
+# vision (ref/corpus_vision.py; the image requests, HTTP limits and caches)
+make test-vision-attention
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-vision-f32 --dump
+make test-vision-gemm  # FP64 samples, tile/packing parity, overflow flags and bias/norm fusion
+.venv/bin/python -B tests/test_vision_gemm.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl
+tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl    # repeat with CLEF_VIS_F32=0
+tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl   # repeat with CLEF_VIS_F32=0, CLEF_ATTN_REF=1
+.venv/bin/python -B tests/test_server_images.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl
+.venv/bin/python -B tests/test_vision_cache.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl  # keyed image reuse, exact logits, poison
+
+# image decoders: libFuzzer with ASan and UBSan (Homebrew LLVM; Apple's clang has no libFuzzer).
+# The harness repairs PNG chunk CRCs and the zlib trailer, or mutations rarely pass them.
+make fuzz-image && .venv/bin/python -B tests/fuzz_image_seeds.py fuzz/seeds
+./fuzz-image -dict=tests/fuzz_image.dict -fork=14 -ignore_crashes=1 -max_total_time=1800 -artifact_prefix=fuzz/artifacts/ fuzz/corpus fuzz/seeds
+# differential: decoder vs libjpeg-turbo, pixel for pixel (Homebrew jpeg-turbo), and the encoder corpus
+make fuzz-jpeg-diff && ./fuzz-jpeg-diff -dict=tests/fuzz_image.dict -fork=14 -ignore_crashes=1 -max_total_time=1200 -artifact_prefix=fuzz/artifacts-diff/ fuzz/corpus-diff fuzz/seeds
+make test-image-diff
 
 # invariants
 tests/test_batch.sh  gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # batch invariance + tenant isolation
@@ -153,8 +209,9 @@ tests/test_lingering_close.sh gguf/clef-flash.gguf   # starts its own server; cl
 ```
 
 `clef-tool` is the bridge the Python tests use to drive the C host code one line at a time
-(`json`, `float`, `round`, `tok`, `encode`, `encode-strict`, `respond` modes). When adding a host-side
-behaviour, add a mode there and a Python comparison rather than a C-only assertion.
+(`json`, `float`, `round`, `tok`, `encode`, `encode-strict`, `respond`, `image` modes; `encode` prints
+image runs and 3D positions for records with images). When adding a host-side behaviour, add a mode
+there and a Python comparison rather than a C-only assertion.
 
 ## Architecture
 
@@ -164,9 +221,13 @@ behaviour, add a mode there and a Python comparison rather than a C-only asserti
 JSON line / HTTP body
   -> clef_json.c      json_parse into an arena DOM (Python json semantics)
   -> clef_record.c    clef_encode_request: systemone() validation + encode_record port
-                      (tokenizes via clef_tok.c; records question/option token spans)
-  -> clef.c           clef_run_ex: pack records into one [T] token stream with pos/seq_start/seq_bounds
-  -> clef_metal.m     clef_gpu_forward: backbone + head-side K/V projections, one command buffer
+                      (tokenizes via clef_tok.c; records question/option token spans; images:
+                       clef_image.c decodes and preprocesses each one to patches, and the
+                       <|vision_start|> <|image_pad|>*n <|vision_end|> runs go after the template)
+  -> clef.c           clef_run_ex: pack records into one [T] token stream with pos3/seq_start/seq_bounds,
+                      the batch's images and img_row (clef_record_positions, pack_images)
+  -> clef_metal.m     clef_gpu_forward: vision tower per image (encode_vision), embedding with
+                      image features scattered in, backbone + head-side K/V projections, one command buffer
   -> clef_head.c      clef_head_run per record: joint schema head on CPU (Accelerate), f32
   -> clef.c           softmax per question (skipped with --logits)
   -> clef_record.c    clef_build_response: systemone_answer port, Python float repr / round
@@ -181,13 +242,90 @@ internal GPU/head entry points. `clef_main.c` (CLI) and `clef_server.c` (HTTP) a
 `tools/convert.py` writes one GGUF with architecture `clef`. `clef.c` `load_config` reads the
 `clef.*` keys and `bind_weights` binds every tensor by name with an exact type+shape check, so a
 converter change and the engine must move together. Shape assumptions baked into the kernels are
-enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...). The GGUF is mmap'd and wrapped as a
+enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...), including, for a vision model,
+interleaved M-RoPE section `[11, 11, 10]` (the kernels' `lane % 3`; text cannot reveal a mismatch),
+four distinct vision token ids below the vocabulary, at least 8 vision heads (`vis_qkv_rope` clears the
+attention tail with one thread per head and patch, and the smallest image has 4 patches), and a
+recorded `clef.vision.image_processor` describing exactly the preprocessing `clef_image.c`
+implements (checked field by field, as the converter checks it). The GGUF is mmap'd and wrapped as a
 single `MTLBuffer` with no copy; weight tensors are addressed by file offset.
 
 Converter layout decisions the engine depends on: per-layer projections fused into one GEMM each
 (`attn_qkv` = [q|k|v], `ssm_in` = [qkv|z|b|a], `ffn_gate_up` = [gate|up]); RMSNorm `(1+w)` folded in
 f32 and stored F32; DeltaNet `A = -exp(A_log)` stored F32; q rows are per-head `[query | gate]`;
-DeltaNet k->v head mapping is `repeat_interleave` (`h // ratio`). No tensor is permuted.
+DeltaNet k->v head mapping is `repeat_interleave` (`h // ratio`). No tensor is permuted. Vision:
+`v.patch_embd.weight` is the Conv3d weight viewed as `[1152, 3*2*16*16]` in the processor's patch
+order (channel, temporal, y, x); vision norms and biases are F32, matrices and the position table
+BF16; the merger input is four consecutive patch rows (merge-window order makes it a reshape).
+
+### Vision tower (clef_image.c, clef_metal.m encode_vision, metal/clef.metal "vision tower")
+
+Images come in the hosted API's two forms in the request's `images` list, a `data:` URL or a
+`{"content_type", "base64"}` object (bare base64 is an extension); `image_bytes` in `clef_record.c`
+checks a declared type (object `content_type` or data URL media type) against the signature and
+rejects WebP. The encoder builds the schema first, then computes each image's `smart_resize`
+geometry and refuses an image over the per-image limit, or one that cannot fit the context with the
+fixed prompt, the schema, the images before it and, when truncation is refused (the server's default),
+the state, before resizing or allocating patches: the resized area is
+request-controlled through `media_kwargs` and reached 1.85 GB resident from a 40x40 file when the
+check came after preprocessing. `media_kwargs` integers are parsed range-checked, never with `atol`.
+The server's startup warm-up includes one image sized to the per-image limit when the model has a
+tower. `clef_image.c`
+reproduces the reference's `Qwen2VLImageProcessor` byte for byte (`tests/test_image.py`): PIL-style RGB
+conversion, `smart_resize`, PyTorch's native uint8 antialiased bicubic CPU kernel (what torchvision
+runs on this Mac; PIL differs by ±1 in hundreds of pixels, the float path by much more), f32
+normalization and 16x16 patches in 2x2 merge-window order with the frame duplicated for both
+temporal taps. `clef_vision_opts` (token ids, pixel bounds, geometry) comes from the GGUF
+(`clef_vision_opts_load`); limits (`max_images`, `max_image_tokens`) from the caller. `media_kwargs`
+takes `min_pixels` and `max_pixels` together only (the processor ignores a lone one; the engine
+rejects it). `clef_record_positions` reproduces `get_rope_index` (checked against it in
+`tests/test_record.py`).
+
+On the GPU each image is one dispatch sequence over its own patches: patch GEMM + bias + bilinear
+position resampling (`vis_embed`), 27 blocks of `layernorm_act` -> qkv GEMM -> `vis_qkv_rope` (2D
+rotary, pairs (i, i+36): the first 18 by grid row, the next 18 by column) -> bidirectional
+attention (`vis_attention_mpp` at 2,048 patches or more, FP32 Metal matrix primitives with
+32-query/128-key tiles; smaller images use `vis_attention_mma`, simdgroup matrices after
+`attention_fa`; `vis_attention` is the lane-per-key reference behind `CLEF_ATTN_REF=1`) -> out GEMM + bias -> `layernorm_act` -> up GEMM -> `vis_bias_gelu`
+(tanh) -> down GEMM + bias; merger `layernorm_act` -> fc1 GEMM over four patches per row ->
+`vis_bias_gelu` (erf; `erf_f32` is musl's erff, Metal has none) -> fc2 GEMM into the pass's feature
+buffer `feat`, part of the vision scratch (one row per image token; a text-only pass has none and
+`embed` binds `img_row` in its place, never reading it). Residual biases are folded into the following `layernorm_bias_act`, which writes
+the rounded sum back before computing the norm; this removes 54 standalone passes per image
+without changing the arithmetic. The `embed` kernel reads `feat[img_row[t]]` for placeholder tokens.
+**Tower producers compute in f32 by default.** Non-residual projections use high/residual
+FP16 planes, now written directly by their producers except for patch embedding
+(`vis_split_gemm`, residual scaled by 2048), and compute two
+FP32-accumulating products (`vis_gemm_comp`). Residual projections use direct FP32 16x128 tiles.
+`CLEF_VIS_COMP=0` restores direct FP32 products throughout; BF16 retries and a cleared `ACT_VIS`
+bit also use that path. Compensating residual projections too failed the probability-error gate.
+`CLEF_VIS_F32=0` selects plain 16-bit operands under `ACT_VIS` = 16 in `CLEF_ACT_F16`; that older
+mode puts two of 41 Flash vision questions past the parity limits (`docs/vision.md`). Vision scratch is sized per pass
+(`ensure_vision_capacity`): uploads by the pass's total patches, activations by its largest image;
+Q/K/V get 128 slack rows; `encode_vision` zeroes the readable tail each layer because the
+attention tiles read past the last head's patches (poison-safe). MPP uses FP32 throughout,
+including probabilities and output before any optional 16-bit epilogue. Its tiles and dispatch
+threshold depend only on this image, never packed token count. `CLEF_VIS_MPP=0` keeps the prior
+simdgroup kernel; `make test-vision-attention` checks FP64 error, sharp/flat softmax rows, ragged
+tiles, padding, output guards, 16-bit epilogues and overflow flags without a model. The 3D positions reach `attn_prep*` as `pos[3t + i%3]` per rotary
+pair (interleaved M-RoPE, section [11, 11, 10]); text tokens carry equal values, so text results are
+bitwise what they were.
+
+Batch invariance holds because an image's dispatches depend only on its own patches and the
+record's overflow slot; `tests/test_batch.sh` and `tests/test_poison.sh` on the vision corpus cover
+both operand modes. `make test-vision-gemm` checks sampled FP64 error, exact tile/packing parity
+within each precision path, poisoned ragged tails, bias/norm fusion, and split overflow flags.
+`tests/test_vision_gemm.py` forces vision-only overflow and verifies safe reruns, including dumps.
+Norm and merger-GELU producers write the compensated half planes directly, preserving the
+standalone split's FP32 rounding. Only patch embedding needs split scratch: 24 MiB at 4,096
+patches, versus 67.25 MiB before fusion. QKV preparation clears the attention padding itself.
+The keyed prefix cache compares owned canonical patch bytes, image order, token placement and grid
+geometry before reusing backbone state or merged image features. CPU patches and GPU features count
+against its budget. Feature layout retains all images even when the resumed row lies inside or after
+an image. A failed/overflowing pass never becomes reusable; template reuse clears keyed image identity.
+Image requests qualify with a 32-token snapshot, since skipping the tower pays off even on short
+prefixes. Text keeps its 128-token minimum. `tests/test_vision_cache.py` checks full-corpus exact logits,
+image/text/schema/geometry transitions and overflow invalidation on both models.
 
 ### GPU forward (clef_metal.m + metal/clef.metal)
 
@@ -322,14 +460,19 @@ requests encode identically either way. Keep that asymmetry when adding options.
 ### Debug / diagnostic env vars
 
 `CLEF_ACT_F16=<mask>` (FP16 GEMM inputs per producer class: 1 rmsnorm, 2 attention, 4 DeltaNet,
-8 SwiGLU; default 15, 0 = BF16 as in HF's BF16 path), `CLEF_HEAD_BF16=1` (round the head's input to
-BF16 as HF does; with `CLEF_ACT_F16=0` this reproduces the pre-FP16 engine bitwise),
+8 SwiGLU, 16 vision compensation or plain 16-bit operands; default 31, 0 = BF16 backbone with FP32 vision),
+`CLEF_VIS_F32` (1, the default: retain f32 vision operands; 0: plain 16-bit per the mask),
+`CLEF_VIS_COMP` (1, the default: compensated non-residual vision GEMMs; 0: direct FP32),
+`CLEF_VIS_MPP` (1, the default: FP32 MPP vision attention at 2,048+ patches; 0: prior simdgroup kernel), `CLEF_HEAD_BF16=1`
+(round the head's input to BF16 as HF does; with `CLEF_ACT_F16=0` this reproduces the pre-FP16 engine
+bitwise),
 `CLEF_DEBUG_F16_LIMIT` (lower the FP16 overflow limit to exercise the rerun),
 `CLEF_PROFILE=1` (GPU ms for gemm, attention, gdn_scan, norm, attn_prep, conv_prep, gdn_out,
-swiglu and head; serializes the GPU, so not for latency),
+swiglu, head and vision, with the tower's GEMMs and attention counted under gemm and attention;
+serializes the GPU, so not for latency),
 `CLEF_STAGE_TIME=1` (host encode, commit-to-completion wait, GPU execution and CPU head time),
 `CLEF_ATTN_TU=0` (tiled FP32 attention control; compensated tensor-unit attention defaults on),
-`CLEF_ATTN_REF=1` (reference attention kernel, overrides tensor attention), `CLEF_DEBUG_POISON=1`, `CLEF_DEBUG_FAIL_MULTI=1`
+`CLEF_ATTN_REF=1` (reference attention kernels for the backbone and the vision tower), `CLEF_DEBUG_POISON=1`, `CLEF_DEBUG_FAIL_MULTI=1`
 (fails every multi-record forward; exercises the server's per-record retry), `CLEF_SCAN_LPC`
 (lanes per value column in the sequential `gdn_scan`), `CLEF_DEBUG_NIL_CMDBUF=N` (the Nth Metal command-buffer
 creation fails; forward-pass creation goes through `new_cb`, which makes the pass fail instead of running
@@ -464,13 +607,23 @@ discard a run with outliers like that.
 
 The engine errors where Python answers or behaves differently. The list lives in the README under
 "Deliberate divergences"; extend it there when adding one, and add the case to `tests/test_record.py`.
+Image cases (videos, lone or unknown `media_kwargs`, unsupported encodings, placeholder text in parity
+mode) are there and in `docs/vision.md`.
 
 ## Conventions
 
 - Error propagation is explicit: every fallible function returns `bool`/`NULL` and fills a
   caller-provided `err` buffer. Follow that; no silent fallbacks.
 - Treat GGUF files and requests as untrusted. Every count, offset, type and shape is bounds-checked at
-  load; JSON depth is capped at 512; duplicate-key and NFC handling must stay linear-time.
+  load; JSON depth is capped at 512; duplicate-key and NFC handling must stay linear-time. Images are
+  capped before decoding (64 MiB encoded, 16,384 px a side, 64 Mpx decoded) and the decoders check
+  every chunk and index; the server caps images per request, tokens per image, source pixels per
+  image (enforced inside the decoders at the header through a thread-local limit, never by a
+  separate pre-parse: the JPEG decoder takes every SOF it meets) and image requests decoded or
+  queued at once (slots held from before decoding until the patches are freed). Every image limit
+  is a memory bound; check that a new one applies before the allocation it is meant to prevent.
+- `ref/corpus_vision.py` is the fixed 16-request vision corpus. Changing it invalidates every
+  `golden/*vision*` directory.
 - The comment density is high and explains *why* (precision choices, parity reasoning, security).
   Match it.
 - `ref/corpus.py` is the fixed 22-request corpus for both parity and latency. Changing it invalidates

@@ -35,6 +35,17 @@ __pycache__/
 /tile-bench
 /mixed-bench
 /attention-bench
+/vision-attention-bench
+/vision-gemm-bench
+/image-bench
+/tests/test-vision-buffers
+/tests/test-base64
+/tests/test-vision-config
+/tests/test-jpeg-ub
+/fuzz-image
+/fuzz-jpeg-diff
+/fuzz/
+/tests/vision-config/
 /gemm-tiles
 /gdn-bench
 /tests/test-gdn-buffers

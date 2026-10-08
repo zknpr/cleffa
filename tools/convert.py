@@ -1,6 +1,6 @@
 """Convert a Clef / Clef-Flash HF snapshot into a single GGUF for the native engine.
 
-Text backbone + joint head + tokenizer. The vision tower is not exported (v1 is text-only).
+Text backbone + vision tower + joint head + tokenizer + image-processor parameters.
 
 Precision policy: nothing is quantized and no stored value is rounded.
   - Matrices stay BF16, byte-identical to the safetensors source.
@@ -11,6 +11,11 @@ Precision policy: nothing is quantized and no stored value is rounded.
     -exp(A_log.float()); both are stored F32 (bf16 -> f32 is exact; the exp is the
     same f32 op the reference runs).
   - Joint head tensors keep their stored dtype.
+  - Vision tower matrices stay BF16 (the patch projection is the Conv3d weight viewed as
+    [1152, 3*2*16*16], a byte-exact reshape in the processor's patch order); its LayerNorm
+    weights/biases and linear biases are stored F32 (bf16 -> f32 is exact). The learned
+    position table stays BF16 and is interpolated in f32 by the engine, as the FP32 reference
+    does with the BF16 values.
   - Per-layer projections that consume the same input are concatenated along rows
     (exact byte concatenation) so each becomes one GEMM: attention [q|k|v], DeltaNet
     [qkv|z|b|a], MLP [gate|up].
@@ -122,6 +127,34 @@ def main() -> None:
     if text["hidden_act"] != "silu" or text.get("mlp_only_layers"):
         raise ValueError("unexpected MLP configuration")
 
+    vision = config["vision_config"]
+    if vision.get("model_type") != "qwen3_5_vision" or vision.get("in_channels", 3) != 3:
+        raise ValueError("unsupported vision tower")
+    if vision.get("deepstack_visual_indexes"):
+        raise ValueError("deepstack injection is not implemented")
+    # The rotary kernels pick each frequency's position axis as lane % 3: interleaved M-RoPE with
+    # section [11, 11, 10]. The GGUF records the section (checked again at load), not the
+    # interleaving, so refuse anything else here.
+    if rope.get("mrope_interleaved") is not True or list(rope.get("mrope_section", [])) != [11, 11, 10]:
+        raise ValueError("only interleaved M-RoPE with mrope_section [11, 11, 10] is implemented")
+    if vision.get("hidden_act") != "gelu_pytorch_tanh" or vision["hidden_size"] % vision["num_heads"]:
+        raise ValueError("unexpected vision block configuration")
+    if vision["out_hidden_size"] != text["hidden_size"]:
+        raise ValueError("vision out_hidden_size does not match the backbone")
+    proc = json.loads((args.model_dir / "processor_config.json").read_text())
+    ip = proc["image_processor"]
+    # The engine reproduces this preprocessing exactly (clef_image.c); refuse anything else.
+    if (ip["image_processor_type"] != "Qwen2VLImageProcessor" or ip["resample"] != 3 or
+            ip["image_mean"] != [0.5] * 3 or ip["image_std"] != [0.5] * 3 or
+            abs(ip["rescale_factor"] - 1 / 255) > 1e-12 or not ip["do_convert_rgb"] or
+            not ip["do_resize"] or not ip["do_rescale"] or not ip["do_normalize"] or
+            ip["patch_size"] != vision["patch_size"] or ip["merge_size"] != vision["spatial_merge_size"] or
+            ip["temporal_patch_size"] != vision["temporal_patch_size"]):
+        raise ValueError("unsupported image processor configuration")
+    for key in ("image_token_id", "video_token_id", "vision_start_token_id", "vision_end_token_id"):
+        if not isinstance(config.get(key), int):
+            raise ValueError(f"missing {key}")
+
     src = None if args.vocab_only else Source(args.model_dir)
     w = gguf.GGUFWriter(args.output, ARCH)
     w.add_name(args.model_dir.name)
@@ -146,6 +179,22 @@ def main() -> None:
     w.add_uint32(f"{ARCH}.ssm.v_head_dim", text["linear_value_head_dim"])
     for key in ("width", "routing_layers", "layers", "heads", "feedforward"):
         w.add_uint32(f"{ARCH}.head.{key}", int(head_config[key]))
+    w.add_uint32(f"{ARCH}.vision.block_count", vision["depth"])
+    w.add_uint32(f"{ARCH}.vision.embedding_length", vision["hidden_size"])
+    w.add_uint32(f"{ARCH}.vision.feed_forward_length", vision["intermediate_size"])
+    w.add_uint32(f"{ARCH}.vision.attention.head_count", vision["num_heads"])
+    w.add_uint32(f"{ARCH}.vision.patch_size", vision["patch_size"])
+    w.add_uint32(f"{ARCH}.vision.spatial_merge_size", vision["spatial_merge_size"])
+    w.add_uint32(f"{ARCH}.vision.temporal_patch_size", vision["temporal_patch_size"])
+    w.add_uint32(f"{ARCH}.vision.position_embeddings", vision["num_position_embeddings"])
+    w.add_uint32(f"{ARCH}.vision.image_token_id", config["image_token_id"])
+    w.add_uint32(f"{ARCH}.vision.start_token_id", config["vision_start_token_id"])
+    w.add_uint32(f"{ARCH}.vision.end_token_id", config["vision_end_token_id"])
+    w.add_uint32(f"{ARCH}.vision.video_token_id", config["video_token_id"])
+    # smart_resize bounds: pixels of the resized image (processor size.shortest_edge / longest_edge)
+    w.add_uint32(f"{ARCH}.vision.image.min_pixels", int(ip["size"]["shortest_edge"]))
+    w.add_uint32(f"{ARCH}.vision.image.max_pixels", int(ip["size"]["longest_edge"]))
+    w.add_string(f"{ARCH}.vision.image_processor", json.dumps(ip, sort_keys=True))
     write_tokenizer(w, args.model_dir)
     if args.vocab_only:
         w.write_header_to_file()
@@ -208,6 +257,34 @@ def main() -> None:
                        lambda a=a: src.get(a + "norm.weight").float())
         else:
             raise ValueError(f"layer {i}: unknown layer type {layer_type}")
+
+    V = "model.visual."
+    E, P, Tp = vision["hidden_size"], vision["patch_size"], vision["temporal_patch_size"]
+    # Conv3d [E, 3, Tp, P, P] -> [E, 3*Tp*P*P]: the processor flattens each patch as
+    # (channel, temporal, y, x), the same order, so this is a byte-exact view.
+    plan.append(("v.patch_embd.weight", (E, 3 * Tp * P * P), "bf16",
+                 lambda: src.get(V + "patch_embed.proj.weight").reshape(E, 3 * Tp * P * P)))
+    f32_tensor("v.patch_embd.bias", (E,), lambda: src.get(V + "patch_embed.proj.bias").float())
+    matrix("v.pos_embd.weight", V + "pos_embed.weight")
+    for i in range(vision["depth"]):
+        p = f"{V}blocks.{i}."
+        b = f"v.blk.{i}."
+        for hf_name, name in (("norm1", "ln1"), ("norm2", "ln2")):
+            for part in ("weight", "bias"):
+                f32_tensor(f"{b}{name}.{part}", tuple(src.weight_shape(f"{p}{hf_name}.{part}")),
+                           lambda p=p, hf_name=hf_name, part=part: src.get(f"{p}{hf_name}.{part}").float())
+        for hf_name, name in (("attn.qkv", "attn_qkv"), ("attn.proj", "attn_out"),
+                              ("mlp.linear_fc1", "ffn_up"), ("mlp.linear_fc2", "ffn_down")):
+            matrix(f"{b}{name}.weight", f"{p}{hf_name}.weight")
+            f32_tensor(f"{b}{name}.bias", tuple(src.weight_shape(f"{p}{hf_name}.bias")),
+                       lambda p=p, hf_name=hf_name: src.get(f"{p}{hf_name}.bias").float())
+    for part in ("weight", "bias"):
+        f32_tensor(f"v.post_ln.{part}", tuple(src.weight_shape(f"{V}merger.norm.{part}")),
+                   lambda part=part: src.get(f"{V}merger.norm.{part}").float())
+    for hf_name, name in (("linear_fc1", "mm.0"), ("linear_fc2", "mm.2")):
+        matrix(f"v.{name}.weight", f"{V}merger.{hf_name}.weight")
+        f32_tensor(f"v.{name}.bias", tuple(src.weight_shape(f"{V}merger.{hf_name}.bias")),
+                   lambda hf_name=hf_name: src.get(f"{V}merger.{hf_name}.bias").float())
 
     head = safe_open(args.model_dir / "joint_head.safetensors", "pt")
     for name in sorted(head.keys()):

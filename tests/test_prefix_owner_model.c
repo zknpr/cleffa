@@ -46,6 +46,7 @@ int main(int argc,char **argv) {
     need(request!=NULL,err);
     clef_encode_opts opts=CLEF_ENCODE_DEFAULTS;
     opts.strict=true; opts.reject_truncation=true;
+    opts.vision=first->vision;
     clef_record rec={0};
     need(clef_encode_request(first->tok,request,opts,&rec,err,sizeof(err)),err);
     float ***reference=NULL;
@@ -55,10 +56,24 @@ int main(int argc,char **argv) {
     for(int pass=0;pass<2;pass++) {
         float ***got=NULL;
         int reused=-1;
+        const size_t projected=clef_prefix_estimate(first,entry,&rec);
         need(clef_run_prefix(first,entry,&rec,&got,true,&reused,err,sizeof(err)),err);
         need(pass?reused>0:reused==0,"incorrect initial fill/hit");
+        need(clef_prefix_bytes(entry)<=projected,"cache exceeded its admission projection");
         same(&rec,reference,got);
         clef_free_probs(&rec,1,got);
+    }
+    if(rec.n_images) {
+        float ***got=NULL;
+        int reused=0;
+        need(clef_run_template(first,entry,&rec,&got,true,&reused,err,sizeof(err)),err);
+        same(&rec,reference,got);clef_free_probs(&rec,1,got);
+        for(int pass=0;pass<2;pass++) {
+            got=NULL;
+            need(clef_run_prefix(first,entry,&rec,&got,true,&reused,err,sizeof(err)),err);
+            need(pass?reused>0:reused==0,"template state masqueraded as cached image features");
+            same(&rec,reference,got);clef_free_probs(&rec,1,got);
+        }
     }
     need(clef_prefix_bytes(entry)>0,"test did not populate a GPU cache");
     clef_engine *other=clef_open(argv[2],err,sizeof(err));

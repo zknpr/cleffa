@@ -14,6 +14,7 @@ section.
 | [hosted-comparison.md](hosted-comparison.md) | Workers AI measurements on the checkout fixtures and the public corpus, the truncation observations, and the local replay against saved hosted responses |
 | [long-request-timing.md](long-request-timing.md) | Why a 13.9K-token Flash request sometimes ran slower with the default attention: stage timing, GPU clocks, limiter and shader traces, sustained thermal behavior |
 | [rejected-experiments.md](rejected-experiments.md) | Attention, GEMM, FFN, DeltaNet and workload-level changes that were measured and not retained, with the criterion each failed |
+| [vision.md](vision.md) | Images: the preprocessing and tower pipeline, host byte parity, FP32-oracle parity of both operand modes, costs, cache behavior, limits and divergences |
 
 **Evidence archive.** `tools/evidence_archive.py OUT.tar.gz` packs the checkable part of
 `golden/` for publication as a release asset (`cleffa-evidence-<date>.tar.gz`): result,

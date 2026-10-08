@@ -2,6 +2,7 @@
  *
  *   clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] [--batch-tokens 4096]
  *               [--max-body 8388608] [--max-conn 256] [--no-keep-warm] [--prefix-cache-mb 0]
+ *               [--max-images 4] [--max-image-tokens 1024]
  *
  *   POST /v1/systemone   SystemOne request body -> SystemOne response body
  *   GET  /health         {"status":"ok","model":...}
@@ -32,6 +33,7 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
@@ -73,6 +75,24 @@ static struct {
     int batch;
     size_t batch_tokens;
     bool truncate;           /* default off: over-long state is rejected (--truncate = reference) */
+    /* Images per request and tokens per image after the model's own resizing (--max-images,
+     * --max-image-tokens; 0 = no limit). Over the limit a request is rejected with the count and
+     * the media_kwargs.max_pixels that would fit, never downscaled silently: the reference keeps up
+     * to 16,384 tokens per image, and image tokens cost the same prefill as text. */
+    int max_images;
+    long max_image_tokens;
+    /* Image memory is bounded at two more points (review #3). Decoding allocates several times a
+     * source image's RGB size before any token limit can apply, and a compressible 8192x8192 PNG
+     * is about 1.4 MB as base64: max_image_pixels refuses large sources at the header, before the
+     * decoders allocate. And each connection thread encodes its own request, so per-image bounds
+     * still multiply by --max-conn; an encoded 1,024-token image holds 24 MiB of f32 patches
+     * from a request of about 1 KB. max_image_requests bounds the requests with images that are
+     * decoding or holding patches at once; the rest wait, holding only their body. */
+    long max_image_pixels;   /* per source image; default 16,777,216 (the processor's max_pixels) */
+    int max_image_requests;  /* image requests decoded or queued at once; 0 = unlimited */
+    int image_inflight;
+    pthread_mutex_t image_mu;
+    pthread_cond_t image_cv;
     bool strict;             /* default on: content cannot inject chat-control tokens (--no-strict = reference) */     /* token budget per forward pass (the head job is always admitted) */
     size_t max_body;
     int max_conn;
@@ -496,6 +516,20 @@ static int read_request(int fd, rbuf *in, char **method, char **path, char **bod
     return 0;
 }
 
+static void image_slot_acquire(void) {
+    pthread_mutex_lock(&S.image_mu);
+    while (S.image_inflight >= S.max_image_requests) pthread_cond_wait(&S.image_cv, &S.image_mu);
+    S.image_inflight++;
+    pthread_mutex_unlock(&S.image_mu);
+}
+
+static void image_slot_release(void) {
+    pthread_mutex_lock(&S.image_mu);
+    S.image_inflight--;
+    pthread_cond_signal(&S.image_cv);
+    pthread_mutex_unlock(&S.image_mu);
+}
+
 static bool handle_systemone(int fd, const char *body, size_t len, bool keep_alive, const char *cache_key) {
     char err[256];
     jarena *a = jarena_new();
@@ -506,7 +540,17 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
     opts.strict = S.strict;
     opts.reject_truncation = !S.truncate;
+    opts.vision = S.e->vision;
+    opts.vision.max_images = S.max_images;
+    opts.vision.max_image_tokens = S.max_image_tokens;
+    opts.vision.max_image_pixels = S.max_image_pixels;
+    /* Any request naming images takes a slot before its images are decoded and keeps it until
+     * its patches are freed; a malformed list is refused by the encoder before any decoding. */
+    const jval *ims = req ? json_get(req, "images") : NULL;
+    const bool slot = S.max_image_requests > 0 && ims && ims->type == J_ARRAY && ims->n > 0;
+    if (slot) image_slot_acquire();
     if (!req || !clef_encode_request(S.e->tok, req, opts, &j.rec, err, sizeof(err))) {
+        if (slot) image_slot_release();
         bool sent = respond_error(fd, 400, err, keep_alive);
         jarena_free(a);
         return sent;
@@ -525,18 +569,22 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     while (!j.done) pthread_cond_wait(&j.cv, &j.mu);
     pthread_mutex_unlock(&j.mu);
 
-    bool sent;
-    if (!j.ok) {
-        sent = respond_error(fd, 500, j.err, keep_alive);
-    } else {
-        jbuf b = {0};
-        if (!clef_build_response(req, &j.rec, j.probs, &b)) sent = respond_error(fd, 500, "out of memory", keep_alive);
-        else sent = respond(fd, 200, b.p, b.len, keep_alive);
-        jbuf_free(&b);
+    /* Build the response, then free the record (its image patches) and the slot before writing:
+     * a client that reads slowly must not hold image memory or keep other image requests out. */
+    jbuf b = {0};
+    bool built = false;
+    if (j.ok) {
+        built = clef_build_response(req, &j.rec, j.probs, &b);
         for (int q = 0; q < j.rec.nq; q++) free(j.probs[q]);
         free(j.probs);
     }
     clef_record_free(&j.rec);
+    if (slot) image_slot_release();
+    bool sent;
+    if (!j.ok) sent = respond_error(fd, 500, j.err, keep_alive);
+    else if (!built) sent = respond_error(fd, 500, "out of memory", keep_alive);
+    else sent = respond(fd, 200, b.p, b.len, keep_alive);
+    jbuf_free(&b);
     pthread_mutex_destroy(&j.mu);
     pthread_cond_destroy(&j.cv);
     jarena_free(a);
@@ -571,16 +619,18 @@ static void lingering_close(int fd) {
 
 /* One forward pass before accepting connections: faults in the weight pages, wires the
  * Metal buffers and allocates activations, so the first client does not pay for it
- * (measured: first request 208-223 ms vs 95 ms steady, with a warm OS page cache). */
-static bool warmup(char *err, size_t errlen) {
-    static const char req_text[] =
-        "{\"model\":\"warmup\",\"state\":\"warm-up request\",\"questions\":"
-        "{\"q\":{\"type\":\"choice\",\"criteria\":{\"a\":\"x\",\"b\":\"y\"}}}}";
+ * (measured: first request 208-223 ms vs 95 ms steady, with a warm OS page cache).
+ * When the model has a vision tower, a second pass carries one image sized to the per-image
+ * limit (a 1x1 PNG the processor upscales through media_kwargs), so the vision scratch is
+ * allocated at the size the first real image needs and the tower's weight pages are faulted
+ * in too; a text-only warm-up left both to the first image request (review #3). */
+static bool run_warm_request(const char *req_text, size_t len, char *err, size_t errlen) {
     jarena *a = jarena_new();
     if (!a) { snprintf(err, errlen, "out of memory"); return false; }
-    jval *req = json_parse(a, req_text, sizeof(req_text) - 1, err, errlen);
+    jval *req = json_parse(a, req_text, len, err, errlen);
     clef_record rec;
     clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
+    opts.vision = S.e->vision;
     bool ok = req && clef_encode_request(S.e->tok, req, opts, &rec, err, errlen);
     if (ok) {
         float ***probs = NULL;
@@ -590,6 +640,33 @@ static bool warmup(char *err, size_t errlen) {
     }
     jarena_free(a);
     return ok;
+}
+
+static bool warmup(char *err, size_t errlen) {
+    static const char req_text[] =
+        "{\"model\":\"warmup\",\"state\":\"warm-up request\",\"questions\":"
+        "{\"q\":{\"type\":\"choice\",\"criteria\":{\"a\":\"x\",\"b\":\"y\"}}}}";
+    if (!run_warm_request(req_text, sizeof(req_text) - 1, err, errlen)) return false;
+    if (!S.e->vision.image_token_id) return true;
+    /* side = floor(sqrt(limit)) merge windows, so the upscaled square stays within the limit;
+     * 1,024 tokens when the limit is off, 4,096 at most (about 3 s on Flash at startup). */
+    long limit = S.max_image_tokens > 0 ? S.max_image_tokens : 1024;
+    if (limit > 4096) limit = 4096;
+    long side = 1;
+    while ((side + 1) * (side + 1) <= limit) side++;
+    const long window = (long)S.e->vision.image.patch * S.e->vision.image.merge;
+    const long px = side * window * side * window;
+    char req_image[512];
+    const int n = snprintf(req_image, sizeof(req_image),
+        "{\"model\":\"warmup\",\"state\":\"warm-up request\",\"images\":[\"data:image/png;base64,"
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR42mNoaGgAAAMEAYF1LgG8AAAAAElFTkSuQmCC\"],"
+        "\"media_kwargs\":{\"min_pixels\":%ld,\"max_pixels\":%ld},"
+        "\"questions\":{\"q\":{\"type\":\"choice\",\"criteria\":{\"a\":\"x\",\"b\":\"y\"}}}}", px, px);
+    if (n < 0 || (size_t)n >= sizeof(req_image)) { snprintf(err, errlen, "warm-up request too long"); return false; }
+    const double t0 = now_ms();
+    if (!run_warm_request(req_image, (size_t)n, err, errlen)) return false;
+    fprintf(stderr, "clef-server: warm-up image pass: %ld image tokens in %.0f ms\n", side * side, now_ms() - t0);
+    return true;
 }
 
 static void *connection(void *arg) {
@@ -642,6 +719,12 @@ int main(int argc, char **argv) {
     S.batch = 8;
     S.batch_tokens = 4096;
     S.strict = true;
+    S.max_images = 4;
+    S.max_image_tokens = 1024;
+    S.max_image_pixels = 16777216;
+    S.max_image_requests = 8;
+    pthread_mutex_init(&S.image_mu, NULL);
+    pthread_cond_init(&S.image_cv, NULL);
     S.max_body = 8u << 20;
     S.max_conn = 256;
     S.io_timeout = IO_TIMEOUT_S;
@@ -671,9 +754,31 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--template-cache")) S.template_cache = true;
         else if (!strcmp(argv[i], "--max-conn") && i + 1 < argc) S.max_conn = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
+            /* whole numbers only: atoi turned a typo into 0, which means unlimited (review #3) */
+            size_t v;
+            if (!parse_size(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef-server: --max-images must be a whole number (0 = unlimited)\n"); return 2; }
+            S.max_images = (int)v;
+        }
+        else if (!strcmp(argv[i], "--max-image-tokens") && i + 1 < argc) {
+            size_t v;
+            if (!parse_size(argv[++i], LONG_MAX, &v)) { fprintf(stderr, "clef-server: --max-image-tokens must be a whole number (0 = unlimited)\n"); return 2; }
+            S.max_image_tokens = (long)v;
+        }
+        else if (!strcmp(argv[i], "--max-image-pixels") && i + 1 < argc) {
+            size_t v;
+            if (!parse_size(argv[++i], LONG_MAX, &v)) { fprintf(stderr, "clef-server: --max-image-pixels must be a whole number (0 = the decoders' 64 Mpx cap)\n"); return 2; }
+            S.max_image_pixels = (long)v;
+        }
+        else if (!strcmp(argv[i], "--max-image-requests") && i + 1 < argc) {
+            size_t v;
+            if (!parse_size(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef-server: --max-image-requests must be a whole number (0 = unlimited)\n"); return 2; }
+            S.max_image_requests = (int)v;
+        }
         else {
             fprintf(stderr, "usage: clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] "
-                            "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N]\n");
+                            "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N] "
+                            "[--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-image-requests N]\n");
             return 2;
         }
     }
@@ -707,6 +812,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "clef-server: %s on http://%s:%d (batch %d, %s)\n", model, host, port, S.batch,
             S.strict ? "strict: content cannot emit control tokens" : "no-strict: reference tokenization, injectable");
     fprintf(stderr, "clef-server: over-long state is %s\n", S.truncate ? "truncated silently (reference behaviour)" : "rejected");
+    if (S.e->vision.image_token_id)
+        fprintf(stderr, "clef-server: images: at most %d per request, %ld tokens each after resizing, %ld source pixels each; "
+                        "%d image requests decoded or queued at once (0 = unlimited)\n",
+                S.max_images, S.max_image_tokens, S.max_image_pixels, S.max_image_requests);
+    else fprintf(stderr, "clef-server: this model file has no vision tower; requests with images are rejected\n");
     if (S.keep_warm_ms) fprintf(stderr, "clef-server: keep-warm pass every %d ms while idle\n", S.keep_warm_ms);
     else fprintf(stderr, "clef-server: keep-warm off\n");
     if (S.cache_bytes) fprintf(stderr, "clef-server: prefix cache of %zu MB for requests with X-Clef-Prefix-Cache\n", S.cache_bytes >> 20);

@@ -8,6 +8,10 @@
  *   clef-tool encode-strict MODEL.gguf    same, strict tokenization of request content
  *   clef-tool encode-notrunc MODEL.gguf   same, but reject a state that would be truncated
  *   clef-tool respond MODEL.gguf < lines  each line: {"request":..., "probs":[[...],...]} -> response JSON
+ *   clef-tool image < lines      each line: {"image": base64 or data URL, "out": PREFIX, "min_pixels": N,
+ *                                "max_pixels": N} -> {"width","height","grid_h","grid_w","n_tokens"} or "ERR <msg>";
+ *                                writes PREFIX.rgb (decoded), PREFIX.resized (resized RGB), PREFIX.patches (f32
+ *                                [n_patch][1536]) and PREFIX.pos (int32 [n_patch][4] indices, f32 [n_patch][4] weights)
  */
 
 #include <stdio.h>
@@ -15,6 +19,7 @@
 #include <string.h>
 
 #include "../clef_gguf.h"
+#include "../clef_image.h"
 #include "../clef_json.h"
 #include "../clef_record.h"
 #include "../clef_tok.h"
@@ -83,6 +88,61 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
+    if (!strcmp(mode, "image")) {
+        while ((line = read_line(stdin, &len))) {
+            jarena *a = jarena_new();
+            jval *v = json_parse(a, line, len, err, sizeof(err));
+            const jval *img = v ? json_get(v, "image") : NULL, *out = v ? json_get(v, "out") : NULL;
+            const jval *mn = v ? json_get(v, "min_pixels") : NULL, *mx = v ? json_get(v, "max_pixels") : NULL;
+            if (!v || !img || img->type != J_STRING || !out || out->type != J_STRING) {
+                printf("ERR %s\n", v ? "need image and out strings" : err);
+            } else {
+                clef_image_params prm = { 65536, 16777216, 16, 2, 2 };
+                if (mn && mn->type == J_INT) prm.min_pixels = atol(mn->s);
+                if (mx && mx->type == J_INT) prm.max_pixels = atol(mx->s);
+                uint8_t *bytes = NULL;
+                size_t n = 0;
+                clef_rgb rgb = {0};
+                clef_image_patches pt = {0};
+                bool ok = clef_base64_decode(img->s, img->len, &bytes, &n, err, sizeof(err)) &&
+                          clef_image_decode(bytes, n, &rgb, err, sizeof(err)) &&
+                          clef_image_preprocess(&rgb, &prm, &pt, err, sizeof(err));
+                if (ok) {
+                    char path[1024];
+                    uint8_t *resized = malloc((size_t)pt.width * pt.height * 3);
+                    int32_t *idx = malloc((size_t)pt.n_patch * 4 * sizeof(int32_t));
+                    float *w = malloc((size_t)pt.n_patch * 4 * sizeof(float));
+                    ok = resized && idx && w &&
+                         clef_resize_bicubic_aa(rgb.rgb, rgb.width, rgb.height, resized, pt.width, pt.height, err, sizeof(err));
+                    if (ok) clef_image_pos_interp(pt.grid_h, pt.grid_w, 48, 2, idx, w);
+                    const struct { const char *suffix; const void *data; size_t bytes; } files[] = {
+                        { ".rgb", rgb.rgb, (size_t)rgb.width * rgb.height * 3 },
+                        { ".resized", resized, (size_t)pt.width * pt.height * 3 },
+                        { ".patches", pt.patches, (size_t)pt.n_patch * pt.patch_dim * sizeof(float) },
+                        { ".pos", idx, (size_t)pt.n_patch * 4 * sizeof(int32_t) },
+                    };
+                    for (size_t i = 0; ok && i < 4; i++) {
+                        snprintf(path, sizeof(path), "%.*s%s", (int)out->len, out->s, files[i].suffix);
+                        FILE *f = fopen(path, i == 3 ? "wb" : "wb");
+                        ok = f && fwrite(files[i].data, 1, files[i].bytes, f) == files[i].bytes;
+                        if (ok && i == 3) ok = fwrite(w, sizeof(float), (size_t)pt.n_patch * 4, f) == (size_t)pt.n_patch * 4;
+                        if (f && fclose(f)) ok = false;
+                        if (!ok) snprintf(err, sizeof(err), "cannot write %s", path);
+                    }
+                    if (ok) printf("{\"width\":%d,\"height\":%d,\"grid_h\":%d,\"grid_w\":%d,\"n_tokens\":%d,\"decoded\":[%d,%d]}\n",
+                                   pt.width, pt.height, pt.grid_h, pt.grid_w, pt.n_tokens, rgb.width, rgb.height);
+                    free(resized); free(idx); free(w);
+                }
+                if (!ok) printf("ERR %s\n", err);
+                clef_image_patches_free(&pt);
+                clef_rgb_free(&rgb);
+                free(bytes);
+            }
+            jarena_free(a);
+            free(line);
+        }
+        return 0;
+    }
     if (!strcmp(mode, "tok")) {
         if (argc < 3) { fprintf(stderr, "tok needs a model path\n"); return 2; }
         gguf_file f;
@@ -117,6 +177,8 @@ int main(int argc, char **argv) {
         clef_tokenizer *t = clef_tok_load(&f, err, sizeof(err));
         if (!t) { fprintf(stderr, "%s\n", err); return 1; }
         bool respond = !strcmp(mode, "respond");
+        clef_vision_opts vision = {0};
+        if (!clef_vision_opts_load(&f, &vision, err, sizeof(err))) { fprintf(stderr, "%s\n", err); return 1; }
         while ((line = read_line(stdin, &len))) {
             jarena *a = jarena_new();
             jval *doc = json_parse(a, line, len, err, sizeof(err));
@@ -125,6 +187,7 @@ int main(int argc, char **argv) {
             clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
             opts.strict = !strcmp(mode, "encode-strict");
             opts.reject_truncation = !strcmp(mode, "encode-notrunc");
+            opts.vision = vision;
             if (!doc) {
                 printf("ERR %s\n", err);
             } else if (!clef_encode_request(t, req, opts, &rec, err, sizeof(err))) {
@@ -173,7 +236,32 @@ int main(int argc, char **argv) {
                     }
                     jbuf_puts(&b, "]}");
                 }
-                jbuf_puts(&b, "]}");
+                jbuf_puts(&b, "]");
+                if (rec.n_images) {
+                    /* images: token offset and merged grid of each; position_ids as the reference's
+                     * get_rope_index lays them out, [3][T] */
+                    jbuf_puts(&b, ",\"images\":[");
+                    for (int i = 0; i < rec.n_images; i++) {
+                        snprintf(num, sizeof(num), i ? ",[%d,%d,%d]" : "[%d,%d,%d]", rec.images[i].tok_start,
+                                 rec.images[i].pt.grid_h, rec.images[i].pt.grid_w);
+                        jbuf_puts(&b, num);
+                    }
+                    int32_t *pos3 = malloc(rec.ids.len * 3 * sizeof(int32_t));
+                    if (!pos3) { fprintf(stderr, "out of memory\n"); return 1; }
+                    clef_record_positions(&rec, pos3);
+                    jbuf_puts(&b, "],\"position_ids\":[");
+                    for (int axis = 0; axis < 3; axis++) {
+                        jbuf_puts(&b, axis ? ",[" : "[");
+                        for (size_t t = 0; t < rec.ids.len; t++) {
+                            snprintf(num, sizeof(num), t ? ",%d" : "%d", pos3[3 * t + axis]);
+                            jbuf_puts(&b, num);
+                        }
+                        jbuf_puts(&b, "]");
+                    }
+                    jbuf_puts(&b, "]");
+                    free(pos3);
+                }
+                jbuf_puts(&b, "}");
                 printf("%s\n", b.p);
                 jbuf_free(&b);
                 clef_record_free(&rec);

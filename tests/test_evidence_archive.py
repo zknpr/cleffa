@@ -110,6 +110,12 @@ def make_tree(root: Path):
     (oracle / 'logits.safetensors').write_bytes(safetensors({'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
     (oracle / 'requests.jsonl').write_text('{"id":"r000"}\n')
     (oracle / 'latency.json').write_text('{}')
+    vision = root / 'clef-vision-f32'   # the vision corpus oracle directories are oracle directories too
+    (vision / 'layers').mkdir(parents=True)
+    (vision / 'layers' / 'v000.safetensors').write_bytes(b'\0' * 10)
+    (vision / 'logits.safetensors').write_bytes(safetensors({'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
+    (vision / 'requests.jsonl').write_text('{"id":"v000","images":["iVBORw0KGgo="]}\n')
+    (vision / 'encoded.jsonl').write_text('{"id":"v000","position_ids":[[0],[0],[0]]}\n')
     (root / 'engine_logits.jsonl').write_text('{}\n')
     (root / 'engine_logits-private.jsonl').write_text('{"state": "customer text"}\n')  # top-level, private-named
     (root / 'engine_dump.bin').write_bytes(b'\0' * 4)
@@ -145,6 +151,7 @@ class EvidenceArchive(unittest.TestCase):
             'gemm-probe-20261004/counts.json',
             'ds4-qwen-perf-20261004/groups-summary.json',
             'clef-flash-f32/logits.safetensors', 'clef-flash-f32/requests.jsonl', 'clef-flash-f32/latency.json',
+            'clef-vision-f32/logits.safetensors', 'clef-vision-f32/requests.jsonl', 'clef-vision-f32/encoded.jsonl',
             'engine_logits.jsonl',
         })
         with tarfile.open(out) as tar:

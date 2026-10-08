@@ -1,6 +1,7 @@
 // Clef prefill kernels. Packed varlen batches: tokens of several records are
-// concatenated; seq_start[t] is the index of the first token of t's record and
-// pos[t] = t - seq_start[t]. Nothing crosses a record boundary.
+// concatenated; seq_start[t] is the index of the first token of t's record and pos[t] holds its
+// three rotary positions (all t - seq_start[t] for text; an image's tokens take their grid, see
+// clef_record_positions). Nothing crosses a record boundary.
 //
 // Precision policy (see README "Accuracy"): the target is the FP32 reference. Weights keep
 // their exact BF16 values. Backbone dense matmuls accumulate in f32 with FP16 activations
@@ -24,7 +25,7 @@ struct gemm_args { int T, N, K; };
 // identical per-element reductions; bench/gemm_tiles.m checks this across packed offsets.
 // XT is the activation type: bfloat, half or float against BF16 weights, all listed by MPP
 // (MPPTensorOpsMatMul2d.h). bench/mixed_bench.m: half runs at the bfloat rate with ~8x less
-// error; float is exact to f32 accumulation but ~4x slower (used only for the small head GEMMs).
+// error; float is exact to f32 accumulation but ~4x slower (head and vision residual GEMMs).
 template <typename XT, bool ACC, int TM, int TN>
 kernel void gemm_x(constant gemm_args &a [[buffer(0)]],
                    device XT *X [[buffer(1)]],
@@ -50,6 +51,38 @@ GEMM_VARIANT(f16, half, 32, 128)
 GEMM_VARIANT(f16, half, 64, 128)
 GEMM_VARIANT(f16, half, 32, 256)
 GEMM_VARIANT(f32, float, 32, 128)
+GEMM_VARIANT(f32, float, 16, 128)
+
+// Non-residual vision projections: X = hi + lo / 2048, with two FP32-accumulating
+// products against the unchanged BF16 weights. This is an approximation, not bitwise FP32.
+// Residual projections stay on gemm_x<float>: compensating those too failed vision parity.
+// Dynamic extents mask ragged rows/columns, including the end of each half plane.
+template <int TM, int TN>
+kernel void vis_gemm_comp(constant gemm_args &a [[buffer(0)]],
+                          device half *X [[buffer(1)]],
+                          device bfloat *W [[buffer(2)]],
+                          device float *Y [[buffer(3)]],
+                          uint2 tg [[threadgroup_position_in_grid]]) {
+    auto tX = tensor<device half, dextents<int32_t, 2>, tensor_inline>(X, dextents<int32_t, 2>(a.K, a.T));
+    auto tL = tensor<device half, dextents<int32_t, 2>, tensor_inline>(X + (long)a.T * a.K, dextents<int32_t, 2>(a.K, a.T));
+    auto tW = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(W, dextents<int32_t, 2>(a.K, a.N));
+    auto tY = tensor<device float, dextents<int32_t, 2>, tensor_inline>(Y, dextents<int32_t, 2>(a.N, a.T));
+    matmul2d<matmul2d_descriptor(TM, TN, dynamic_length_v<int>, false, true, false), execution_simdgroups<4>> mm;
+    auto mX = tX.slice(0, (int)tg.y * TM), mL = tL.slice(0, (int)tg.y * TM);
+    auto mW = tW.slice(0, (int)tg.x * TN);
+    auto mY = tY.slice((int)tg.x * TN, (int)tg.y * TM);
+    auto hi = mm.template get_destination_cooperative_tensor<decltype(mX), decltype(mW), float>();
+    auto lo = mm.template get_destination_cooperative_tensor<decltype(mX), decltype(mW), float>();
+    mm.run(mX, mW, hi);
+    mm.run(mL, mW, lo);
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < hi.get_capacity(); i++) if (hi.is_valid_element(i)) hi[i] += lo[i] * (1.0f / 2048.0f);
+    hi.store(mY);
+}
+#define COMP_VARIANT(TM, TN) \
+template [[host_name("vis_gemm_comp_" #TM "x" #TN)]] kernel void vis_gemm_comp<TM, TN>(constant gemm_args &, device half *, device bfloat *, device float *, uint2);
+COMP_VARIANT(32, 128)
+COMP_VARIANT(64, 128)
 
 // 16-bit GEMM operand: BF16 (the reference's activation type) or FP16 (~8x finer, same GEMM
 // rate). Producers store the bits; the GEMM reads them as the matching type.
@@ -70,6 +103,26 @@ static inline ushort act16(float v, constant act_args &ac, device atomic_int *ov
         return as_type<ushort>((half)copysign(65504.0f, v));
     }
     return as_type<ushort>((half)v);
+}
+
+// Two half planes retain the activation's leading and residual bits. Scale the residual
+// by 2048 so small corrections survive FP16's limited exponent range. Overflow marks
+// only this image's record; its retry uses the original FP32 vision GEMMs.
+static inline void vis_split_value(float x, device half *y, long i, long n,
+                                   constant act_args &ac, device atomic_int *ovf) {
+    const half h = as_type<half>(act16(x, ac, ovf));
+    y[i] = h;
+    y[n + i] = fabs(x) <= ac.lim ? half((x - float(h)) * 2048.0f) : 0.0h;
+}
+
+kernel void vis_split_gemm(device const float *x [[buffer(0)]],
+                           device half *y [[buffer(1)]],
+                           constant long &n [[buffer(2)]],
+                           constant act_args &ac [[buffer(3)]],
+                           device atomic_int *ovf [[buffer(4)]],
+                           uint i [[thread_position_in_grid]]) {
+    if ((long)i >= n) return;
+    vis_split_value(x[i], y, i, n, ac, ovf);
 }
 
 // ---------------------------------------------------------------- helpers
@@ -93,15 +146,20 @@ static inline float log1p_acc(float y) { const float u = 1.0f + y; return u == 1
 static inline float softplus(float x) { return x > 20.0f ? x : log1p_acc(exp(x)); }
 
 // ---------------------------------------------------------------- embedding
+// A token's row is its embedding, or for an image placeholder the vision tower's feature row
+// img_row[t] (Qwen3_5Model.forward's masked_scatter of the image features into inputs_embeds).
 struct embed_args { int H; };
 kernel void embed(constant embed_args &a [[buffer(0)]],
                   device const int *ids [[buffer(1)]],
                   device const bfloat *table [[buffer(2)]],
                   device float *x [[buffer(3)]],
+                  device const int *img_row [[buffer(4)]],
+                  device const float *feat [[buffer(5)]],
                   uint2 gid [[thread_position_in_grid]]) {
     const int t = gid.y, h = gid.x;
     if (h >= a.H) return;
-    x[(long)t * a.H + h] = (float)table[(long)ids[t] * a.H + h];
+    const int r = img_row[t];
+    x[(long)t * a.H + h] = r >= 0 ? feat[(long)r * a.H + h] : (float)table[(long)ids[t] * a.H + h];
 }
 
 // ---------------------------------------------------------------- RMSNorm
@@ -215,10 +273,13 @@ kernel void attn_prep(constant attn_prep_args &a [[buffer(0)]],
     const float inv = rsqrt(ss / (float)hd + a.eps);
     device const float *nw = is_q ? qnorm : knorm;
     for (int j = 0; j < per; j++) v[j] = v[j] * inv * nw[lane + 32 * j];
-    // NeoX partial RoPE on the first n_rot dims: rotate_half pairs (i, i + n_rot/2).
+    // NeoX partial RoPE on the first n_rot dims: rotate_half pairs (i, i + n_rot/2). Interleaved
+    // M-RoPE (apply_interleaved_mrope, mrope_section [11, 11, 10]): pair i turns by the token's
+    // temporal, row or column position for i mod 3 = 0, 1, 2; pos is [T][3]. A text token has the
+    // same value on all three, so this is the plain RoPE it always was.
     const int rot_half = a.n_rot / 2;   // 32 for Clef: dims lane and lane+32 are slots 0 and 1
     if (lane < (uint)rot_half) {
-        const float ang = (float)pos[t] * inv_freq[lane];
+        const float ang = (float)pos[3 * t + (int)(lane % 3)] * inv_freq[lane];
         const float c = precise::cos(ang), s = precise::sin(ang);
         const float x0 = v[0], x1 = v[1];
         v[0] = x0 * c - x1 * s;
@@ -619,10 +680,13 @@ kernel void attn_prep_prefix(constant attn_prefix_prep_args &a [[buffer(0)]],
     const float inv = rsqrt(ss / (float)hd + a.eps);
     device const float *nw = is_q ? qnorm : knorm;
     for (int j = 0; j < per; j++) v[j] = v[j] * inv * nw[lane + 32 * j];
-    // NeoX partial RoPE on the first n_rot dims: rotate_half pairs (i, i + n_rot/2).
+    // NeoX partial RoPE on the first n_rot dims: rotate_half pairs (i, i + n_rot/2). Interleaved
+    // M-RoPE (apply_interleaved_mrope, mrope_section [11, 11, 10]): pair i turns by the token's
+    // temporal, row or column position for i mod 3 = 0, 1, 2; pos is [T][3]. A text token has the
+    // same value on all three, so this is the plain RoPE it always was.
     const int rot_half = a.n_rot / 2;   // 32 for Clef: dims lane and lane+32 are slots 0 and 1
     if (lane < (uint)rot_half) {
-        const float ang = (float)pos[t] * inv_freq[lane];
+        const float ang = (float)pos[3 * t + (int)(lane % 3)] * inv_freq[lane];
         const float c = precise::cos(ang), s = precise::sin(ang);
         const float x0 = v[0], x1 = v[1];
         v[0] = x0 * c - x1 * s;
@@ -834,10 +898,13 @@ kernel void attn_prep_split(constant attn_split_args &a [[buffer(0)]],
     const float inv = rsqrt(ss / (float)hd + a.eps);
     device const float *nw = is_q ? qnorm : knorm;
     for (int j = 0; j < per; j++) v[j] = v[j] * inv * nw[lane + 32 * j];
-    // NeoX partial RoPE on the first n_rot dims: rotate_half pairs (i, i + n_rot/2).
+    // NeoX partial RoPE on the first n_rot dims: rotate_half pairs (i, i + n_rot/2). Interleaved
+    // M-RoPE (apply_interleaved_mrope, mrope_section [11, 11, 10]): pair i turns by the token's
+    // temporal, row or column position for i mod 3 = 0, 1, 2; pos is [T][3]. A text token has the
+    // same value on all three, so this is the plain RoPE it always was.
     const int rot_half = a.n_rot / 2;   // 32 for Clef: dims lane and lane+32 are slots 0 and 1
     if (lane < (uint)rot_half) {
-        const float ang = (float)pos[t] * inv_freq[lane];
+        const float ang = (float)pos[3 * t + (int)(lane % 3)] * inv_freq[lane];
         const float c = precise::cos(ang), s = precise::sin(ang);
         const float x0 = v[0], x1 = v[1];
         v[0] = x0 * c - x1 * s;
@@ -1413,3 +1480,517 @@ kernel void gemm_group4(constant gemm_args &a [[buffer(0)]],
 }
 template [[host_name("gemm_f16_g4_64x128")]] kernel void gemm_group4<false>(constant gemm_args &, device half *, device bfloat *, device float *, uint2);
 template [[host_name("gemm_f16_g4_acc_64x128")]] kernel void gemm_group4<true>(constant gemm_args &, device half *, device bfloat *, device float *, uint2);
+
+// ---------------------------------------------------------------- vision tower
+// Qwen3_5VisionModel, one image per dispatch sequence (clef_metal.m encode_vision). Rows are the
+// image's patches in 2x2 merge-window order (clef_image.c), so the merger reads four consecutive
+// rows as one and a row's grid position follows from its index. GEMMs use FP32 operands by
+// default; CLEF_VIS_F32=0 selects the ACT_VIS class of act16, with overflow flagged in the
+// record's slot. Attention stays FP32 before the optional 16-bit output conversion. A dispatch never depends on another image or on the
+// record's text, so an image's features are the same in any batch.
+struct vis_args { int P, E, heads, hd, grid_w, merge; float eps, scale; };
+
+// f32 patch values -> the 16-bit patch_embd operand
+kernel void vis_act(device const float *x [[buffer(0)]],
+                    device ushort *y [[buffer(1)]],
+                    constant long &n [[buffer(2)]],
+                    constant act_args &ac [[buffer(3)]],
+                    device atomic_int *ovf [[buffer(4)]],
+                    uint gid [[thread_position_in_grid]]) {
+    if ((long)gid < n) y[gid] = act16(x[gid], ac, ovf);
+}
+
+// x[p] = (patch_embd . patch + bias) + sum_k w[p][k] * table[idx[p][k]]: the Conv3d bias and the
+// bilinearly resampled learned position (get_vision_bilinear_indices_and_weights), products summed
+// in index order as the reference's (pos_embed(idx) * w).sum(0).
+kernel void vis_embed(constant vis_args &a [[buffer(0)]],
+                      device float *x [[buffer(1)]],
+                      device const float *bias [[buffer(2)]],
+                      device const bfloat *table [[buffer(3)]],
+                      device const int *idx [[buffer(4)]],
+                      device const float *w [[buffer(5)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+    const int d = gid.x, p = gid.y;
+    if (d >= a.E) return;
+    float pos = 0.0f;
+    for (int k = 0; k < 4; k++) pos += w[p * 4 + k] * (float)table[(long)idx[p * 4 + k] * a.E + d];
+    x[(long)p * a.E + d] = (x[(long)p * a.E + d] + bias[d]) + pos;
+}
+
+// torch.nn.LayerNorm with f32 weight and bias, written as the 16-bit operand of the next GEMM
+struct ln_act_args { int H; float eps; int rows; };
+template <bool BIAS>
+kernel void layernorm_act_x(constant ln_act_args &a [[buffer(0)]],
+                          device float *x [[buffer(1)]],
+                          device const float *w [[buffer(2)]],
+                          device const float *b [[buffer(3)]],
+                          device ushort *y [[buffer(4)]],
+                          constant act_args &ac [[buffer(5)]],
+                          device atomic_int *ovf [[buffer(6)]],
+                          device float *y32 [[buffer(7)]],      // CLEF_VIS_F32: f32 operand instead of y
+                          constant int &f32out [[buffer(8)]],
+                          device const float *residual_bias [[buffer(9)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint nt [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    device float *xr = x + (long)row * a.H;
+    float s = 0.0f;
+    for (int i = tid; i < a.H; i += nt) {
+        if (BIAS) xr[i] += residual_bias[i];
+        s += xr[i];
+    }
+    const float mean = tg_sum(s, scratch, tid, nt) / (float)a.H;
+    float v = 0.0f;
+    for (int i = tid; i < a.H; i += nt) { const float d = xr[i] - mean; v += d * d; }
+    const float inv = rsqrt(tg_sum(v, scratch, tid, nt) / (float)a.H + a.eps);
+    for (int i = tid; i < a.H; i += nt) {
+        const float o = (xr[i] - mean) * inv * w[i] + b[i];
+        if (f32out == 2) vis_split_value(o, (device half *)y, (long)row * a.H + i, (long)a.rows * a.H, ac, ovf);
+        else if (f32out) y32[(long)row * a.H + i] = o;
+        else y[(long)row * a.H + i] = act16(o, ac, ovf);
+    }
+}
+
+// Each thread owns the same x elements in all three loops; no thread reads another's
+// device writes. tg_sum synchronizes the reductions. The bias addition still rounds
+// to FP32 before normalization and is stored before the next residual GEMM.
+#define VIS_LN_VARIANT(NAME, BIAS) \
+template [[host_name(NAME)]] kernel void layernorm_act_x<BIAS>(constant ln_act_args &, device float *, device const float *, device const float *, device ushort *, constant act_args &, device atomic_int *, device float *, constant int &, device const float *, uint, uint, uint);
+VIS_LN_VARIANT("layernorm_act", false)
+VIS_LN_VARIANT("layernorm_bias_act", true)
+
+// qkv rows (+ bias) -> Q, K, V [heads][P][hd]. Q and K take the 2D rotary embedding
+// (apply_rotary_pos_emb_vision): rotate_half pairs (i, i + hd/2); the first hd/4 pairs turn by the
+// patch's grid row, the next hd/4 by its column, inv_freq[j] = 10000^(-2j/(hd/2)) in f32.
+kernel void vis_qkv_rope(constant vis_args &a [[buffer(0)]],
+                         device const float *qkv [[buffer(1)]],
+                         device const float *bias [[buffer(2)]],
+                         device const float *inv_freq [[buffer(3)]],
+                         device float *Q [[buffer(4)]],
+                         device float *K [[buffer(5)]],
+                         device float *V [[buffer(6)]],
+                         constant int &tail_rows [[buffer(7)]],
+                         uint3 gid [[thread_position_in_grid]]) {
+    const int i = gid.x, h = gid.y, p = gid.z;   // rotary pair, head, patch
+    const int hd = a.hd, rot = hd / 2, quarter = hd / 4, E = a.E;   // `half` is a Metal type
+    if (i >= rot || p >= a.P) return;
+    // These writes start after the final head, never inside another image's data. The
+    // host chooses 32 or 128 rows for the attention kernel's largest masked read. Even
+    // the smallest four-patch image supplies 64 head/patch rows, enough for its 32-row tail.
+    const long tail = ((long)p * a.heads + h) * rot + i;
+    if (tail < (long)tail_rows * rot) {
+        const long at = (long)a.heads * a.P * hd + 2 * tail;
+        Q[at] = Q[at + 1] = K[at] = K[at + 1] = V[at] = V[at + 1] = 0.0f;
+    }
+    const int window = a.merge * a.merge, blk = p / window, within = p % window, w2 = a.grid_w / a.merge;
+    const float hpos = (float)((blk / w2) * a.merge + within / a.merge);
+    const float wpos = (float)((blk % w2) * a.merge + within % a.merge);
+    const float ang = (i < quarter ? hpos : wpos) * inv_freq[i < quarter ? i : i - quarter];
+    const float c = precise::cos(ang), s = precise::sin(ang);
+    device const float *row = qkv + (long)p * 3 * E;
+    const long o = ((long)h * a.P + p) * hd;
+    for (int part = 0; part < 2; part++) {
+        const int base = part * E + h * hd;
+        const float x0 = row[base + i] + bias[base + i], x1 = row[base + i + rot] + bias[base + i + rot];
+        device float *dst = part == 0 ? Q : K;
+        dst[o + i] = x0 * c - x1 * s;
+        dst[o + i + rot] = x1 * c + x0 * s;
+    }
+    const int vb = 2 * E + h * hd;
+    V[o + i] = row[vb + i] + bias[vb + i];
+    V[o + i + rot] = row[vb + i + rot] + bias[vb + i + rot];
+}
+
+// Bidirectional attention over the image's patches, f32 online softmax. A threadgroup of VIS_QB
+// simdgroups handles VIS_QB consecutive query rows of one head; key and value tiles of 32 rows are
+// staged in threadgroup memory (row stride 73: 9j mod 32 is distinct per lane, so no bank
+// conflicts) and shared by the queries. Each lane scores one key of the tile against its
+// simdgroup's query (held in registers) and keeps that key's share of P.V; the shares are reduced
+// at the end. The head size is the compile-time VIS_HD (load_config admits only 72) so the
+// per-lane accumulators stay in registers. The output row is the attn_out operand. Every simdgroup
+// reaches every barrier, including one whose query row is past the image.
+constant constexpr int VIS_QB = 8, VIS_KB = 32, VIS_HD = 72, VIS_STRIDE = 73;
+kernel void vis_attention(constant vis_args &a [[buffer(0)]],
+                          device const float *Q [[buffer(1)]],
+                          device const float *K [[buffer(2)]],
+                          device const float *V [[buffer(3)]],
+                          device ushort *out [[buffer(4)]],
+                          constant act_args &ac [[buffer(5)]],
+                          device atomic_int *ovf [[buffer(6)]],
+                          device float *out32 [[buffer(7)]],    // CLEF_VIS_F32
+                          constant int &f32out [[buffer(8)]],
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float tk[VIS_KB * VIS_STRIDE], tv[VIS_KB * VIS_STRIDE];
+    const int P = a.P, h = tg.y, q0 = tg.x * VIS_QB, qi = q0 + sg;
+    device const float *Kh = K + (long)h * P * VIS_HD, *Vh = V + (long)h * P * VIS_HD;
+    float q[VIS_HD], acc[VIS_HD];
+    {
+        device const float *qrow = Q + ((long)h * P + (qi < P ? qi : 0)) * VIS_HD;
+        for (int d = 0; d < VIS_HD; d++) { q[d] = qrow[d] * a.scale; acc[d] = 0.0f; }
+    }
+    float m = -INFINITY, l = 0.0f;
+    for (int k0 = 0; k0 < P; k0 += VIS_KB) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int i = tid; i < VIS_KB * VIS_HD; i += VIS_QB * 32) {
+            const int r = i / VIS_HD, d = i % VIS_HD;
+            const bool ok = k0 + r < P;
+            tk[r * VIS_STRIDE + d] = ok ? Kh[(long)(k0 + r) * VIS_HD + d] : 0.0f;
+            tv[r * VIS_STRIDE + d] = ok ? Vh[(long)(k0 + r) * VIS_HD + d] : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const bool valid = k0 + (int)lane < P;
+        const threadgroup float *kr = tk + lane * VIS_STRIDE, *vr = tv + lane * VIS_STRIDE;
+        float s = 0.0f;
+        for (int d = 0; d < VIS_HD; d++) s += q[d] * kr[d];
+        s = valid ? s : -INFINITY;
+        const float mn = max(m, simd_max(s));
+        const float alpha = exp(m - mn);        // 0 on the first tile (m = -inf)
+        const float p = valid ? exp(s - mn) : 0.0f;
+        l = l * alpha + simd_sum(p);
+        for (int d = 0; d < VIS_HD; d++) acc[d] = acc[d] * alpha + p * vr[d];
+        m = mn;
+    }
+    if (qi >= P) return;
+    for (int d = 0; d < VIS_HD; d++) {
+        const float o = simd_sum(acc[d]);
+        if ((int)lane == d % 32) {
+            if (f32out) out32[(long)qi * a.E + h * VIS_HD + d] = o / l;
+            else out[(long)qi * a.E + h * VIS_HD + d] = act16(o / l, ac, ovf);
+        }
+    }
+}
+
+// The same attention on f32 simdgroup matrices (after attention_fa): a threadgroup of VIS_MQ
+// simdgroups, each owning 8 query rows of one head; keys 32 at a time, S = Q K^T as 9 x 4
+// fragment products (hd = 72 = 9 x 8), online softmax in threadgroup scratch, O = diag(alpha) O
+// + P V. Tile loads run up to 31 K/V rows and 7 Q rows past P: for every head but the last those
+// are the next head's rows (finite, written this layer), and the last head's are the 32 zeroed
+// slack rows after the buffer's last patch (encode_vision zeroes them each layer), so masked
+// probabilities (exact zeros) never meet a NaN. A simdgroup whose rows are all past P still runs
+// every barrier.
+constant constexpr int VIS_MQ = 4, VIS_DT = VIS_HD / 8;
+kernel void vis_attention_mma(constant vis_args &a [[buffer(0)]],
+                              device const float *Q [[buffer(1)]],
+                              device const float *K [[buffer(2)]],
+                              device const float *V [[buffer(3)]],
+                              device ushort *out [[buffer(4)]],
+                              constant act_args &ac [[buffer(5)]],
+                              device atomic_int *ovf [[buffer(6)]],
+                              device float *out32 [[buffer(7)]],
+                              constant int &f32out [[buffer(8)]],
+                              uint2 tg [[threadgroup_position_in_grid]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float smem[VIS_MQ * (8 * VIS_KB + 64)];
+    threadgroup float *S = smem + sg * (8 * VIS_KB + 64);   // 8x32 scores/probs
+    threadgroup float *D = S + 8 * VIS_KB;                   // 8x8 diagonal
+    const int P = a.P, h = tg.y, i0 = tg.x * (VIS_MQ * 8) + sg * 8;
+    device const float *Qh = Q + ((long)h * P + i0) * VIS_HD;
+    device const float *Kh = K + (long)h * P * VIS_HD;
+    device const float *Vh = V + (long)h * P * VIS_HD;
+    simdgroup_float8x8 acc[VIS_DT];
+    #pragma clang loop unroll(full)
+    for (int d = 0; d < VIS_DT; d++) acc[d] = simdgroup_float8x8(0.0f);
+    const int r = lane / 4, c0 = (lane % 4) * 8;   // softmax: row r, 8 columns from c0
+    const bool qvalid = i0 + r < P;
+    float m = -INFINITY, l = 0.0f;
+    for (int kb = 0; kb < P; kb += VIS_KB) {
+        simdgroup_float8x8 s[4];
+        for (int j = 0; j < 4; j++) s[j] = simdgroup_float8x8(0.0f);
+        for (int d = 0; d < VIS_DT; d++) {
+            simdgroup_float8x8 qt, kt;
+            simdgroup_load(qt, Qh + d * 8, VIS_HD);
+            for (int j = 0; j < 4; j++) {
+                simdgroup_load(kt, Kh + (long)(kb + 8 * j) * VIS_HD + d * 8, VIS_HD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s[j], qt, kt, s[j]);
+            }
+        }
+        for (int j = 0; j < 4; j++) simdgroup_store(s[j], S + 8 * j, VIS_KB);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        float v[8], mx = -INFINITY;
+        for (int c = 0; c < 8; c++) {
+            const bool ok = qvalid && kb + c0 + c < P;
+            v[c] = ok ? S[r * VIS_KB + c0 + c] * a.scale : -INFINITY;
+            mx = max(mx, v[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float mn = max(m, mx);
+        float alpha = 1.0f, sum = 0.0f;
+        if (mn != -INFINITY) {
+            alpha = m == -INFINITY ? 0.0f : exp(m - mn);
+            for (int c = 0; c < 8; c++) { v[c] = v[c] == -INFINITY ? 0.0f : exp(v[c] - mn); sum += v[c]; }
+        } else {
+            for (int c = 0; c < 8; c++) v[c] = 0.0f;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        l = l * alpha + sum;
+        m = mn;
+        for (int c = 0; c < 8; c++) S[r * VIS_KB + c0 + c] = v[c];
+        D[lane] = 0.0f;
+        D[lane + 32] = 0.0f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane % 4 == 0) D[r * 8 + r] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 dm, pf[4];
+        simdgroup_load(dm, D, 8);
+        for (int j = 0; j < 4; j++) simdgroup_load(pf[j], S + 8 * j, VIS_KB);
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < VIS_DT; d++) {
+            simdgroup_float8x8 t;
+            simdgroup_multiply(t, dm, acc[d]);
+            for (int j = 0; j < 4; j++) {
+                simdgroup_float8x8 vt;
+                simdgroup_load(vt, Vh + (long)(kb + 8 * j) * VIS_HD + d * 8, VIS_HD);
+                simdgroup_multiply_accumulate(t, pf[j], vt, t);
+            }
+            acc[d] = t;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // epilogue: O = diag(1/l) acc
+    D[lane] = 0.0f;
+    D[lane + 32] = 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane % 4 == 0) D[r * 8 + r] = l > 0.0f ? 1.0f / l : 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dm;
+    simdgroup_load(dm, D, 8);
+    const int er = lane / 4, ec = (lane % 4) * 2;   // 2 elements per lane in the epilogue
+    #pragma clang loop unroll(full)
+    for (int d = 0; d < VIS_DT; d++) {
+        simdgroup_float8x8 t;
+        simdgroup_multiply(t, dm, acc[d]);
+        simdgroup_store(t, S, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int qq = i0 + er;
+        if (qq < P) {
+            for (int c = 0; c < 2; c++) {
+                const long o = (long)qq * a.E + (long)h * VIS_HD + d * 8 + ec + c;
+                if (f32out) out32[o] = S[er * 8 + ec + c];
+                else out[o] = act16(S[er * 8 + ec + c], ac, ovf);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// FP32 attention using Metal matrix primitives, 32 queries by 128 keys per tile. Keeping
+// probabilities and both matrix operands in FP32 avoids the tower's measured FP16 drift.
+// The wider key block reduces online-softmax work. MPP requires dynamic K for the 72-wide
+// Q.K reduction. Per-image tiles preserve batch invariance; QKV preparation zeros 128 slack rows
+// so masked keys cannot multiply a stale NaN. CLEF_VIS_MPP=0 keeps vis_attention_mma.
+constant constexpr int VIS_BQ = 32, VIS_BK = 128;
+kernel void vis_attention_mpp(constant vis_args &a [[buffer(0)]],
+                         device float *Q [[buffer(1)]],             // [heads][P][72]
+                         device float *K [[buffer(2)]],             // [heads][P][72]
+                         device float *V [[buffer(3)]],
+                         device ushort *out [[buffer(4)]],
+                         constant act_args &ac [[buffer(5)]],
+                         device atomic_int *ovf [[buffer(6)]],
+                         device float *out32 [[buffer(7)]],
+                         constant int &f32out [[buffer(8)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    constexpr int TPR = 4, CPT = VIS_BK / TPR;   // threads per query row; score columns per thread
+    // Scores become probabilities in place after every thread has read its row.
+    threadgroup float S[VIS_BQ * VIS_BK];
+    threadgroup float *P = S;
+    threadgroup float alpha_s[VIS_BQ], linv_s[VIS_BQ];
+    threadgroup int flag_s[8];
+
+    const int len = a.P, i0 = tg.x * VIS_BQ, h = tg.y;
+    const long qoff = ((long)h * a.P + i0) * VIS_HD;
+    const long kvoff = (long)h * a.P * VIS_HD;
+
+    using QTile = tensor<device float, extents<int, VIS_HD, VIS_BQ>, tensor_inline>;
+    using KTile = tensor<device float, extents<int, VIS_HD, VIS_BK>, tensor_inline>;
+    using STile = tensor<threadgroup float, extents<int, VIS_BK, VIS_BQ>, tensor_inline>;
+    using PTile = tensor<threadgroup float, extents<int, VIS_BK, VIS_BQ>, tensor_inline>;
+    auto tQ = QTile(Q + qoff, extents<int, VIS_HD, VIS_BQ>());
+    auto tS = STile(S, extents<int, VIS_BK, VIS_BQ>());
+    auto tP = PTile(P, extents<int, VIS_BK, VIS_BQ>());
+
+    constexpr auto ACC = matmul2d_descriptor::mode::multiply_accumulate;
+    matmul2d<matmul2d_descriptor(VIS_BQ, VIS_BK, dynamic_length_v<int>, false, true, false, ACC), execution_simdgroups<4>> qk;
+    matmul2d<matmul2d_descriptor(VIS_BQ, VIS_HD, VIS_BK, false, false, false, ACC), execution_simdgroups<4>> pv;
+    auto cS = qk.template get_destination_cooperative_tensor<QTile, KTile, float>();
+    auto cO = pv.template get_destination_cooperative_tensor<PTile, KTile, float>();
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < cO.get_capacity(); ++i) if (cO.is_valid_element(i)) cO[i] = 0.0f;
+
+    const int r = tid / TPR, part = tid % TPR;
+    // The thread's j-th score is column part * CPT + (j + skew) % CPT. The row stride (128 floats)
+    // is a multiple of 32 words; the per-row rotation makes the 32 lanes of a SIMDgroup touch 32
+    // different words of threadgroup memory per access.
+    const int skew = 4 * (r & 7) + part;
+    const int q = i0 + r;
+    const bool qvalid = q < len;
+    float m = -INFINITY, l = 0.0f;   // row state, replicated over the row's TPR threads
+    if (tid < 8) flag_s[tid] = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Vision is bidirectional: every query visits all of this image's keys.
+    const int k_end = len;
+    int it = 0;
+    for (int kb = 0; kb < k_end; kb += VIS_BK, it++) {
+        const long koff = kvoff + (long)kb * VIS_HD;
+        auto tK = KTile(K + koff, extents<int, VIS_HD, VIS_BK>());
+        auto tV = KTile(V + koff, extents<int, VIS_HD, VIS_BK>());
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < cS.get_capacity(); ++i) if (cS.is_valid_element(i)) cS[i] = 0.0f;
+        qk.run(tQ, tK, cS);
+        cS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax over this block's columns of row r.
+        float v[CPT], mx = -INFINITY;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < CPT; j++) {
+            const int c = part * CPT + ((j + skew) & (CPT - 1));
+            v[j] = qvalid && kb + c < len ? S[r * VIS_BK + c] * a.scale : -INFINITY;
+            mx = max(mx, v[j]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float mn = max(m, mx);
+        const float alpha = (m == -INFINITY || mn == -INFINITY) ? 1.0f : exp(m - mn);
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // every S read precedes the P writes over it
+        float sum = 0.0f;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < CPT; j++) {
+            const int c = part * CPT + ((j + skew) & (CPT - 1));
+            const float p = v[j] == -INFINITY ? 0.0f : exp(v[j] - mn);
+            P[r * VIS_BK + c] = p;
+            sum += p;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        l = l * alpha + sum;
+        m = mn;
+        if (part == 0) alpha_s[r] = alpha;
+        // One writer per SIMD-group slot avoids concurrent non-atomic writes. The slots
+        // alternate between key blocks, and the barrier makes all four votes visible.
+        const int vote_base = (it & 1) * 4;
+        const bool rescale = simd_any(alpha != 1.0f);
+        if ((tid & 31) == 0) flag_s[vote_base + tid / 32] = rescale;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const bool any_rescale = flag_s[vote_base] || flag_s[vote_base + 1]
+                              || flag_s[vote_base + 2] || flag_s[vote_base + 3];
+
+        if (it > 0 && any_rescale) {   // uniform over the threadgroup
+            #pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < cO.get_capacity(); ++i) {
+                if (cO.is_valid_element(i)) cO[i] *= alpha_s[cO.get_multidimensional_index(i)[1]];
+            }
+        }
+        pv.run(tP, tV, cO);
+        // P lives in S, which the next block's Q.K^T store overwrites.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (part == 0) linv_s[r] = l > 0.0f ? 1.0f / l : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    #pragma clang loop unroll(full)
+    for (uint16_t i = 0; i < cO.get_capacity(); ++i) {
+        if (!cO.is_valid_element(i)) continue;
+        const auto idx = cO.get_multidimensional_index(i);   // [column, row]
+        const int rr = idx[1], qq = i0 + rr;
+        if (qq >= len) continue;
+        if (idx[0] >= VIS_HD) continue;
+        const long o = (long)qq * a.E + h * VIS_HD + idx[0];
+        const float value = cO[i] * linv_s[rr];
+        if (f32out) out32[o] = value;
+        else out[o] = act16(value, ac, ovf);
+    }
+}
+
+// x[r][i] += bias[i]: a layer's bias after its accumulating output GEMM
+kernel void add_bias(constant int &N [[buffer(0)]],
+                     device float *x [[buffer(1)]],
+                     device const float *bias [[buffer(2)]],
+                     uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= N) return;
+    x[(long)gid.y * N + gid.x] += bias[gid.x];
+}
+
+// erf for float, musl's erff (FreeBSD's s_erff.c); Metal's stdlib has no erf.
+static inline float erf_f32(float x) {
+    const float erx = 8.4506291151e-01f, efx8 = 1.0270333290e+00f;
+    const float pp0 = 1.2837916613e-01f, pp1 = -3.2504209876e-01f, pp2 = -2.8481749818e-02f, pp3 = -5.7702702470e-03f, pp4 = -2.3763017452e-05f;
+    const float qq1 = 3.9791721106e-01f, qq2 = 6.5022252500e-02f, qq3 = 5.0813062117e-03f, qq4 = 1.3249473704e-04f, qq5 = -3.9602282413e-06f;
+    const float pa0 = -2.3621185683e-03f, pa1 = 4.1485610604e-01f, pa2 = -3.7220788002e-01f, pa3 = 3.1834661961e-01f, pa4 = -1.1089469492e-01f, pa5 = 3.5478305072e-02f, pa6 = -2.1663755178e-03f;
+    const float qa1 = 1.0642088205e-01f, qa2 = 5.4039794207e-01f, qa3 = 7.1828655899e-02f, qa4 = 1.2617121637e-01f, qa5 = 1.3637083583e-02f, qa6 = 1.1984500103e-02f;
+    const float ra0 = -9.8649440333e-03f, ra1 = -6.9385856390e-01f, ra2 = -1.0558626175e+01f, ra3 = -6.2375331879e+01f, ra4 = -1.6239666748e+02f, ra5 = -1.8460508728e+02f, ra6 = -8.1287437439e+01f, ra7 = -9.8143291473e+00f;
+    const float sa1 = 1.9651271820e+01f, sa2 = 1.3765776062e+02f, sa3 = 4.3456588745e+02f, sa4 = 6.4538726807e+02f, sa5 = 4.2900814819e+02f, sa6 = 1.0863500214e+02f, sa7 = 6.5702495575e+00f, sa8 = -6.0424413532e-02f;
+    const float rb0 = -9.8649431020e-03f, rb1 = -7.9928326607e-01f, rb2 = -1.7757955551e+01f, rb3 = -1.6063638306e+02f, rb4 = -6.3756646729e+02f, rb5 = -1.0250950928e+03f, rb6 = -4.8351919556e+02f;
+    const float sb1 = 3.0338060379e+01f, sb2 = 3.2579251099e+02f, sb3 = 1.5367296143e+03f, sb4 = 3.1998581543e+03f, sb5 = 2.5530502930e+03f, sb6 = 4.7452853394e+02f, sb7 = -2.2440952301e+01f;
+    uint ix = as_type<uint>(x);
+    const bool sign = ix >> 31;
+    ix &= 0x7fffffffu;
+    if (ix >= 0x7f800000u) return 1.0f - 2.0f * (float)sign + 1.0f / x;   // nan, +-inf
+    if (ix < 0x3f580000u) {                                             // |x| < 0.84375
+        if (ix < 0x31800000u) return 0.125f * (8.0f * x + efx8 * x);    // |x| < 2^-28
+        const float z = x * x;
+        const float r = pp0 + z * (pp1 + z * (pp2 + z * (pp3 + z * pp4)));
+        const float s = 1.0f + z * (qq1 + z * (qq2 + z * (qq3 + z * (qq4 + z * qq5))));
+        return x + x * (r / s);
+    }
+    float y;
+    if (ix < 0x40c00000u) {                                             // |x| < 6
+        float c;
+        if (ix < 0x3fa00000u) {                                         // |x| < 1.25
+            const float s = fabs(x) - 1.0f;
+            const float P = pa0 + s * (pa1 + s * (pa2 + s * (pa3 + s * (pa4 + s * (pa5 + s * pa6)))));
+            const float Q = 1.0f + s * (qa1 + s * (qa2 + s * (qa3 + s * (qa4 + s * (qa5 + s * qa6)))));
+            c = 1.0f - erx - P / Q;
+        } else {
+            const float ax = fabs(x), s = 1.0f / (ax * ax);
+            float R, S;
+            if (ix < 0x4036db6du) {                                     // |x| < 1/0.35
+                R = ra0 + s * (ra1 + s * (ra2 + s * (ra3 + s * (ra4 + s * (ra5 + s * (ra6 + s * ra7))))));
+                S = 1.0f + s * (sa1 + s * (sa2 + s * (sa3 + s * (sa4 + s * (sa5 + s * (sa6 + s * (sa7 + s * sa8)))))));
+            } else {
+                R = rb0 + s * (rb1 + s * (rb2 + s * (rb3 + s * (rb4 + s * (rb5 + s * rb6)))));
+                S = 1.0f + s * (sb1 + s * (sb2 + s * (sb3 + s * (sb4 + s * (sb5 + s * (sb6 + s * sb7))))));
+            }
+            const float z = as_type<float>(as_type<uint>(ax) & 0xffffe000u);
+            c = exp(-z * z - 0.5625f) * exp((z - ax) * (z + ax) + R / S) / ax;
+        }
+        y = 1.0f - c;
+    } else y = 1.0f - 0x1p-120f;
+    return sign ? -y : y;
+}
+
+// y16 = act16(gelu(x + bias)): the block MLP's gelu_pytorch_tanh (mode 0, torch's tanh
+// approximation) or the merger's nn.GELU (mode 1, erf)
+struct bias_act_args { int N, mode, rows; };
+kernel void vis_bias_gelu(constant bias_act_args &a [[buffer(0)]],
+                          device const float *x [[buffer(1)]],
+                          device const float *bias [[buffer(2)]],
+                          device ushort *y [[buffer(3)]],
+                          constant act_args &ac [[buffer(4)]],
+                          device atomic_int *ovf [[buffer(5)]],
+                          device float *y32 [[buffer(6)]],      // CLEF_VIS_F32
+                          constant int &f32out [[buffer(7)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    const int i = gid.x, r = gid.y;
+    if (i >= a.N) return;
+    const float t = x[(long)r * a.N + i] + bias[i];
+    float g;
+    if (a.mode == 0) {
+        // torch gelu(approximate="tanh"): 0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))
+        const float inner = 0.7978845608028654f * (t + 0.044715f * (t * t * t));
+        g = 0.5f * t * (1.0f + precise::tanh(inner));
+    } else {
+        g = t * 0.5f * (1.0f + erf_f32(t * 0.7071067811865476f));
+    }
+    if (f32out == 2) vis_split_value(g, (device half *)y, (long)r * a.N + i, (long)a.rows * a.N, ac, ovf);
+    else if (f32out) y32[(long)r * a.N + i] = g;
+    else y[(long)r * a.N + i] = act16(g, ac, ovf);
+}
