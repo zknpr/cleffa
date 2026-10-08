@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and four sequential frames split across scans) | 98/98 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and four sequential frames split across scans, bytes after EOI, and a PNG chunk before IHDR) | 100/100 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -393,6 +393,21 @@ in the README. `tests/test_image.py` adds a progressive file cut with and withou
 before); all 98 parity images and 1,925 corpus files still decode identically. A 15-minute
 differential run on the result executed 133.7 million inputs with no finding
 (`golden/fuzz-image-2026-10-07/review14/`).
+
+A fifteenth round (Codex on `5d9ea53`) raised two points, measured first. (38) Confirmed: the
+decoder returned pixels for a JPEG without EOI, the baseline path straight after its scan and the
+progressive path at the end of the data. Pillow refuses every progressive one as truncated, but for
+baseline its answer depends on what follows the scan: it refused a file ending there or one byte
+later, and decoded one with eight bytes or two other bytes in place of EOI, so it follows its own
+read-ahead, not the file. EOI is now required for every JPEG; the baseline image is held until the
+decoding pass reaches it. The two baseline files Pillow decodes become refusals listed in the README;
+bytes after EOI are still ignored. `tests/test_image.py` adds three files without EOI (all decoded
+before) and one with bytes after EOI as a parity case. (39) Refuted: an ancillary chunk before IHDR
+(tEXt, gAMA or a private chunk), which the PNG specification forbids, is decoded by Pillow, and the
+decoder already matched it pixel for pixel; refusing it would diverge. It stays accepted, and a PNG
+with tEXt before IHDR is a parity case. A 15-minute differential run on the result executed
+185.9 million inputs with no finding; most mutated files now stop at the EOI requirement, as
+libjpeg's warning already kept them out of the comparison (`golden/fuzz-image-2026-10-07/review15/`).
 
 ## Numerical parity
 

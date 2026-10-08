@@ -369,7 +369,7 @@ Host-side pieces must match Python byte for byte, and they do:
 | `json.dumps` / `repr(float)` / `round()` | 404k floats, 240k roundings, 20k documents |
 | Request encoding (`encode_record`) | 3,089 requests, 43 with images (ids, spans, image runs, 3D positions) |
 | Response building (`systemone_answer`) | 1,338 responses |
-| Image decoding, resizing, normalization, patches, position interpolation | 98 PNG/JPEG images of every color type, scan layout, JPEG colour-space marking and quantization-table placement, byte-identical to PIL, torchvision and the processor |
+| Image decoding, resizing, normalization, patches, position interpolation | 100 PNG/JPEG images of every color type, scan layout, JPEG colour-space marking and quantization-table placement, byte-identical to PIL, torchvision and the processor |
 
 **Images.** The vision tower runs its 27 layers before any text is read, so operand rounding there
 compounds. Its producers retain f32 outputs. Non-residual GEMMs use compensated high/residual
@@ -766,7 +766,9 @@ differently:
   own result for it depends on how its input is buffered), JPEG blocks whose IDCT output leaves
   [-512, 511] (no encoder was measured above 397; libjpeg-turbo's C and NEON builds decode them
   differently), JPEG scans whose entropy data ends early (libjpeg fills the gap with a warning, and
-  Pillow refuses such a file when it also lacks EOI), WebP; and images over the decode limits;
+  Pillow refuses such a file when it also lacks EOI), JPEGs without EOI (Pillow refuses every
+  progressive one, but a baseline one only depending on its read-ahead), WebP; and images over
+  the decode limits;
 - a literal `<|image_pad|>` in request text in parity mode (the reference raises later, on the
   placeholder count).
 

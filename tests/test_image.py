@@ -525,6 +525,10 @@ def main() -> None:
         for name, idats in (("png-empty-first-idat", [b"", z]), ("png-empty-middle-idat", [z[:10], b"", z[10:]])):
             data = b"\x89PNG\r\n\x1a\n" + ihdr + b"".join(chunk(b"IDAT", x) for x in idats) + chunk(b"IEND", b"")
             cases.append((name, base64.b64encode(data).decode(), Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
+        # An ancillary chunk before IHDR, which the PNG specification forbids but Pillow decodes: kept
+        # as accepted (Codex on 5d9ea53 asked for a refusal on the belief that Pillow refuses it).
+        data = b"\x89PNG\r\n\x1a\n" + chunk(b"tEXt", b"key\x00value") + ihdr + chunk(b"IDAT", z) + chunk(b"IEND", b"")
+        cases.append(("png-text-before-ihdr", base64.b64encode(data).decode(), Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
         for name, b64 in (("separate-dc-37x21", SEPARATE_DC_SCANS_37X21), ("separate-dc-32x32", SEPARATE_DC_SCANS_32X32),
                           ("chroma-440", CHROMA_440_JPEG), ("sof1", SOF1_JPEG)):
             cases.append((name, b64, Image.open(io.BytesIO(base64.b64decode(b64))), MIN_PIXELS, MAX_PIXELS))
@@ -604,7 +608,9 @@ def main() -> None:
                            ("seq-cb-scanned-twice", b"".join(s for _, s in segs[:-1]) + segs[sos[1]][1] + b"\xff\xd9"),
                            # a partial scan may list its components in a later-first order, which
                            # libjpeg accepts and decodes in scan order (Codex on 1a0b186)
-                           ("seq-cr-then-cb", with_scan_order(base64.b64decode(SEQUENTIAL_Y_THEN_CBCR_JPEG), 1, (1, 0)))):
+                           ("seq-cr-then-cb", with_scan_order(base64.b64decode(SEQUENTIAL_Y_THEN_CBCR_JPEG), 1, (1, 0))),
+                           # bytes after EOI are ignored, as libjpeg and Pillow ignore them
+                           ("data-after-eoi", seq + b"trailing bytes after the end of the image")):
             cases.append((name, base64.b64encode(data).decode(), Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
         lines = [json.dumps({"image": b64, "out": f"{tmp}/{name}", "min_pixels": mn, "max_pixels": mx})
                  for name, b64, _, mn, mx in cases]
@@ -732,7 +738,12 @@ def main() -> None:
         # without EOI, but the decoder treated the gap as an EOB and returned pixels either way, up to
         # 50 levels from Pillow's (Codex on b6cbe49). Baseline scans were already refused.
         cut = prog.getvalue()[:-4]
-        for name, data in (("prog-cut-eoi", cut + b"\xff\xd9"), ("prog-cut-no-eoi", cut),
+        # Complete scans without EOI: Pillow refuses every progressive one and a baseline one with
+        # zero or one byte after its scan, but decodes a baseline one with more, by its read-ahead; the
+        # decoder returned pixels for all of them and now requires EOI (Codex on 5d9ea53).
+        no_eoi = [("base-no-eoi-1-byte", rgb.getvalue()[:-2] + b"\x00"), ("prog-no-eoi-8-bytes", prog.getvalue()[:-2] + b"\x00" * 8),
+                  ("base-eoi-replaced", rgb.getvalue()[:-2] + b"\x12\x34")]
+        for name, data in (*no_eoi, ("prog-cut-eoi", cut + b"\xff\xd9"), ("prog-cut-no-eoi", cut),
                            ("scan-order-102", with_scan_order(rgb.getvalue(), 0, (1, 0, 2))),
                            ("scan-order-210", with_scan_order(rgb.getvalue(), 0, (2, 1, 0))),
                            ("refine-ah2-al0", with_ahal(0x20)), ("refine-ah1-al1", with_ahal(0x11)),
@@ -762,7 +773,7 @@ def main() -> None:
         # the crafted JPEGs' unmodified sources still decode, and PIL reads the unusual sampling layout
         Image.open(io.BytesIO(base64.b64decode(LUMA_UNDER_CHROMA_JPEG))).load()
         print("errors: bad base64, truncated PNG, aspect ratio, 16-bit PNG, a non-base64 data URL, a progressive scan "
-              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, a scan before the frame header, two frame headers, full scans out of frame order, refinements with Al != Ah - 1, progressive scans cut short, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
+              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, a scan before the frame header, two frame headers, full scans out of frame order, refinements with Al != Ah - 1, progressive scans cut short, JPEGs without EOI, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
               "streams and three corrupt CRCs rejected"
               if not failures else "errors: see above")
     sys.exit(1 if failures else 0)

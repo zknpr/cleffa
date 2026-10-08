@@ -86,6 +86,7 @@
  *   - a sequential frame may split its components across scans: its coefficients are buffered
  *     and finished like a progressive frame's, as libjpeg does; a scan before the frame header,
  *     or a second frame header, is refused (JERR_SOS_NO_SOF, JERR_SOF_DUPLICATE);
+ *   - a file without EOI is refused (Pillow refuses it by its read-ahead, not consistently);
  *   - a scan whose entropy data ends early is refused, whether a Huffman code fails there or
  *     decodes using the padding past the data (libjpeg fills with a warning);
  *   - scan components are looked up from the scan position on, as libjpeg does, so a full scan
@@ -289,6 +290,7 @@ typedef struct {
     int8_t coef_bits[4][64]; /* cleffa: progressive precision per coefficient, -1 = never coded */
     int scans_seen;          /* cleffa: SOS segments processed */
     int sof_seen;            /* cleffa: frame headers met by the decoding pass */
+    int eoi_seen;            /* cleffa: the decoding pass reached EOI */
     int seq_buffered;        /* cleffa: a sequential frame whose components are split across scans */
     int saw_jfif, saw_adobe, adobe_transform;   /* cleffa: markers before the first SOS */
 
@@ -1484,7 +1486,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
          * "FF FF D9", so the decoder read past an EOI that libjpeg stops at. */
         if (marker == 0xFF) { pos -= 1; continue; }
         if (marker == 0x00) continue;
-        if (marker == JPEG_EOI) break;
+        if (marker == JPEG_EOI) { dec.eoi_seen = 1; break; }
 
         if (marker >= JPEG_RST0 && marker <= JPEG_RST0 + 7) continue;
         if (marker == JPEG_SOI) continue;
@@ -1578,6 +1580,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
         } else if (marker == JPEG_SOS) {
             /* Start of scan */
             if (!dec.sof_seen) goto fail;
+            if (img) goto fail;   /* cleffa: a scan after a complete baseline scan */
             dec.scans_seen++;
             if (seg_len < 6) goto fail;
 
@@ -1788,12 +1791,21 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 free(y_data);
                 free(cb_data);
                 free(cr_data);
-                return img;
+                /* cleffa: read on to EOI; the image is returned after the loop (see eoi_seen). */
+                pos = scan_end;
+                continue;
             }
         }
 
         pos += seg_len;
     }
+
+    /* cleffa: a JPEG that ends without EOI is truncated. libjpeg decodes one with a "premature end"
+     * warning, but Pillow refuses every progressive one and a baseline one depending on how many
+     * bytes follow the scan, which is its read-ahead, not the file; the decoder returned pixels for
+     * all of them (Codex on 5d9ea53). EOI is required, as for a complete file. */
+    if (!dec.eoi_seen) goto fail;
+    if (img) return img;   /* baseline, decoded in its scan above */
 
     /* For progressive, or a sequential frame split across scans, finish decoding after all scans */
     if (dec.is_progressive || dec.seq_buffered) {
@@ -1877,6 +1889,7 @@ fail:
     for (int i = 0; i < 4; i++) {
         if (dec.comp[i].coefs) free(dec.comp[i].coefs);
     }
+    if (img) jpeg_free(img);   /* cleffa: a baseline image held until EOI */
     return NULL;
 }
 
