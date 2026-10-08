@@ -86,7 +86,9 @@ TEXT_EXT = {'.json', '.jsonl', '.log', '.txt', '.md', '.csv', '.patch', '.diff',
             '.toml', '.py', '.m', '.metal', '.c', '.h', '.sh', '.mk', '.cfg'}
 TEXT_NAMES = {'Makefile', 'LICENSE'}   # the only extensionless files admitted
 ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latency.json'}
-EXPERIMENT = re.compile(r'^[a-z0-9-]+-20\d{6}$')
+# Experiment directories end in a date, compact (perf-20261003) or dashed (vision-opt-2026-10-07),
+# the form every report since the vision work cites; a mixed form stays undated.
+EXPERIMENT = re.compile(r'^[a-z0-9-]+-20(\d{6}|\d{2}-\d{2}-\d{2})$')
 ORACLE_DIR = re.compile(r'^clef(-flash)?(-(vision|video))?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
 

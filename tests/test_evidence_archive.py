@@ -152,6 +152,21 @@ class EvidenceArchive(unittest.TestCase):
         self.assertIn('clef-flash-video-f32/encoded.jsonl', names)
         self.assertNotIn('clef-flash-video-f32/layers/vd000.safetensors', names)
 
+    def test_dashed_date_experiments(self):
+        # The vision and video reports cite golden/<name>-YYYY-MM-DD/ directories; the compact
+        # 20261005 form alone silently dropped all of their evidence from the archive.
+        for name in ['vision-opt-2026-10-07', 'video-sync-2026-10-08', 'gemm-probe-20261004',
+                     'bad-date-2026-1007', 'bad-date-2026-10-7']:
+            (self.root / name).mkdir(exist_ok=True)
+            (self.root / name / 'result.json').write_text('{"ok": true}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'dated.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertIn('vision-opt-2026-10-07/result.json', names)
+        self.assertIn('video-sync-2026-10-08/result.json', names)
+        self.assertIn('gemm-probe-20261004/result.json', names)
+        self.assertNotIn('bad-date-2026-1007/result.json', names)   # mixed forms stay undated
+        self.assertNotIn('bad-date-2026-10-7/result.json', names)
+
     def test_selection_and_rewrite(self):
         out = Path(self.tmp.name) / 'ev.tar.gz'
         manifest = ea.build(self.root, out, 'ev')
