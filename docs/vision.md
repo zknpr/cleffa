@@ -1,6 +1,6 @@
 # Vision
 
-How images enter the engine, what was checked against the reference, and what it costs. Numbers
+How images and videos enter the engine, what was checked against the reference, and what it costs. Numbers
 are from the one tested M5 Max (128 GB), one GPU job at a time, as the other reports.
 
 ## Pipeline
@@ -44,10 +44,11 @@ Byte parity with the reference, `make test`:
 |---|---|---|
 | Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and four sequential frames split across scans, bytes after EOI, and a PNG chunk before IHDR) | 100/100 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
-| Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
+| Rejections | both | lone `media_kwargs` bound, unsupported processor arguments, malformed videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
 Divergences from the reference (it answers or behaves differently; the engine errors):
-videos; `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
+unsupported video formats or limits; `media_kwargs` outside the documented image bounds and
+`videos_kwargs`, or only one image bound (the
 processor silently ignores a lone bound), or bounds that are not positive integers within int32; a
 data URL whose media type is not `image/png` or `image/jpeg` or contradicts the bytes (the object
 form's `content_type` is checked the same way; the reference's PIL decode ignores both labels); an
@@ -776,9 +777,161 @@ image cases against Pillow/torchvision, and 103/103 image cases under ASan. Base
 invalid-byte/position checks also passed ASan. The two command/result ledgers are
 `validation.json` and `validation-host-final.json` in the evidence directory.
 
+## Video support, 2026-10-07
+
+Video uses the pinned `Qwen3VLVideoProcessor` through a native host implementation. The engine
+accepts PNG/JPEG frame arrays with source FPS. `clef_video.c` contains resize geometry only.
+MP4/MOV conversion lives in the optional `tools/video_request.py` client tool, which invokes
+FFmpeg/ffprobe with bounded input/output and a killable deadline. Neither engine binaries nor
+`make test` require FFmpeg. The converter preserves original source indices and FPS, so timestamp
+tokens match engine sampling. Its output explicitly disables a second sampling pass.
+
+The converter disables MOV external data references and restricts input protocols to local files.
+It runs with the caller's privileges, without an OS sandbox, and is never invoked by the server.
+The optional adapter test supplies local-file and loopback HTTP references inside a MOV, checks
+that only embedded media can be used, and checks that no network connection occurs.
+
+Uniform sampling follows the processor's NumPy linspace/round rule. Video resize uses the total
+sampled frame count, with default pixel bounds 4,096 and 25,165,824. Pairs of resized frames become
+one temporal group in channel/temporal/spatial patch order, with the last frame duplicated when
+needed. Each group's attention stays independent; row-wise tower operations can share dispatches
+across groups. The request encoder adds one-decimal timestamps and `<|video_pad|>` runs,
+including the reference's outer video wrapper. M-RoPE and cache token identity include those
+timestamps. No Metal kernel or model weight changes are required.
+
+`tests/test_video.py` checks 14 cases byte for byte against the processor: decoded RGB through
+patch values, token IDs, question spans, visual token runs and all three position axes. Cases cover
+mixed images/videos, multiple videos, odd counts, single-frame input, explicit sample counts,
+spatial downscaling and presampled source indices. It rejects 39 malformed inputs and checks
+strict-token behavior. Following the sync with `vision` at `b81c9b7`, the shared media encoder
+reserves schema tokens and any untruncated state before allocating either image or video patches.
+Regressions check that both reservations reject an oversized video before its second frame is
+decoded, while truncatable state still yields to the video. `tests/test_video_request.py` separately checks five codec/container
+combinations, comparing adapter output to independently decoded full-frame requests through C
+sampling, token encoding and patches. It also checks process deadlines, output caps, malformed
+clips, explicit CLI failures and external references.
+
+Sync validation is recorded in `golden/video-sync-2026-10-08/validation.json`: `make test`, 2,071
+image differential cases, 3,089 request-encoding cases, truncation and adapter checks pass, as do
+3,746,819 sanitizer/differential fuzz executions. GPU inference and HTTP were not rerun during
+the sync because another checkout was running its GPU verification suite.
+
+The separate `ref/corpus_video.py` has eight synthetic requests and sixteen questions. Both model
+snapshots were hash-verified before generating new streamed FP32 references. Existing acceptance
+limits are unchanged.
+
+| Model | Token IDs | Decisions | Maximum logit error | Maximum probability error |
+|---|---:|---:|---:|---:|
+| Clef-Flash | 8/8 exact | 16/16 | 0.0012 | 0.0002 |
+| Clef 27B | 8/8 exact | 16/16 | 0.0066 | 0.0007 |
+
+The first request's embedding and layer comparisons pass on both models. Batch 1/8 logits and
+NaN-poison checks are exact on both models. Flash HTTP checks pass concurrent CLI parity, keyed
+cache isolation, count/frame/token limits, strict placeholders and failure recovery. Sixteen
+cache transitions under poisoning have identical raw logits with ordinary inference, prefix
+caching and template caching. They change FPS, pixels, frame order, text and mixed-media layouts.
+The existing Flash image corpus retains all 41/41 decisions against its unchanged FP32 oracle.
+Its full image HTTP suite also passes, including admission limits and template/keyed caches.
+`make test` and all eight CLI error tests pass.
+
+Host parity and malformed inputs also pass ASan/UBSan, and the frame host suite passes with
+FFmpeg absent from PATH. `otool -L` confirms that all three engine binaries have no FFmpeg
+linkage. Optional converter tests cover four codecs across five MP4/MOV combinations. These
+checks establish parity on synthetic inputs, not real-world video accuracy. Logs are under
+`golden/video-2026-10-07/` in the
+isolated video worktree. Its newly generated video oracles are `golden/clef-flash-video-f32` and
+`golden/clef-video-f32`; the image and text goldens were not regenerated.
+
+Validation commands for the frame corpus:
+
+```sh
+.venv/bin/python -B tests/test_video.py
+.venv/bin/python -B tests/test_video_request.py  # optional, requires ffmpeg/ffprobe
+.venv/bin/python -B ref/oracle_f32_stream.py model-flash --name clef-flash-video-f32 --corpus video
+.venv/bin/python -B ref/oracle_f32_stream.py model --name clef-video-f32 --corpus video --safe-attn
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-video-f32 --dump
+.venv/bin/python -B tests/test_parity.py gguf/clef.gguf golden/clef-video-f32 --dump
+tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+.venv/bin/python -B tests/test_server_video.py gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+```
+
+Input forms, limits and sampling controls are in [README.md](../README.md#video).
+
+## Video performance follow-up, 2026-10-08
+
+The native clip path now asks FFmpeg to emit lossless RGB PNGs directly. This removes the raw RGB
+pipe and serial Python encoding from the common path. Software decoding and encoding use at most
+four threads per stage, with fewer workers for large sources. Filter-0 PNGs avoid Paeth reconstruction
+in the C decoder. Their dimensions, format, CRCs and count are checked before building the request.
+They can be larger: if the body cap is exceeded, the converter retries the original compact
+Pillow representation without extending the shared FFmpeg deadline. The engine still neither
+links nor starts a video decoder. Source pixels, sampled frame indices and timestamps are unchanged.
+
+The host retains frame zero after the geometry check, skips identity resize copies, and copies the
+normalized temporal plane when padding an odd frame count. Integer NEON resize kernels process
+horizontal taps and adjacent vertical channel bytes with the same weights, rounding and saturation.
+On the GPU, equal grids in one record share projections and norms up to 1,024 patches total.
+RoPE and spatial attention remain separate. Q/K/V scratch is reused after each attention dispatch;
+the existing minimum scratch allocation accommodates grouping without increasing capacity.
+`CLEF_VIS_GROUP=0` retains the previous dispatch arrangement for validation and comparison.
+
+Measurements on the M5 Max used the saved pre-change engine and adapter, with unchanged model
+weights and pixel/frame budgets. `bench/video_latency.py` keeps both engines warm and alternates
+individual baseline/candidate requests in reversed order. The table reports ten samples per arm
+over two rounds. It includes the file snapshot, probe, codec conversion, frame encoding, JSON transfer,
+host processing and inference; it excludes model loading and Python module import. No other inference
+job was running. The clips are four-second, 24 FPS H.264 `testsrc2` fixtures, sampled to eight frames
+with a 2,097,152-pixel video budget. Every response has byte-identical raw logits.
+
+| Model and clip | Before | After | Latency reduction |
+|---|---:|---:|---:|
+| Flash, 640×360 | 702.1 ms | 633.5 ms | 9.8% |
+| Flash, 1280×720 | 935.4 ms | 717.8 ms | 23.3% |
+| 27B, 640×360 | 1,639.0 ms | 1,517.3 ms | 7.4% |
+| 27B, 1280×720 | 1,942.2 ms | 1,702.7 ms | 12.3% |
+
+HD conversion alone fell from about 240 ms to 94 ms. Its request grew from 1.70 MB to 2.22 MB,
+so these local-pipe measurements do not establish the same gain over a bandwidth-limited network.
+For an eight-frame 128×96 frame-array request, warm inference alone fell from 132.9 to 116.9 ms
+on Flash and 364.7 to 352.1 ms on 27B. Larger GPU-only measurements drifted during the run,
+including slower candidate medians in a case that used no grouping; no larger-image GPU speedup
+is claimed. An earlier 4,096-patch grouping experiment showed less than 2% improvement on larger
+inputs while expanding scratch, so the retained cap is 1,024.
+
+The CPU benchmark times the actual request encoder. In per-case ABBA runs, the median of two
+nine-sample run medians changed from 21.27 to 13.17 ms for eight 640×360 PNG frames, 131.66 to
+112.97 ms for sixteen 1280×720 PNG frames, and 261.81 to 235.22 ms for the JPEG equivalent.
+A single 720p frame, formerly decoded and preprocessed twice, fell from 18.38 to 6.78 ms.
+Desktop timing drift is visible in the raw runs; these are fixture measurements, not universal bounds.
+
+Validation passed `make test`, 187 arbitrary resize shapes and 163 randomized image cases against
+torchvision/Pillow, all 14 video host cases, and ASan/UBSan video/JPEG checks. The optional adapter
+suite passes all five codec/container combinations, exact compact fallback at the body limit,
+PNG pipe validation, deadlines and external-reference checks. Both models retain 41/41 image and
+16/16 video decisions against their FP32 oracles. Both also pass image/video batch and poison checks,
+video overflow recovery, and exact grouped/ungrouped logits for 12 requests in six configurations.
+Image and video HTTP/cache suites pass. A 181-second sanitizer fuzz run completed 460,043 executions
+without findings. Neither existing golden corpus was regenerated.
+
+Evidence is in `golden/video-perf-2026-10-07/`: `clips-final.json`, `gpu-final.json`, `host-final.json`,
+the saved baseline binaries/adapter, synthetic fixtures and validation logs. Reproduce with:
+
+```sh
+make video-host-bench
+./video-host-bench gguf/clef-flash.gguf REQUESTS.jsonl
+.venv/bin/python -B bench/video_latency.py RESULTS.json \
+  --baseline-engine SAVED_CLEF --baseline-adapter SAVED_VIDEO_REQUEST.py \
+  --clips CLIP.mp4 CLIP.mov
+.venv/bin/python -B tests/test_resize.py
+.venv/bin/python -B tests/test_vision_groups.py gguf/clef-flash.gguf
+.venv/bin/python -B tests/test_video_request.py
+```
+
 ## Not done
 
-- Live or unknown-length video streams; video codecs outside H.264, HEVC, ProRes and MJPEG.
+- Raw compressed video in the engine/server; live or unknown-length clips in the converter.
+- Converter codecs beyond H.264, HEVC, ProRes and MJPEG.
 - WebP (the hosted API accepts it); 16-bit, low-bit and interlaced PNGs; CMYK JPEGs.
 - Attention remains quadratic in patches. The large-image FP32 MPP path reduces its cost;
   further tensor-unit work remains open.

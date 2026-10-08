@@ -44,7 +44,8 @@ rounded YCbCr conversion, retained progressive scan bits). cleffa changes `jpeg.
 in its header comment: scan headers (Ss/Se/Ah/Al) are validated before decoding, a multi-component
 image's first component must carry the largest sampling factors, scans may only select Huffman
 tables a DHT defined and name each component once, DC table symbols above 15 are refused, the DC predictor wraps and is stored
-as 16 bits before dequantization, the IDCT computes in 64-bit, and a progressive DC scan of one
+as 16 bits before dequantization, progressive scans validate each coefficient's prior bitplane
+and consume a cumulative block-work budget, the IDCT computes in 64-bit, and a progressive DC scan of one
 component walks that component's blocks in raster order. Matching libjpeg on files from other
 encoders, 4:4:0 chroma uses its h1v2 triangle filter, SOF1 frames decode as baseline, a run
 overshooting its band (refinement, first scan or baseline) writes its coefficient where libjpeg does, progressive images libjpeg would
@@ -60,7 +61,7 @@ a scan before the frame header, or a second frame header, is refused. Scan compo
 up from the scan position on, as libjpeg does, and a refinement scan must have Al = Ah - 1. A scan
 whose entropy data ends early is refused, and so is a file without EOI. `clef_image.c` includes the
 headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
-`tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header skips empty IDAT chunks and has optional inflate and CRC32 hooks;
+`tests/test_jpeg_ub.c` and `tests/test_jpeg_regressions.py` hold the crafted files behind those changes. The PNG header skips empty IDAT chunks and has optional inflate and CRC32 hooks;
 cleffa supplies these through the system zlib library, preserving size and checksum validation.
 Their license (`third_party/iris/LICENSE`):
 
@@ -156,5 +157,13 @@ cleffa does not include or redistribute model weights or Cloudflare's code.
   weights. If you redistribute them, the Apache-2.0 terms apply.
 - **Reference code:** the reference oracles in `ref/` import `joint_schema_model.py` from the
   downloaded snapshot. That code is not copied into this repository.
+
+## FFmpeg
+
+The optional `tools/video_request.py` client tool invokes locally installed `ffmpeg` and `ffprobe`
+executables for MP4/MOV conversion. The engine does not link FFmpeg. Its source and binaries are
+not vendored here.
+Its license depends on the build configuration; see the installed distribution's notices and
+[FFmpeg's license page](https://ffmpeg.org/legal.html).
 
 cleffa is an independent project. It is not affiliated with or endorsed by Cloudflare.

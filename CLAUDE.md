@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## What this is
 
 `cleffa`: a C11 + Metal inference engine for Cloudflare's Clef (27B) and Clef-Flash (9B) joint-schema
-models. One prefill pass per SystemOne request, typed decisions out. Text and images (no video), BF16
+models. One prefill pass per SystemOne request, typed decisions out. Text, images and video, BF16
 weights, never quantized. Apple Silicon only (Metal 4 tensor ops, Accelerate). The README is current and
 detailed; read it for measured accuracy/latency numbers and the security notes. This file covers what
 the README does not: how the pieces fit, the parity contract, and the traps.
@@ -69,9 +69,13 @@ make clean
   whose entropy data ends early refused, EOI required) and
   optional PNG inflate/CRC hooks, and `png.h` skips empty IDAT chunks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
+  Progressive JPEG scans may visit at most `max(1024, JPEG_MAX_PIXELS / 4)` blocks in total, counting all
+  components and scans. This bounds CPU even for valid split-band progressions and may reject
+  unusually scan-heavy large images; small files with many scans remain supported.
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;
   the original dependency-free PNG implementation remains the fallback. Decoder changes
   require `tests/test_image.py` against Pillow, including malformed streams and CRCs, and
+  `tests/test_jpeg_regressions.py` (scan work, RGB and separate DC byte parity),
   `tests/test_jpeg_ub.c` (crafted JPEGs under UBSan and ASan, in `make test`), plus
   `make test-image-diff` (files from cjpeg, sips, ffmpeg and Pillow against Pillow) and fuzz runs on
   the result (`make fuzz-image`, `make fuzz-jpeg-diff`, below). Treat any undefined behavior the
@@ -281,7 +285,18 @@ takes `min_pixels` and `max_pixels` together only (the processor ignores a lone 
 rejects it). `clef_record_positions` reproduces `get_rope_index` (checked against it in
 `tests/test_record.py`).
 
-On the GPU each image is one dispatch sequence over its own patches: patch GEMM + bias + bilinear
+AArch64 resize uses exact integer NEON products across vertical channel bytes and horizontal
+taps; scalar tails retain the same rounding and saturation. `tests/test_resize.py` compares
+arbitrary dimensions, including SIMD tails, against torchvision.
+
+On the GPU equal-grid images or frame pairs within one record share GEMM and normalization
+dispatches up to 1,024 patches total. This fits the existing minimum scratch allocation; larger
+images run alone. `CLEF_VIS_GROUP=0` restores separate dispatches for comparison. Spatial positions,
+RoPE and attention stay per image, with Q/K/V scratch and its tail reused after each attention
+dispatch. Grouping never crosses a record's overflow slot, so packing other requests cannot
+change its computation. `tests/test_vision_groups.py` compares exact logits with grouping disabled,
+batch 1/8, NaN poison, both vision operand modes, reference attention and forced overflow.
+The sequence is patch GEMM + bias + bilinear
 position resampling (`vis_embed`), 27 blocks of `layernorm_act` -> qkv GEMM -> `vis_qkv_rope` (2D
 rotary, pairs (i, i+36): the first 18 by grid row, the next 18 by column) -> bidirectional
 attention (`vis_attention_mpp` at 2,048 patches or more, FP32 Metal matrix primitives with
@@ -301,7 +316,7 @@ FP32-accumulating products (`vis_gemm_comp`). Residual projections use direct FP
 bit also use that path. Compensating residual projections too failed the probability-error gate.
 `CLEF_VIS_F32=0` selects plain 16-bit operands under `ACT_VIS` = 16 in `CLEF_ACT_F16`; that older
 mode puts two of 41 Flash vision questions past the parity limits (`docs/vision.md`). Vision scratch is sized per pass
-(`ensure_vision_capacity`): uploads by the pass's total patches, activations by its largest image;
+(`ensure_vision_capacity`): uploads by the pass's total patches, activations by its largest group;
 Q/K/V get 128 slack rows; `encode_vision` zeroes the readable tail each layer because the
 attention tiles read past the last head's patches (poison-safe). MPP uses FP32 throughout,
 including probabilities and output before any optional 16-bit epilogue. Its tiles and dispatch
@@ -326,6 +341,31 @@ an image. A failed/overflowing pass never becomes reusable; template reuse clear
 Image requests qualify with a 32-token snapshot, since skipping the tower pays off even on short
 prefixes. Text keeps its 128-token minimum. `tests/test_vision_cache.py` checks full-corpus exact logits,
 image/text/schema/geometry transitions and overflow invalidation on both models.
+
+### Video input
+
+Video input uses the same GPU path. `clef_record.c` decodes selected PNG/JPEG frame arrays;
+`clef_video.c` contains only resize geometry. Optional `tools/video_request.py` converts local
+MP4/MOV files in a separate FFmpeg process. The engine never links or invokes FFmpeg. Conversion
+emits lossless filter-0 PNGs directly from FFmpeg using up to four software frame threads per stage,
+reduced for large source dimensions. The PNG pipe is checked
+for dimensions, format, CRCs and exact frame count. A body-limit failure retries the original
+compact Pillow encoding within the same FFmpeg deadline. The native host retains the first decoded
+frame, skips identity resize copies, and duplicates an odd final frame after normalization.
+Adapter output retains original `frame_indices`, `total_num_frames` and FPS, and disables further sampling.
+These indices determine timestamp tokens; substituting a nominal sampling FPS loses timing.
+The pinned Qwen3VLVideoProcessor defaults are in `clef_video.h`; both snapshots use them. Frames are
+sampled uniformly, resized against the complete video pixel budget, then paired into independent
+`clef_image_ref` entries with `video_group` and a timestamp. Each entry has two distinct temporal
+taps in its patch rows. Qwen3.5 vision attention is independent for each temporal group, so no
+kernel change is needed. The reference retains an outer vision wrapper around each video's
+timestamped groups; token parity requires both that wrapper and the inner wrappers.
+`images`/`n_images` in internal records therefore include video groups, and `n_image_tokens` is the
+total visual token count. This also makes GPU packing, overflow retries and exact patch caching
+apply to videos. `max_video_*` limits are independent of still-image count/token limits; source
+pixels and concurrent media-request admission use the existing image limits. The standalone video
+corpus preserves existing image golden data: `ref/corpus_video.py`, `--corpus video` on both oracles,
+`tests/test_video.py` for exact host bytes, `tests/test_server_video.py` for HTTP/cache transitions.
 
 ### GPU forward (clef_metal.m + metal/clef.metal)
 
@@ -607,7 +647,7 @@ discard a run with outliers like that.
 
 The engine errors where Python answers or behaves differently. The list lives in the README under
 "Deliberate divergences"; extend it there when adding one, and add the case to `tests/test_record.py`.
-Image cases (videos, lone or unknown `media_kwargs`, unsupported encodings, placeholder text in parity
+Image cases (malformed videos, lone or unknown `media_kwargs`, unsupported encodings, placeholder text in parity
 mode) are there and in `docs/vision.md`.
 
 ## Conventions

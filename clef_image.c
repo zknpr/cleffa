@@ -6,6 +6,9 @@
 #include <string.h>
 #include <strings.h>
 #include <zlib.h>
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
 
 /* PNG dimensions bound the allocation before inflate. Require exactly one complete,
  * checksummed stream of the expected size; never grow output from compressed input. */
@@ -209,7 +212,7 @@ bool clef_image_decode(const uint8_t *data, size_t len, clef_rgb *out, char *err
     }
     if (len >= 2 && data[0] == 0xff && data[1] == 0xd8) {
         jpeg_image *img = jpeg_load_mem(data, len);
-        if (!img) return fail(err, errlen, "image: invalid or unsupported JPEG (baseline or progressive, grayscale or YCbCr)");
+        if (!img) return fail(err, errlen, "image: invalid or unsupported JPEG (baseline or progressive, grayscale, RGB or YCbCr)");
         if (img->channels == 3) {
             *out = (clef_rgb){ .width = img->width, .height = img->height, .rgb = img->data };
             img->data = NULL;
@@ -346,8 +349,27 @@ static void aa_sample_rgb(const uint8_t *src, size_t stride, const aa_plan *p, i
     const uint8_t *s = src + (size_t)p->xmin[i] * stride;
     const int round = 1 << (p->precision - 1);
     int r = round, g = round, b = round;
-    /* Share weights and addresses across RGB, retaining each channel's accumulation order. */
-    for (int64_t j = 0; j < p->xsize[i]; j++) {
+    /* Share weights and addresses across RGB, retaining the exact integer sum and rounding. */
+    int64_t j = 0;
+#if defined(__aarch64__)
+    if (stride == 3 && p->xsize[i] >= 8) {
+        int32x4_t vr = vdupq_n_s32(0), vg = vr, vb = vr;
+        for (; j + 8 <= p->xsize[i]; j += 8) {
+            uint8x8x3_t rgb = vld3_u8(s + (size_t)j * 3);
+            int16x8_t wt = vld1q_s16(w + j);
+            int16x8_t red = vreinterpretq_s16_u16(vmovl_u8(rgb.val[0]));
+            int16x8_t green = vreinterpretq_s16_u16(vmovl_u8(rgb.val[1]));
+            int16x8_t blue = vreinterpretq_s16_u16(vmovl_u8(rgb.val[2]));
+            vr = vmlal_s16(vmlal_s16(vr, vget_low_s16(red), vget_low_s16(wt)), vget_high_s16(red), vget_high_s16(wt));
+            vg = vmlal_s16(vmlal_s16(vg, vget_low_s16(green), vget_low_s16(wt)), vget_high_s16(green), vget_high_s16(wt));
+            vb = vmlal_s16(vmlal_s16(vb, vget_low_s16(blue), vget_low_s16(wt)), vget_high_s16(blue), vget_high_s16(wt));
+        }
+        /* These bounded integer sums are exact; changing their reduction order cannot
+         * change pixels. Never load past xsize, including at the image's right edge. */
+        r += vaddvq_s32(vr); g += vaddvq_s32(vg); b += vaddvq_s32(vb);
+    }
+#endif
+    for (; j < p->xsize[i]; j++) {
         const uint8_t *pixel = s + (size_t)j * stride;
         const int weight = w[j];
         r += (int)pixel[0] * weight;
@@ -361,6 +383,37 @@ static void aa_sample_rgb(const uint8_t *src, size_t stride, const aa_plan *p, i
     dst[0] = (uint8_t)(qr > 255 ? 255 : qr);
     dst[1] = (uint8_t)(qg > 255 ? 255 : qg);
     dst[2] = (uint8_t)(qb > 255 ? 255 : qb);
+}
+
+static void aa_vertical_row(const uint8_t *src, size_t stride, const aa_plan *p, int y, uint8_t *dst) {
+    size_t x = 0;
+#if defined(__aarch64__)
+    const int16_t *w = p->w + (size_t)y * p->max_interp;
+    const uint8_t *first = src + (size_t)p->xmin[y] * stride;
+    const int32x4_t round = vdupq_n_s32(1 << (p->precision - 1));
+    const int32x4_t shift = vdupq_n_s32(-(int)p->precision);
+    /* Eight adjacent channel bytes share the same vertical weights. Keep the integer
+     * multiply, round, shift and saturation identical to the scalar PyTorch path. */
+    for (; x + 8 <= stride; x += 8) {
+        int32x4_t lo = round, hi = round;
+        for (int64_t j = 0; j < p->xsize[y]; j++) {
+            int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(first + (size_t)j * stride + x)));
+            lo = vmlal_n_s16(lo, vget_low_s16(v), w[j]);
+            hi = vmlal_n_s16(hi, vget_high_s16(v), w[j]);
+        }
+        uint16x8_t v = vcombine_u16(vqmovun_s32(vshlq_s32(lo, shift)), vqmovun_s32(vshlq_s32(hi, shift)));
+        vst1_u8(dst + x, vqmovn_u16(v));
+    }
+#endif
+    /* The tail may start inside an RGB pixel, so accumulate individual channel bytes. */
+    for (; x < stride; x++) {
+        int value = 1 << (p->precision - 1);
+        const int16_t *w = p->w + (size_t)y * p->max_interp;
+        for (int64_t j = 0; j < p->xsize[y]; j++)
+            value += src[((size_t)p->xmin[y] + j) * stride + x] * (int)w[j];
+        int shifted = value < 0 ? 0 : value >> p->precision;
+        dst[x] = (uint8_t)(shifted > 255 ? 255 : shifted);
+    }
 }
 
 bool clef_resize_bicubic_aa(const uint8_t *src, int sw, int sh, uint8_t *dst, int dw, int dh, char *err, size_t errlen) {
@@ -390,8 +443,7 @@ bool clef_resize_bicubic_aa(const uint8_t *src, int sw, int sh, uint8_t *dst, in
         aa_plan p;
         if (!aa_plan_build(&p, sh, dh, err, errlen)) { free(tmp); return false; }
         for (int y = 0; y < dh; y++)
-            for (int x = 0; x < cw; x++)
-                aa_sample_rgb(cur + (size_t)x * 3, (size_t)cw * 3, &p, y, dst + ((size_t)y * cw + x) * 3);
+            aa_vertical_row(cur, (size_t)cw * 3, &p, y, dst + (size_t)y * cw * 3);
         aa_plan_free(&p);
     }
     free(tmp);
@@ -456,6 +508,50 @@ void clef_image_patches_free(clef_image_patches *p) {
     if (!p) return;
     free(p->patches);
     memset(p, 0, sizeof(*p));
+}
+
+bool clef_video_pair_preprocess(const clef_rgb *first, const clef_rgb *second, int rh, int rw,
+                               clef_image_patches *out, char *err, size_t errlen) {
+    memset(out, 0, sizeof(*out));
+    if (rh <= 0 || rw <= 0 || rh % 32 || rw % 32 || rh > CLEF_IMAGE_MAX_DIMENSION || rw > CLEF_IMAGE_MAX_DIMENSION ||
+        (long)rh * rw > CLEF_IMAGE_MAX_PIXELS || first->height != second->height || first->width != second->width)
+        return fail(err, errlen, "invalid video frame geometry");
+    /* Reuse the exact uint8 resize and normalization of still images. A pair has independent
+     * temporal taps, not two copies of the first frame. Allocate one patch array and one RGB
+     * resize buffer, regardless of video length. */
+    const int gh = rh / 16, gw = rw / 16, dim = 1536;
+    float *patches = malloc((size_t)gh * gw * dim * sizeof(float));
+    const bool resize = rw != first->width || rh != first->height;
+    uint8_t *owned = resize ? malloc((size_t)rh * rw * 3) : NULL;
+    if (!patches || (resize && !owned)) { free(patches); free(owned); return fail(err, errlen, "out of memory (video patches)"); }
+    float normalized[256];
+    for (int i = 0; i < 256; i++) normalized[i] = ((float)i - 127.5f) / 127.5f;
+    const int taps = first == second ? 1 : 2;
+    for (int t = 0; t < taps; t++) {
+        const clef_rgb *src = t ? second : first;
+        if (resize && !clef_resize_bicubic_aa(src->rgb, src->width, src->height, owned, rw, rh, err, errlen)) {
+            free(patches); free(owned); return false;
+        }
+        const uint8_t *rgb = resize ? owned : src->rgb;
+        size_t row = 0;
+        for (int by = 0; by < gh / 2; by++)
+            for (int bx = 0; bx < gw / 2; bx++)
+                for (int my = 0; my < 2; my++)
+                    for (int mx = 0; mx < 2; mx++, row++)
+                        for (int c = 0; c < 3; c++) {
+                            float *plane = patches + row * dim + c * 512 + t * 256;
+                            for (int y = 0; y < 16; y++)
+                                for (int x = 0; x < 16; x++) {
+                                    size_t at = (((size_t)(by * 2 + my) * 16 + y) * rw + (bx * 2 + mx) * 16 + x) * 3 + c;
+                                    plane[y * 16 + x] = normalized[rgb[at]];
+                                }
+                            /* An odd final frame repeats its already normalized temporal tap. */
+                            if (taps == 1) memcpy(plane + 256, plane, 256 * sizeof(float));
+                        }
+    }
+    free(owned);
+    *out = (clef_image_patches){ rw, rh, gh, gw, gh * gw, gh * gw / 4, dim, patches };
+    return true;
 }
 
 /* torch.linspace(0, side - 1, n) in float32: start + step * i below the midpoint, end - step *

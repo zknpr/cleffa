@@ -80,6 +80,8 @@ static struct {
      * the media_kwargs.max_pixels that would fit, never downscaled silently: the reference keeps up
      * to 16,384 tokens per image, and image tokens cost the same prefill as text. */
     int max_images;
+    int max_videos, max_video_frames;
+    long max_video_tokens;
     long max_image_tokens;
     /* Image memory is bounded at two more points (review #3). Decoding allocates several times a
      * source image's RGB size before any token limit can apply, and a compressible 8192x8192 PNG
@@ -544,10 +546,15 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     opts.vision.max_images = S.max_images;
     opts.vision.max_image_tokens = S.max_image_tokens;
     opts.vision.max_image_pixels = S.max_image_pixels;
-    /* Any request naming images takes a slot before its images are decoded and keeps it until
+    opts.vision.max_videos = S.max_videos;
+    opts.vision.max_video_frames = S.max_video_frames;
+    opts.vision.max_video_tokens = S.max_video_tokens;
+    /* Any request naming images or videos takes a slot before decoding and keeps it until
      * its patches are freed; a malformed list is refused by the encoder before any decoding. */
     const jval *ims = req ? json_get(req, "images") : NULL;
-    const bool slot = S.max_image_requests > 0 && ims && ims->type == J_ARRAY && ims->n > 0;
+    const jval *vids = req ? json_get(req, "videos") : NULL;
+    const bool slot = S.max_image_requests > 0 && ((ims && ims->type == J_ARRAY && ims->n > 0) ||
+                                                 (vids && vids->type == J_ARRAY && vids->n > 0));
     if (slot) image_slot_acquire();
     if (!req || !clef_encode_request(S.e->tok, req, opts, &j.rec, err, sizeof(err))) {
         if (slot) image_slot_release();
@@ -720,6 +727,9 @@ int main(int argc, char **argv) {
     S.batch_tokens = 4096;
     S.strict = true;
     S.max_images = 4;
+    S.max_videos = 1;
+    S.max_video_frames = 32;
+    S.max_video_tokens = 1024;
     S.max_image_tokens = 1024;
     S.max_image_pixels = 16777216;
     S.max_image_requests = 8;
@@ -754,6 +764,13 @@ int main(int argc, char **argv) {
         }
         else if (!strcmp(argv[i], "--template-cache")) S.template_cache = true;
         else if (!strcmp(argv[i], "--max-conn") && i + 1 < argc) S.max_conn = atoi(argv[++i]);
+        else if ((!strcmp(argv[i], "--max-videos") || !strcmp(argv[i], "--max-video-frames") || !strcmp(argv[i], "--max-video-tokens")) && i + 1 < argc) {
+            const char *flag = argv[i]; size_t v;
+            if (!parse_size(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef-server: %s must be a whole number (0 = processor/context limit)\n", flag); return 2; }
+            if (!strcmp(flag, "--max-videos")) S.max_videos = (int)v;
+            else if (!strcmp(flag, "--max-video-frames")) S.max_video_frames = (int)v;
+            else S.max_video_tokens = (long)v;
+        }
         else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
             /* whole numbers only: atoi turned a typo into 0, which means unlimited (review #3) */
             size_t v;
@@ -778,7 +795,8 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr, "usage: clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] "
                             "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N] "
-                            "[--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-image-requests N]\n");
+                            "[--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-image-requests N] "
+                            "[--max-videos N] [--max-video-frames N] [--max-video-tokens N]\n");
             return 2;
         }
     }
@@ -814,9 +832,12 @@ int main(int argc, char **argv) {
     fprintf(stderr, "clef-server: over-long state is %s\n", S.truncate ? "truncated silently (reference behaviour)" : "rejected");
     if (S.e->vision.image_token_id)
         fprintf(stderr, "clef-server: images: at most %d per request, %ld tokens each after resizing, %ld source pixels each; "
-                        "%d image requests decoded or queued at once (0 = unlimited)\n",
+                        "%d image/video requests decoded or queued at once (0 = unlimited)\n",
                 S.max_images, S.max_image_tokens, S.max_image_pixels, S.max_image_requests);
     else fprintf(stderr, "clef-server: this model file has no vision tower; requests with images are rejected\n");
+    if (S.e->vision.image_token_id)
+        fprintf(stderr, "clef-server: videos: at most %d per request, %d sampled frames and %ld tokens each (0 = processor/context limit)\n",
+                S.max_videos, S.max_video_frames, S.max_video_tokens);
     if (S.keep_warm_ms) fprintf(stderr, "clef-server: keep-warm pass every %d ms while idle\n", S.keep_warm_ms);
     else fprintf(stderr, "clef-server: keep-warm off\n");
     if (S.cache_bytes) fprintf(stderr, "clef-server: prefix cache of %zu MB for requests with X-Clef-Prefix-Cache\n", S.cache_bytes >> 20);

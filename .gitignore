@@ -38,6 +38,7 @@ __pycache__/
 /vision-attention-bench
 /vision-gemm-bench
 /image-bench
+/video-host-bench
 /tests/test-vision-buffers
 /tests/test-base64
 /tests/test-vision-config

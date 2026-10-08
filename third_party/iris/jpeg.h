@@ -93,7 +93,9 @@
  *     out of frame order is refused, and a refinement scan needs Al = Ah - 1;
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
  *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
- *     result for it depends on how its input is buffered. */
+ *     result for it depends on how its input is buffered.
+ * Review #3 scan-work regressions (tests/test_jpeg_regressions.py): progressive scans must
+ * follow the recorded bitplanes and consume a cumulative block-visit budget before decoding. */
 #ifndef JPEG_MAX_INPUT_BYTES
 #define JPEG_MAX_INPUT_BYTES (64u * 1024u * 1024u)
 #endif
@@ -102,6 +104,14 @@
 #endif
 #ifndef JPEG_MAX_PIXELS
 #define JPEG_MAX_PIXELS (64u * 1024u * 1024u)
+#endif
+
+#ifndef JPEG_MAX_SCAN_BLOCKS
+/* At the source-pixel cap, allow 16 full-resolution block passes. Charge every component
+ * and scan, including empty entropy and EOB runs. Smaller images can have more passes;
+ * this is a work limit, not a scan-count limit. The floor preserves tiny progressive images
+ * when the caller sets a tiny pixel cap. Excessive legal progressions are refused. */
+#define JPEG_MAX_SCAN_BLOCKS (JPEG_MAX_PIXELS < 4096u ? 1024u : JPEG_MAX_PIXELS / 4u)
 #endif
 
 #ifdef __cplusplus
@@ -265,6 +275,7 @@ typedef struct {
     int num_components;
     int restart_interval;
     int is_progressive;
+    size_t scan_blocks_left;
 
     /* Component info */
     struct {
@@ -1195,6 +1206,14 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
      * end of the scan (refused), where libjpeg decodes the file. */
     if (dec->ss == 0 && num_scan_comps > 1) {
         /* DC scan - interleaved MCUs */
+        size_t blocks_per_mcu = 0;
+        for (int i = 0; i < num_scan_comps; i++) {
+            int ci = scan_comps[i];
+            blocks_per_mcu += (size_t)dec->comp[ci].h_samp * dec->comp[ci].v_samp;
+        }
+        size_t mcus = (size_t)dec->mcus_x * dec->mcus_y;
+        if (mcus > dec->scan_blocks_left / blocks_per_mcu) return -1;
+        dec->scan_blocks_left -= mcus * blocks_per_mcu;
         for (int mcu_y = 0; mcu_y < dec->mcus_y; mcu_y++) {
             for (int mcu_x = 0; mcu_x < dec->mcus_x; mcu_x++) {
                 /* Handle restart interval */
@@ -1260,6 +1279,9 @@ static int jpeg_decode_progressive_scan(jpeg_decoder *dec, int *scan_comps, int 
         int comp_height = (dec->height * v_samp + dec->max_v_samp - 1) / dec->max_v_samp;
         int scan_blocks_x = (comp_width + 7) / 8;
         int scan_blocks_y = (comp_height + 7) / 8;
+        size_t scan_blocks = (size_t)scan_blocks_x * scan_blocks_y;
+        if (scan_blocks > dec->scan_blocks_left) return -1;
+        dec->scan_blocks_left -= scan_blocks;
 
         /* MCU-aligned block dimensions (for storage indexing) */
         int store_blocks_x = dec->comp[comp_idx].blocks_x;
@@ -1362,6 +1384,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
     jpeg_decoder dec;
     memset(&dec, 0, sizeof(dec));
     memset(dec.coef_bits, -1, sizeof(dec.coef_bits));
+    dec.scan_blocks_left = JPEG_MAX_SCAN_BLOCKS;
 
     size_t pos = 2;
     jpeg_image *img = NULL;
@@ -1570,6 +1593,8 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
              * the first SOS (jdapimin.c default_decompress_parms), so later markers do not count. */
             const uint8_t *d = file_data + pos + 2;
             const size_t n = seg_len >= 2 ? (size_t)seg_len - 2 : 0;
+            /* Pillow refuses a recognized JFIF header missing its fixed fields. */
+            if (marker == 0xE0 && n >= 5 && n < 14 && !memcmp(d, "JFIF\0", 5)) goto fail;
             if (marker == 0xE0 && n >= 14 && !memcmp(d, "JFIF\0", 5)) dec.saw_jfif = 1;
             if (marker == 0xEE && n >= 12 && !memcmp(d, "Adobe", 5)) { dec.saw_adobe = 1; dec.adobe_transform = d[11]; }
 
@@ -1635,6 +1660,16 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.ah != 0 && dec.al != dec.ah - 1) goto fail;
                 if (dec.ss == 0 && dec.se != 0) goto fail;      /* a DC scan carries DC only */
                 if (dec.ss != 0 && ns != 1) goto fail;          /* AC scans are one component */
+                /* Reject repeated introductions and out-of-order refinements before the
+                 * image-sized traversal. The state is advanced only after a decoded scan;
+                 * the separate block budget also bounds valid split-band progressions. */
+                for (int i = 0; i < ns; i++) {
+                    const int8_t *state = dec.coef_bits[scan_comps[i]];
+                    if (dec.ss && state[0] < 0) goto fail;
+                    for (int k = dec.ss; k <= dec.se; k++) {
+                        if (dec.ah == 0 ? state[k] != -1 : state[k] != dec.ah) goto fail;
+                    }
+                }
             } else if (dec.ss != 0 || dec.se != 63 || dec.ah != 0 || dec.al != 0) {
                 goto fail;
             }

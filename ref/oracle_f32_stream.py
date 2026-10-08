@@ -26,6 +26,7 @@ from safetensors.torch import save_file
 sys.path.insert(0, str(Path(__file__).parent))
 import corpus  # noqa: E402
 import corpus_vision  # noqa: E402
+import corpus_video  # noqa: E402
 import golden_io  # noqa: E402
 from oracle import with_pil_images  # noqa: E402
 
@@ -39,7 +40,7 @@ def main() -> None:
     ap.add_argument("--safe-attn", action="store_true", help="head-chunked SDPA (MPS >= 2^32 offset bug, ref/safe_attn.py)")
     ap.add_argument("--only", nargs="*", help="request ids to run (default: all); all of them are dumped")
     ap.add_argument("--dump-last", type=int, default=0, help="dump only the last N token rows per layer")
-    ap.add_argument("--corpus", default="text", choices=["text", "vision"])
+    ap.add_argument("--corpus", default="text", choices=["text", "vision", "video"])
     args = ap.parse_args()
 
     sys.path.insert(0, str(args.model_dir.resolve()))
@@ -60,7 +61,7 @@ def main() -> None:
     tm = full.language_model                                 # Qwen3_5TextModel
     base = model.language_model
 
-    requests = corpus.build() if args.corpus == "text" else corpus_vision.build()
+    requests = {"text": corpus, "vision": corpus_vision, "video": corpus_video}[args.corpus].build()
     if args.only:
         requests = [r for r in requests if r["id"] in set(args.only)]
         args.dump_layers = len(requests)
@@ -80,12 +81,18 @@ def main() -> None:
             dump_vision = {}
             if e.media is not None:
                 # Qwen3_5Model.forward: image features over the placeholder rows, positions from get_rope_index
-                feats = full.visual(media["pixel_values"].float(), grid_thw=media["image_grid_thw"]).pooler_output
-                for k, f in enumerate(torch.split(feats, (media["image_grid_thw"].prod(-1) // 4).tolist())):
-                    dump_vision[f"vision.{k}"] = f.float().cpu().clone()
-                mask_img = (b["input_ids"] == full.config.image_token_id).unsqueeze(-1).expand_as(h)
-                h = h.masked_scatter(mask_img, feats.to(h.dtype))
-                pos3, _ = full.get_rope_index(b["input_ids"], media["mm_token_type_ids"], image_grid_thw=media["image_grid_thw"],
+                for pixels, grid, token_id in [("pixel_values", "image_grid_thw", full.config.image_token_id),
+                                               ("pixel_values_videos", "video_grid_thw", full.config.video_token_id)]:
+                    if pixels not in media:
+                        continue
+                    feats = full.visual(media[pixels].float(), grid_thw=media[grid]).pooler_output
+                    sizes = [hh * ww // 4 for tt, hh, ww in media[grid].tolist() for _ in range(tt)]
+                    for f in torch.split(feats, sizes):
+                        dump_vision[f"vision.{len(dump_vision)}"] = f.float().cpu().clone()
+                    mask_img = (b["input_ids"] == token_id).unsqueeze(-1).expand_as(h)
+                    h = h.masked_scatter(mask_img, feats.to(h.dtype))
+                pos3, _ = full.get_rope_index(b["input_ids"], media["mm_token_type_ids"], image_grid_thw=media.get("image_grid_thw"),
+                                              video_grid_thw=media.get("video_grid_thw"),
                                               attention_mask=b["attention_mask"])
                 pos3 = pos3.to(dev)
                 positions[i] = pos3[:, 0].cpu().tolist()

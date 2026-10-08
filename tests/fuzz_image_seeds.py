@@ -3,6 +3,7 @@ across subsampling, progressive, grayscale, restart intervals and quality, plus 
 the regression tests keep (tests/test_image.py). Usage: fuzz_image_seeds.py OUT_DIR"""
 import base64
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -11,6 +12,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_image  # noqa: E402  (crafted JPEGs; its main() only runs as a script)
+import test_jpeg_regressions  # noqa: E402
 
 out = Path(sys.argv[1])
 out.mkdir(parents=True, exist_ok=True)
@@ -92,4 +94,13 @@ save(data[:first_idat] + empty + data[first_idat:], "empty-first-idat.png")
 # a sequential frame with one scan per component (Codex on a82292d)
 save(base64.b64decode(test_image.SEQUENTIAL_SCAN_PER_COMPONENT_JPEG), "sequential-scan-per-component.jpg")
 save(test_image.with_scan_order(base64.b64decode(test_image.SEQUENTIAL_Y_THEN_CBCR_JPEG), 1, (1, 0)), "sequential-cr-then-cb.jpg")
+for case in json.loads(test_jpeg_regressions.FIXTURES.read_text()):
+    save(base64.b64decode(case['base64']), 'separate-dc-' + case['name'] + '.jpg')
+save(test_jpeg_regressions.progressive([(0, 0, 1, 0)] * 1000, entropy=False), 'repeated-refinement.jpg')
+save(test_jpeg_regressions.spectral_work_bomb(512, 512), 'split-band-work.jpg')
+save(test_jpeg_regressions.progressive([(0, 0, 0, 1), (1, 5, 0, 1), (4, 9, 0, 1)]), 'overlapping-bands.jpg')
+for progressive in [False, True]:
+    buf = io.BytesIO()
+    Image.fromarray(arr(41, 57, 3)).save(buf, 'JPEG', keep_rgb=True, progressive=progressive)
+    save(buf.getvalue(), f'rgb-{progressive}.jpg')
 print(f"{n} seeds in {out}")

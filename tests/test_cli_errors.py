@@ -38,7 +38,8 @@ class CliErrors(unittest.TestCase):
         for args in (["--max-images", "-1"], ["--max-image-tokens", "-5"], ["--max-images", "foo"], ["--max-image-tokens", "1k"],
                      ["--max-images", ""], ["--max-image-tokens", "99999999999999999999"],
                      ["--max-image-pixels", "16M"], ["--max-image-pixels", "-1"], ["--max-image-requests", "x"],
-                     ["--max-image-requests", "99999999999"]):
+                     ["--max-image-requests", "99999999999"], ["--max-videos", "-1"],
+                     ["--max-video-frames", "32x"], ["--max-video-tokens", "99999999999999999"]):
             for binary in ("clef", "clef-server"):
                 if args[0] == "--max-image-requests" and binary == "clef":
                     continue   # the server's admission bound; the CLI encodes one request at a time

@@ -1,4 +1,5 @@
 #include "clef_record.h"
+#include "clef_video.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -113,6 +114,165 @@ static bool tok_jbuf(const clef_tokenizer *tok, jbuf *b, bool split, clef_tokens
     return ok;
 }
 
+static bool nonnegative_int(const jval *v, long *out) {
+    if (!v || v->type != J_INT || !v->len || v->len > 10) return false;
+    char s[12]; memcpy(s, v->s, v->len); s[v->len] = 0;
+    char *end; errno = 0;
+    long n = strtol(s, &end, 10);
+    if (errno || *end || n < 0 || n > INT32_MAX) return false;
+    *out = n; return true;
+}
+
+static bool positive_int(const jval *v, long *out) {
+    return nonnegative_int(v, out) && *out > 0;
+}
+
+static bool positive_number(const jval *v, double *out) {
+    if (!v || (v->type != J_INT && v->type != J_FLOAT)) return false;
+    double value = v->f;
+    if (v->type == J_INT) {
+        long n;
+        if (!positive_int(v, &n)) return false;
+        value = (double)n;
+    }
+    if (!isfinite(value) || value <= 0 || value > 1000) return false;
+    *out = value; return true;
+}
+
+static bool decode_frame(const jval *im, size_t index, long limit, clef_rgb *rgb, char *err, size_t errlen) {
+    uint8_t *bytes = NULL; size_t size = 0;
+    if (!image_bytes(im, index, &bytes, &size, err, errlen)) return false;
+    bool ok = clef_image_decode_limited(bytes, size, limit, rgb, err, errlen);
+    free(bytes);
+    return ok;
+}
+
+static bool encode_video(const clef_tokenizer *tok, const jval *input, const jval *kwargs, int group,
+                         clef_encode_opts opts, size_t *reserve, clef_record *out, char *err, size_t errlen) {
+    long min_px = CLEF_VIDEO_MIN_PIXELS, max_px = CLEF_VIDEO_MAX_PIXELS, requested = 0;
+    double sample_fps = 2;
+    bool sample = true, explicit_fps = false;
+    if (kwargs) {
+        if (kwargs->type != J_OBJECT) return fail(err, errlen, "videos_kwargs must be an object", NULL, 0);
+        for (size_t i = 0; i < kwargs->n; i++) {
+            const jmember *m = &kwargs->members[i];
+            if (m->klen == 16 && !memcmp(m->key, "do_sample_frames", 16)) {
+                if (m->val->type != J_TRUE && m->val->type != J_FALSE) return fail(err, errlen, "do_sample_frames must be boolean", NULL, 0);
+                sample = m->val->type == J_TRUE;
+            } else if (m->klen == 10 && !memcmp(m->key, "num_frames", 10)) {
+                if (!positive_int(m->val, &requested)) return fail(err, errlen, "num_frames must be a positive integer", NULL, 0);
+            } else if (m->klen == 3 && !memcmp(m->key, "fps", 3)) {
+                explicit_fps = m->val->type != J_NULL;
+                if (explicit_fps && !positive_number(m->val, &sample_fps)) return fail(err, errlen, "sampling fps must be finite and in (0,1000]", NULL, 0);
+            } else if (m->klen == 4 && !memcmp(m->key, "size", 4)) {
+                const jval *s = m->val;
+                if (s->type != J_OBJECT || s->n != 2 || !positive_int(json_get(s, "shortest_edge"), &min_px) ||
+                    !positive_int(json_get(s, "longest_edge"), &max_px) || min_px > max_px)
+                    return fail(err, errlen, "video size needs positive shortest_edge <= longest_edge", NULL, 0);
+            } else return fail(err, errlen, "unsupported videos_kwargs: %.*s", m->key, m->klen);
+        }
+    }
+    if ((requested && explicit_fps) || (!sample && (requested || explicit_fps)))
+        return fail(err, errlen, "choose sampling fps or num_frames; neither with do_sample_frames=false", NULL, 0);
+
+    const jval *frames = input->type == J_OBJECT ? json_get(input, "frames") : NULL;
+    if (!frames) return fail(err, errlen, "video must be {frames,fps}; convert MP4/MOV with tools/video_request.py", NULL, 0);
+    const jval *source_indices = json_get(input, "frame_indices"), *total = json_get(input, "total_num_frames");
+    struct { int frames, width, height; double fps; } info = {0};
+    clef_rgb first = {0}, second = {0};
+    bool ok = false;
+    if (frames->type != J_ARRAY || frames->n < 1 || frames->n > CLEF_VIDEO_MAX_SOURCE_FRAMES ||
+        !positive_number(json_get(input, "fps"), &info.fps) || frames->n / info.fps > 600)
+        return fail(err, errlen, "frames must contain 1..18000 images with positive fps and duration <= 600 seconds", NULL, 0);
+    if (input->n != (source_indices ? 4u : 2u) || !!source_indices != !!total)
+        return fail(err, errlen, "frame video accepts frames, fps and optional frame_indices with total_num_frames", NULL, 0);
+    int source_map[CLEF_VIDEO_MAX_FRAMES];
+    if (source_indices) {
+        long source_count;
+        if (sample || frames->n > CLEF_VIDEO_MAX_FRAMES || source_indices->type != J_ARRAY || source_indices->n != frames->n ||
+            !positive_int(total, &source_count) || source_count > CLEF_VIDEO_MAX_SOURCE_FRAMES || source_count / info.fps > 600)
+            return fail(err, errlen, "frame_indices requires do_sample_frames=false, one index per frame and a bounded total_num_frames", NULL, 0);
+        long previous = -1;
+        for (size_t i = 0; i < source_indices->n; i++) {
+            const jval *v = source_indices->items[i];
+            long index;
+            if (!nonnegative_int(v, &index) || index <= previous || index >= source_count)
+                return fail(err, errlen, "frame_indices must be strictly increasing integers in [0,total_num_frames)", NULL, 0);
+            source_map[i] = (int)index;
+            previous = index;
+        }
+    }
+    info.frames = (int)frames->n;
+    if (!decode_frame(frames->items[0], 0, opts.vision.max_image_pixels, &first, err, errlen)) goto done;
+    info.width = first.width; info.height = first.height;
+    int count = info.frames;
+    if (sample) {
+        if (requested) count = requested > CLEF_VIDEO_MAX_FRAMES ? CLEF_VIDEO_MAX_FRAMES + 1 : (int)requested;
+        else {
+            double wanted = trunc(info.frames / info.fps * sample_fps);
+            count = (int)fmin(fmax(wanted, 4), CLEF_VIDEO_MAX_FRAMES);
+            if (count > info.frames) count = info.frames;
+        }
+    }
+    if (count < 1 || count > info.frames || count > CLEF_VIDEO_MAX_FRAMES ||
+        (opts.vision.max_video_frames > 0 && count > opts.vision.max_video_frames)) {
+        snprintf(err, errlen, "video has %d sampled frames, above the limit of %d or its source count; lower videos_kwargs.fps/num_frames",
+                 count, opts.vision.max_video_frames > 0 ? opts.vision.max_video_frames : CLEF_VIDEO_MAX_FRAMES);
+        goto done;
+    }
+    int rh, rw;
+    if (!clef_video_resize(count, info.height, info.width, min_px, max_px, &rh, &rw, err, errlen)) goto done;
+    int groups = (count + 1) / 2;
+    long tokens = (long)groups * (rh / 32) * (rw / 32);
+    if (opts.vision.max_video_tokens > 0 && tokens > opts.vision.max_video_tokens) {
+        snprintf(err, errlen, "video resizes to %ld tokens, above the limit of %ld per video; lower videos_kwargs.size.longest_edge", tokens, opts.vision.max_video_tokens);
+        goto done;
+    }
+    int indices[CLEF_VIDEO_MAX_FRAMES];
+    double timestamps[CLEF_VIDEO_MAX_FRAMES / 2];
+    for (int i = 0; i < count; i++) indices[i] = sample && count > 1 ? (int)rint(i * ((info.frames - 1.0) / (count - 1))) : sample ? 0 : i;
+    /* NumPy linspace explicitly writes its endpoint after multiplication. */
+    if (sample && count > 1) indices[count - 1] = info.frames - 1;
+    size_t extra = 2 + 2 * (size_t)groups;  /* reference retains the original outer video wrapper */
+    for (int i = 0; i < groups; i++) {
+        int a = indices[i * 2], b = indices[i * 2 + 1 < count ? i * 2 + 1 : i * 2];
+        /* An adapter may have sampled already. Keep the original source indices and FPS,
+         * otherwise timestamps shrink to the duration of the supplied frame array. */
+        int source_a = source_indices ? source_map[a] : a;
+        int source_b = source_indices ? source_map[b] : b;
+        timestamps[i] = (source_a / info.fps + source_b / info.fps) / 2;
+        char stamp[64]; snprintf(stamp, sizeof(stamp), "<%.1f seconds>", timestamps[i]);
+        clef_tokens t = {0};
+        bool encoded = tok_z(tok, stamp, false, &t);
+        extra += t.len; clef_tokens_free(&t);
+        if (!encoded) { fail(err, errlen, "out of memory (timestamp)", NULL, 0); goto done; }
+    }
+    if ((size_t)tokens + out->n_image_tokens + *reserve + extra > (size_t)opts.max_length) {
+        fail(err, errlen, "video tokens and prompt cannot fit the context", NULL, 0); goto done;
+    }
+    clef_image_ref *refs = realloc(out->images, ((size_t)out->n_images + groups) * sizeof(*refs));
+    if (!refs) { fail(err, errlen, "out of memory (video groups)", NULL, 0); goto done; }
+    out->images = refs;
+    for (int i = 0; i < groups; i++) {
+        int a = indices[2 * i], b = indices[2 * i + 1 < count ? 2 * i + 1 : 2 * i];
+        /* Uniform sampling starts at frame zero, already decoded for geometry and limits. */
+        if (i && !decode_frame(frames->items[a], a, opts.vision.max_image_pixels, &first, err, errlen)) goto done;
+        if (a != b && !decode_frame(frames->items[b], b, opts.vision.max_image_pixels, &second, err, errlen)) goto done;
+        if (first.width != info.width || first.height != info.height) { fail(err, errlen, "video frame dimensions differ", NULL, 0); goto done; }
+        clef_image_ref *r = &out->images[out->n_images];
+        memset(r, 0, sizeof(*r));
+        if (!clef_video_pair_preprocess(&first, a == b ? &first : &second, rh, rw, &r->pt, err, errlen)) goto done;
+        r->video_group = group; r->timestamp = timestamps[i];
+        out->n_images++; out->n_image_tokens += r->pt.n_tokens;
+        clef_rgb_free(&first); clef_rgb_free(&second);
+    }
+    *reserve += extra;
+    ok = true;
+done:
+    clef_rgb_free(&first); clef_rgb_free(&second);
+    return ok;
+}
+
 typedef struct { const char *id; size_t id_len; const jval *desc; } option;
 
 static int option_cmp(const void *a, const void *b) {
@@ -137,11 +297,11 @@ void clef_record_free(clef_record *r) {
     memset(r, 0, sizeof(*r));
 }
 
-/* Decodes and preprocesses the request's images into out->images. It runs after the schema, and
- * the state when truncation is refused, are tokenized; reserved_tokens counts them toward each
- * image's budget (see the reserve below). */
-static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval *images, size_t n_images,
-                          clef_encode_opts opts, size_t reserved_tokens, clef_record *out, char *err, size_t errlen) {
+/* Decodes and preprocesses images and video frame pairs into out->images, after the schema
+ * and any untruncated state have been tokenized. Their tokens count toward every media budget. */
+static bool encode_media(const clef_tokenizer *tok, const jval *req, const jval *images, size_t n_images,
+                         const jval *videos, size_t n_videos,
+                         clef_encode_opts opts, size_t reserved_tokens, clef_record *out, char *err, size_t errlen) {
     /* media_kwargs: the reference forwards them to the processor; only its pixel bounds are
      * taken here (deliberate divergence: other processor arguments are rejected, not ignored).
      * The processor applies the bounds only when both are given and silently ignores a lone
@@ -150,11 +310,12 @@ static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval
     const jval *mk = json_get(req, "media_kwargs");
     if (mk && mk->type != J_NULL) {
         if (mk->type != J_OBJECT) return fail(err, errlen, "media_kwargs must be an object", NULL, 0);
-        /* n counts distinct keys: the DOM merges a repeated key as json.loads does (clef_json.h), so
-         * {"min_pixels": a, "min_pixels": b} is one member and refused here like any lone bound. */
-        if (mk->n == 1) return fail(err, errlen, "media_kwargs: give both min_pixels and max_pixels (the reference ignores one alone)", NULL, 0);
+        /* The DOM merges repeated keys as json.loads does. Test bound presence explicitly,
+         * since videos_kwargs is independent and does not supply a missing image bound. */
+        if (!!json_get(mk, "min_pixels") != !!json_get(mk, "max_pixels")) return fail(err, errlen, "media_kwargs: give both min_pixels and max_pixels (the reference ignores one alone)", NULL, 0);
         for (size_t i = 0; i < mk->n; i++) {
             const jmember *m = &mk->members[i];
+            if (n_videos && m->klen == 13 && !memcmp(m->key, "videos_kwargs", 13)) continue;
             const bool is_min = m->klen == 10 && !memcmp(m->key, "min_pixels", 10);
             const bool is_max = m->klen == 10 && !memcmp(m->key, "max_pixels", 10);
             if (!is_min && !is_max) return fail(err, errlen, "media_kwargs: only min_pixels and max_pixels are supported, not %.*s", m->key, m->klen);
@@ -201,8 +362,10 @@ static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval
         clef_tokens_free(&pt);
         if (!tok_ok) return fail(err, errlen, "out of memory", NULL, 0);
     }
-    out->images = calloc(n_images, sizeof(*out->images));
-    if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
+    if (n_images) {
+        out->images = calloc(n_images, sizeof(*out->images));
+        if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
+    }
     for (size_t i = 0; i < n_images; i++) {
         const jval *im = images->items[i];
         char ierr[256];
@@ -248,6 +411,13 @@ static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval
         if (out->n_image_tokens > INT32_MAX - tokens) return fail(err, errlen, "too many image tokens", NULL, 0);
         out->n_image_tokens += (int32_t)tokens;
     }
+    const jval *vk = mk && mk->type == J_OBJECT ? json_get(mk, "videos_kwargs") : NULL;
+    for (size_t i = 0; i < n_videos; i++) {
+        char verr[256];
+        if (!encode_video(tok, videos->items[i], vk, (int)i + 1, opts, &reserve, out, verr, sizeof(verr))) {
+            snprintf(err, errlen, "videos[%zu]: %s", i, verr); return false;
+        }
+    }
     return true;
 }
 
@@ -262,8 +432,13 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         return fail(err, errlen, "at least one question is required", NULL, 0);
     }
     const jval *images = json_get(req, "images"), *videos = json_get(req, "videos");
-    /* Deliberate divergence: the reference also takes videos (frame arrays). */
-    if (truthy(videos)) return fail(err, errlen, "videos are not supported", NULL, 0);
+    if (videos && videos->type != J_NULL && videos->type != J_ARRAY)
+        return fail(err, errlen, "videos must be a list", NULL, 0);
+    const size_t n_videos = videos && videos->type == J_ARRAY ? videos->n : 0;
+    if (n_videos && (!opts.vision.image_token_id || !opts.vision.video_token_id))
+        return fail(err, errlen, "videos are not supported by this model file (no vision tower)", NULL, 0);
+    if (n_videos > INT32_MAX || (opts.vision.max_videos > 0 && n_videos > (size_t)opts.vision.max_videos))
+        return fail(err, errlen, "too many videos per request", NULL, 0);
     /* The reference iterates record.get("images") or []: any JSON array of images; the engine
      * takes encoded images in the hosted API's forms (image_bytes). */
     if (truthy(images) && images->type != J_ARRAY) {
@@ -434,14 +609,14 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         }
     }
 
-    /* With truncation refused the state is never cut, so like the schema it is part of each image's
-     * budget: tokenize it before the images, at most max_length + 1 tokens (enough to know it cannot
+    /* With truncation refused the state is never cut, so like the schema it is part of each media
+     * budget: tokenize it before the media, at most max_length + 1 tokens (enough to know it cannot
      * fit; a limited encode is a prefix of the full one). The state check below then refuses nothing
      * new, but before any patches exist rather than after (Codex on a99a8a9). With truncation the
-     * state yields to the images and is tokenized later, as before. */
+     * state yields to the media and is tokenized later, as before. */
     bool state_done = false;
     size_t state_reserve = 0;
-    if (ok && n_images && opts.reject_truncation) {
+    if (ok && (n_images || n_videos) && opts.reject_truncation) {
         size_t cap = (size_t)opts.max_length + 1;
         if (opts.max_state_tokens >= 0 && (size_t)opts.max_state_tokens + 1 < cap) cap = (size_t)opts.max_state_tokens + 1;
         b.len = 0;
@@ -452,8 +627,9 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         state_reserve = state_ids.len;
     }
 
-    /* Images after the schema (and that state), whose lengths are part of each image's budget. */
-    if (ok && n_images && !encode_images(tok, req, images, n_images, opts, schema.len + state_reserve, out, err, errlen)) {
+    /* Media follows the schema and that state, which count toward every allocation budget. */
+    if (ok && (n_images || n_videos) && !encode_media(tok, req, images, n_images, videos, n_videos,
+                                                   opts, schema.len + state_reserve, out, err, errlen)) {
         jbuf_free(&b);
         clef_tokens_free(&schema);
         clef_tokens_free(&state_ids);
@@ -465,17 +641,28 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         jbuf_puts(&b, SYSTEM_PROMPT);
         jbuf_puts(&b, PROMPT_USER);
         ok = tok_jbuf(tok, &b, false, &prefix);   /* template: real control tokens */
-        if (ok && n_images) {
+        if (ok && out->n_images) {
             /* _encode_media: "<|vision_start|><|image_pad|><|vision_end|>" per image, then "\n",
              * tokenized by the processor, which expands each <|image_pad|> to the image's tokens.
              * These are engine-made control tokens, never request text, in both modes. */
-            for (size_t i = 0; ok && i < n_images; i++) {
+            int video_group = 0;
+            for (int i = 0; ok && i < out->n_images; i++) {
                 clef_image_ref *ir = &out->images[i];
-                ok = clef_tokens_push(&prefix, opts.vision.start_token_id);
+                if (ir->video_group != video_group) {
+                    if (video_group) ok = clef_tokens_push(&prefix, opts.vision.end_token_id);
+                    video_group = ir->video_group;
+                    if (video_group) ok = ok && clef_tokens_push(&prefix, opts.vision.start_token_id);
+                }
+                if (video_group) {
+                    char stamp[64]; snprintf(stamp, sizeof(stamp), "<%.1f seconds>", ir->timestamp);
+                    ok = ok && tok_z(tok, stamp, false, &prefix);
+                }
+                ok = ok && clef_tokens_push(&prefix, opts.vision.start_token_id);
                 ir->tok_start = (int32_t)prefix.len;
-                for (int k = 0; ok && k < ir->pt.n_tokens; k++) ok = clef_tokens_push(&prefix, opts.vision.image_token_id);
+                for (int k = 0; ok && k < ir->pt.n_tokens; k++) ok = clef_tokens_push(&prefix, video_group ? opts.vision.video_token_id : opts.vision.image_token_id);
                 ok = ok && clef_tokens_push(&prefix, opts.vision.end_token_id);
             }
+            if (video_group) ok = ok && clef_tokens_push(&prefix, opts.vision.end_token_id);
             clef_tokens nl = {0};
             ok = ok && tok_z(tok, "\n", false, &nl);
             if (ok && nl.len != 1) ok = false;   /* the tokenizer's newline is one token */
@@ -540,11 +727,15 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         /* In parity mode a literal "<|image_pad|>" in request text becomes the placeholder token;
          * the reference then fails scattering the image features ("Image features and image tokens
          * do not match"). Fail the same way instead of guessing which tokens are the images. */
-        int32_t pads = 0;
-        for (size_t i = 0; i < out->ids.len; i++) pads += out->ids.ids[i] == opts.vision.image_token_id;
-        if (pads != out->n_image_tokens) {
-            snprintf(err, errlen, "image placeholder tokens in request content: %d image tokens for %d image features",
-                     pads, out->n_image_tokens);
+        int32_t pads = 0, video_pads = 0, video_features = 0;
+        for (size_t i = 0; i < out->ids.len; i++) {
+            pads += out->ids.ids[i] == opts.vision.image_token_id;
+            video_pads += out->ids.ids[i] == opts.vision.video_token_id;
+        }
+        for (int i = 0; i < out->n_images; i++) if (out->images[i].video_group) video_features += out->images[i].pt.n_tokens;
+        if (pads != out->n_image_tokens - video_features || video_pads != video_features) {
+            snprintf(err, errlen, "%s placeholder tokens in request content do not match features",
+                     pads != out->n_image_tokens - video_features ? "image" : "video");
             return false;
         }
     }

@@ -12,7 +12,7 @@ cleffa is built after [ds4](https://github.com/antirez/ds4) by antirez and the d
 would not exist without it (see [Acknowledgements](#acknowledgements)). It is an independent
 project, not affiliated with or endorsed by Cloudflare.
 
-Text and images. BF16 weights, never quantized. Videos are not supported.
+Text, images and video. BF16 weights, never quantized.
 
 ## Requirements
 
@@ -23,6 +23,7 @@ Text and images. BF16 weights, never quantized. Videos are not supported.
   or more. The 27B's is 55 GB, so plan on 64 GB or more. Long inputs add a few GB of activations
   on top.
 - **Tools:** Xcode command-line tools (`clang`, `xxd`) and macOS's system zlib (`-lz`).
+  The optional MP4/MOV conversion tool also needs `ffmpeg` and `ffprobe` in PATH (`brew install ffmpeg`).
   Python 3.12 is needed only for conversion and tests: `uv` if installed, otherwise `python3.12`,
   plus `requirements.txt`.
 
@@ -93,6 +94,73 @@ Missing files, extra files and symbolic links fail verification; only `.cache/hu
 download bookkeeping is excluded. Remove stale `__pycache__` bytecode in an existing snapshot
 before verifying it, and run Python reference scripts with `-B` to keep the snapshot unchanged.
 Verify snapshots before invoking reference scripts directly; those scripts do not run the verifier.
+
+### Video
+
+`videos` accepts ordered frame arrays as `{"frames":[...],"fps":24}`. Each frame accepts the same
+PNG/JPEG forms as `images`; `fps` is the source frame rate. Selected frames must have identical
+dimensions, at least 32 pixels per side. The engine and server have no video codec dependency and never spawn a decoder.
+
+For MP4/MOV files, `tools/video_request.py` runs FFmpeg separately and produces the frame request.
+Create a request template with `model`, `state` and `questions`, then convert a local clip:
+
+```sh
+.venv/bin/python -B tools/video_request.py clip.mp4 --request request.json > video.jsonl
+./clef -m gguf/clef-flash.gguf video.jsonl
+# Or submit the same converted request to the server:
+curl localhost:8080/v1/systemone -H 'Content-Type: application/json' --data-binary @video.jsonl
+```
+
+The converter accepts H.264, HEVC, ProRes and MJPEG in MP4/MOV, with exactly one video track.
+Audio is ignored. It preserves stored orientation and does not apply HDR tone mapping. It takes
+regular local files, copies at most 64 MiB into a private temporary directory, disables MOV external
+data references and restricts input protocols to files. It runs as your user, without an OS sandbox.
+It is a client tool, never an HTTP upload handler. Its probe and decode share a 30-second deadline;
+on timeout the child process is killed and reaped. Source clips need a known frame count and FPS,
+at most 18,000 frames / 600 seconds and 16,777,216 pixels per frame. Sampled RGB is capped at 256 MiB.
+
+The adapter defaults to 2 FPS, at most 32 sampled frames and an 8 MiB output request, matching
+server frame/body defaults. Exceeding a cap fails explicitly. Use `--num-frames` or `--fps` to reduce
+sampling, and `--max-frames` / `--max-body` only when the receiving server allows larger requests.
+Configure the model's pixel budget through `media_kwargs.videos_kwargs.size` in the template.
+
+Conversion emits lossless PNG frames directly from FFmpeg, using bounded software decoding and
+encoding threads. It falls back to compact PNGs when the fast encoding would exceed `--max-body`.
+Frame pixels, sampling and timestamps remain identical. The engine shares vision projections
+across small frame pairs while preserving separate spatial attention for each pair.
+
+The output includes `frame_indices` and `total_num_frames` alongside the original average `fps`, with
+`media_kwargs.videos_kwargs.do_sample_frames:false`. Indices must be strictly increasing integers
+within the original source count, one per supplied frame. These fields preserve timestamps after
+sampling. The engine rejects indexed frames if sampling is enabled, and rejects compressed video
+uploads with an instruction to use the converter. Ordinary frame arrays without metadata support
+up to 18,000 source frames / 600 seconds; source FPS must be in `(0,1000]`.
+
+The processor samples uniformly at a target 2 FPS, with a minimum of four frames when available
+and a maximum of 768. A final unpaired frame is repeated for the second temporal tap. Frame-pair
+timestamps, video placeholder tokens, video resize budgets and M-RoPE match the pinned processor.
+All images precede all videos, which precede the state. Existing vision GGUFs already contain
+the necessary weights and video token ID; no reconversion is needed.
+
+Optional sampling and sizing controls live under `media_kwargs.videos_kwargs`:
+
+```json
+{"videos_kwargs":{"fps":2,"size":{"shortest_edge":4096,"longest_edge":1048576}}}
+```
+
+`size` is a budget across sampled frames, in pixels, with both positive bounds required. The
+reference defaults are 4,096 and 25,165,824. Use `num_frames` instead of `fps` to select a count,
+or `do_sample_frames:false` to keep all supplied frames. `num_frames` clears the default sampling
+FPS, equivalent to supplying `fps:null` to the reference. Other processor controls are rejected.
+Top-level `media_kwargs.min_pixels`/`max_pixels` continue to control still images only.
+
+Server defaults allow one video, 32 sampled frames and 1,024 total tokens per video. Configure
+these with `--max-videos`, `--max-video-frames`, and `--max-video-tokens`; 0 uses the processor
+and context bounds, as the CLI does by default. Limits reject requests without silently reducing
+resolution or sampling rate. `--max-image-pixels` also bounds each video source frame, and
+`--max-image-requests` counts both image and video requests. Video token/context limits are
+checked before resizing or allocating patches.
+Prefix and template caches support videos, with exact patch identity and timestamp-token matching.
 
 ### Server
 
@@ -752,8 +820,8 @@ differently:
 - score criteria that are not a list;
 - noul criteria given as a list of pairs;
 - a question with an empty id and no instructions (the reference returns NaN);
-- videos;
-- `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
+- video formats, source sizes, durations or sample counts outside the limits described above;
+- `media_kwargs` other than the documented image bounds and `videos_kwargs`, or only one image bound (the
   processor silently ignores a lone bound); bounds that are not positive integers within int32;
 - a data URL whose media type is not `image/png` or `image/jpeg`, or contradicts the bytes (the
   reference's PIL decode ignores the label);

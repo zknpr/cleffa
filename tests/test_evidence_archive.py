@@ -140,6 +140,18 @@ class EvidenceArchive(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def test_video_oracle_selection(self):
+        oracle = self.root / 'clef-flash-video-f32'
+        (oracle / 'layers').mkdir(parents=True)
+        (oracle / 'requests.jsonl').write_text('{"id":"vd000","videos":[]}\n')
+        (oracle / 'encoded.jsonl').write_text('{"id":"vd000","input_ids":[1]}\n')
+        (oracle / 'layers' / 'vd000.safetensors').write_bytes(b'\0' * 10)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'video.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertIn('clef-flash-video-f32/requests.jsonl', names)
+        self.assertIn('clef-flash-video-f32/encoded.jsonl', names)
+        self.assertNotIn('clef-flash-video-f32/layers/vd000.safetensors', names)
+
     def test_selection_and_rewrite(self):
         out = Path(self.tmp.name) / 'ev.tar.gz'
         manifest = ea.build(self.root, out, 'ev')
