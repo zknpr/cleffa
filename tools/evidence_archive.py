@@ -27,8 +27,10 @@ Excluded
     clef* sources, Makefile and documents), since the repository holds the source; result
     files and an experiment's own probe programs stored beside it stay
   - the ds4 upstream `source/` tree, every `article-*` directory at any depth (private
-    workload), any path that itself matches a FORBIDDEN pattern, and the
-    text extracts of Apple's Metal Shading Language specification
+    workload), every `showcase-*` directory at any depth (the showcase app, a private
+    repository), every top-level `*worktree-transfer*` directory (a pre-merge copy of engine
+    sources and a patch, not a measurement), any path that itself matches a FORBIDDEN pattern,
+    and the text extracts of Apple's Metal Shading Language specification
   - every other undated directory, Cloudflare subscription and usage dumps (`subscriptions.json`,
     `usage-*.json`) and agents'
     `checkpoint*.json` working-state files
@@ -321,6 +323,10 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
         return 'trace or dSYM bundle'
     if any(part.lower().startswith('article-') for part in ancestors):   # any capitalization (review #90)
         return 'private workload directory'
+    if any(part.lower().startswith('showcase-') for part in ancestors):
+        return 'private showcase app'   # dated, but its repository is private (Codex on PR #5)
+    if 'worktree-transfer' in top.lower():
+        return 'worktree transfer bundle'   # copied engine sources and a patch, not evidence
     if top.lower().startswith('ds4-') and len(ancestors) >= 2 and parts[1].lower() == 'source':
         return 'upstream clone'
     if copied_source(golden, parts, directory):
