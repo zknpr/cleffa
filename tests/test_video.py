@@ -87,6 +87,13 @@ def main():
     req = copy.deepcopy(base); req['state'] = '<|video_pad|>'; bad.append(req)
     for i, req in enumerate(bad):
         assert native(req).startswith('ERR'), ('accepted invalid input', i)
+    # A size mismatch in either frame of a pair must name the dimensions, not fall through to
+    # the pair preprocessor's generic geometry error. base samples frames [0, 3, 5, 8]:
+    # frame 5 opens the second pair and frame 8 closes it.
+    odd = corpus_video.image(corpus_video.frames(1, 64, 64)[0])
+    for position in [5, 8]:
+        req = copy.deepcopy(base); req['videos'][0]['frames'][position] = odd
+        assert 'video frame dimensions differ' in native(req), ('pair frame size message', position)
     assert not native(bad[-1], 'encode-strict').startswith('ERR')
     # Uniform adapter sampling must preserve every token and temporal patch of core sampling.
     assert native(cases[0]) == native(cases[5])

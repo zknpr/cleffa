@@ -152,6 +152,7 @@ static int run(int c) {
         return 1;
     }
     printf("jpeg ub: case %d %s: %s\n", c, names[c], ok ? "decoded" : "refused");
+    if (ok) clef_rgb_free(&rgb);
     return 0;
 }
 

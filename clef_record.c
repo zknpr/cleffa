@@ -258,7 +258,10 @@ static bool encode_video(const clef_tokenizer *tok, const jval *input, const jva
         /* Uniform sampling starts at frame zero, already decoded for geometry and limits. */
         if (i && !decode_frame(frames->items[a], a, opts.vision.max_image_pixels, &first, err, errlen)) goto done;
         if (a != b && !decode_frame(frames->items[b], b, opts.vision.max_image_pixels, &second, err, errlen)) goto done;
-        if (first.width != info.width || first.height != info.height) { fail(err, errlen, "video frame dimensions differ", NULL, 0); goto done; }
+        if (first.width != info.width || first.height != info.height ||
+            (a != b && (second.width != info.width || second.height != info.height))) {
+            fail(err, errlen, "video frame dimensions differ", NULL, 0); goto done;
+        }
         clef_image_ref *r = &out->images[out->n_images];
         memset(r, 0, sizeof(*r));
         if (!clef_video_pair_preprocess(&first, a == b ? &first : &second, rh, rw, &r->pt, err, errlen)) goto done;
