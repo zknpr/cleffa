@@ -65,7 +65,8 @@ make clean
   first scan, blocks with IDCT output beyond [-512, 511] refused because libjpeg's C and NEON paths
   disagree there, sequential frames split across scans buffered and finished like progressive
   ones, a scan before the frame header or a second frame header refused, scan components looked up
-  from the scan position on as libjpeg does, refinement scans required to have Al = Ah - 1) and
+  from the scan position on as libjpeg does, refinement scans required to have Al = Ah - 1, a scan
+  whose entropy data ends early refused) and
   optional PNG inflate/CRC hooks, and `png.h` skips empty IDAT chunks. `clef_image.c` passes the per-call source-pixel limit through
   the `PNG_MAX_PIXELS`/`JPEG_MAX_PIXELS` macros (a thread-local).
   `clef_image.c` supplies macOS zlib hooks with fixed-size output and complete-stream checks;

@@ -57,7 +57,8 @@ table must be defined by its first scan and is latched there as libjpeg does, an
 IDCT output leaves [-512, 511], where libjpeg's builds disagree, is refused. A sequential frame may
 split its components across scans, which are buffered and finished like a progressive frame's, and
 a scan before the frame header, or a second frame header, is refused. Scan components are looked
-up from the scan position on, as libjpeg does, and a refinement scan must have Al = Ah - 1. `clef_image.c` includes the
+up from the scan position on, as libjpeg does, and a refinement scan must have Al = Ah - 1. A scan
+whose entropy data ends early is refused. `clef_image.c` includes the
 headers and sets their limits; `tests/test_image.py` checks their output against Pillow, and it and
 `tests/test_jpeg_ub.c` hold the crafted files behind those changes. The PNG header skips empty IDAT chunks and has optional inflate and CRC32 hooks;
 cleffa supplies these through the system zlib library, preserving size and checksum validation.

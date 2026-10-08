@@ -379,6 +379,21 @@ its placeholder check after being decoded and preprocessed. The loader now requi
 end and video ids to be distinct, as they are in both released models; three crafted headers
 (start equal to image, end equal to image, start equal to end) loaded before and are refused now.
 
+A fourteenth round (Codex on `b6cbe49`) raised one point. (37) Confirmed, measured on Pillow
+progressive and baseline files cut two or six bytes before EOI, with and without the EOI. The bit
+reader pads past a scan's data with 1-bits, and the progressive decoders took a Huffman failure there
+as an implicit EOB. A progressive scan cut short therefore decoded without error: up to 50 levels
+from Pillow when the file kept its EOI, where libjpeg fills the gap with a "premature end of data
+segment" warning, and accepted when it had no EOI, where Pillow refuses it as truncated. Baseline
+scans were refused in both forms already. A Huffman failure is now a failure everywhere, and the
+reader counts the padding it appends, so a scan that consumed any of it, even inside a code that
+happened to decode, is refused (`jpeg_overran`); lookahead may still buffer padding without
+consuming it. Every cut file is refused now, Pillow's warning case as a deliberate divergence listed
+in the README. `tests/test_image.py` adds a progressive file cut with and without EOI (both decoded
+before); all 98 parity images and 1,925 corpus files still decode identically. A 15-minute
+differential run on the result executed 133.7 million inputs with no finding
+(`golden/fuzz-image-2026-10-07/review14/`).
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to

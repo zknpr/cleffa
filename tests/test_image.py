@@ -727,7 +727,13 @@ def main() -> None:
             seg = bytearray(segs_[refine][1])
             seg[5 + 2 * seg[4] + 2] = value
             return b"".join(bytes(seg) if i == refine else s for i, (_, s) in enumerate(segs_))
-        for name, data in (("scan-order-102", with_scan_order(rgb.getvalue(), 0, (1, 0, 2))),
+        # A progressive file whose last scan's data ends two bytes early, with and without EOI: libjpeg
+        # fills the gap with a "premature end of data segment" warning and Pillow refuses the file
+        # without EOI, but the decoder treated the gap as an EOB and returned pixels either way, up to
+        # 50 levels from Pillow's (Codex on b6cbe49). Baseline scans were already refused.
+        cut = prog.getvalue()[:-4]
+        for name, data in (("prog-cut-eoi", cut + b"\xff\xd9"), ("prog-cut-no-eoi", cut),
+                           ("scan-order-102", with_scan_order(rgb.getvalue(), 0, (1, 0, 2))),
                            ("scan-order-210", with_scan_order(rgb.getvalue(), 0, (2, 1, 0))),
                            ("refine-ah2-al0", with_ahal(0x20)), ("refine-ah1-al1", with_ahal(0x11)),
                            ("sos-before-sof", scan_first), ("two-sof", two_frames),
@@ -756,7 +762,7 @@ def main() -> None:
         # the crafted JPEGs' unmodified sources still decode, and PIL reads the unusual sampling layout
         Image.open(io.BytesIO(base64.b64decode(LUMA_UNDER_CHROMA_JPEG))).load()
         print("errors: bad base64, truncated PNG, aspect ratio, 16-bit PNG, a non-base64 data URL, a progressive scan "
-              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, a scan before the frame header, two frame headers, full scans out of frame order, refinements with Al != Ah - 1, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
+              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, a scan before the frame header, two frame headers, full scans out of frame order, refinements with Al != Ah - 1, progressive scans cut short, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
               "streams and three corrupt CRCs rejected"
               if not failures else "errors: see above")
     sys.exit(1 if failures else 0)

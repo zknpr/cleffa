@@ -86,6 +86,8 @@
  *   - a sequential frame may split its components across scans: its coefficients are buffered
  *     and finished like a progressive frame's, as libjpeg does; a scan before the frame header,
  *     or a second frame header, is refused (JERR_SOS_NO_SOF, JERR_SOF_DUPLICATE);
+ *   - a scan whose entropy data ends early is refused, whether a Huffman code fails there or
+ *     decodes using the padding past the data (libjpeg fills with a warning);
  *   - scan components are looked up from the scan position on, as libjpeg does, so a full scan
  *     out of frame order is refused, and a refinement scan needs Al = Ah - 1;
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
@@ -245,7 +247,17 @@ typedef struct {
     uint64_t bitbuf;  /* 64-bit to prevent overflow when refilling */
     int bitcount;
     int eof;  /* Set when we've padded past end of data */
+    int pad_bits;  /* cleffa: 1-bits appended past the end of the scan's data */
 } jpeg_bitstream;
+
+/* cleffa: whether the scan consumed any of the padding appended past its data, which a complete
+ * scan never does (lookahead may buffer padding without consuming it). libjpeg decodes such a
+ * scan with a "premature end of data segment" warning and its own fill; Pillow then refuses the
+ * file when it also lacks EOI. A truncated progressive scan decoded here as if it had ended with
+ * an EOB, up to 50 levels from Pillow, and was accepted without EOI too (Codex on b6cbe49). */
+static int jpeg_overran(const jpeg_bitstream *bs) {
+    return bs->pad_bits > bs->bitcount;
+}
 
 typedef struct {
     int width, height;
@@ -352,6 +364,7 @@ static int jpeg_get_bits(jpeg_bitstream *bs, int n) {
             /* At EOF - pad with 1s (JPEG convention for fill bits) */
             b = 0xFF;
             bs->eof = 1;
+            bs->pad_bits += 8;
         }
         bs->bitbuf = (bs->bitbuf << 8) | b;
         bs->bitcount += 8;
@@ -371,6 +384,7 @@ static int jpeg_peek_bits(jpeg_bitstream *bs, int n) {
             /* At EOF - pad with 1s (JPEG convention for fill bits) */
             b = 0xFF;
             bs->eof = 1;
+            bs->pad_bits += 8;
         }
         bs->bitbuf = (bs->bitbuf << 8) | b;
         bs->bitcount += 8;
@@ -1004,11 +1018,7 @@ static int jpeg_prog_decode_ac_first(jpeg_decoder *dec, int comp_idx, int16_t *c
     int k = dec->ss;
     while (k <= dec->se && k < 64) {
         int rs = jpeg_decode_huffman(&dec->bs, ac_huff);
-        if (rs < 0) {
-            /* At EOF, treat as implicit EOB for remaining blocks */
-            if (dec->bs.eof) return 0;
-            return -1;
-        }
+        if (rs < 0) return -1;   /* cleffa: also at the end of the data (jpeg_overran) */
 
         int run = rs >> 4;
         int size = rs & 0x0F;
@@ -1065,11 +1075,7 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
     if (dec->eobrun == 0) {
         while (k <= dec->se && k < 64) {
             int rs = jpeg_decode_huffman(&dec->bs, ac_huff);
-            if (rs < 0) {
-                /* At EOF, treat as implicit EOB for remaining blocks */
-                if (dec->bs.eof) break;
-                return -1;
-            }
+            if (rs < 0) return -1;   /* cleffa: also at the end of the data (jpeg_overran) */
 
             int run = rs >> 4;
             int size = rs & 0x0F;
@@ -1093,7 +1099,6 @@ static int jpeg_prog_decode_ac_refine(jpeg_decoder *dec, int comp_idx, int16_t *
                  * Do not keep refining trailing non-zeros before the next
                  * Huffman symbol; those correction bits come after it. */
             } else if (size != 1) {
-                if (dec->bs.eof) break;
                 return -1;  /* Invalid: size must be 1 for refinement */
             } else {
                 int bit = jpeg_get_bits(&dec->bs, 1);
@@ -1661,6 +1666,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
             dec.bs.bitbuf = 0;
             dec.bs.bitcount = 0;
             dec.bs.eof = 0;
+            dec.bs.pad_bits = 0;
 
             /* Find end of scan data (next marker). cleffa: fill FFs before a restart marker stay
              * in the scan; after any other run of FFs the scan ends at the run's first FF (a marker
@@ -1706,7 +1712,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 if (dec.is_progressive)
                     for (int i = 0; i < ns; i++)
                         for (int k = dec.ss; k <= dec.se; k++) dec.coef_bits[scan_comps[i]][k] = (int8_t)dec.al;
-                if (jpeg_decode_progressive_scan(&dec, scan_comps, ns) < 0) goto fail;
+                if (jpeg_decode_progressive_scan(&dec, scan_comps, ns) < 0 || jpeg_overran(&dec.bs)) goto fail;
                 pos = scan_end;
                 continue;  /* Continue to next scan */
             } else {
@@ -1740,7 +1746,7 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 }
 
                 /* Decode baseline scan */
-                if (jpeg_decode_scan(&dec, y_data, cb_data, cr_data) < 0) {
+                if (jpeg_decode_scan(&dec, y_data, cb_data, cr_data) < 0 || jpeg_overran(&dec.bs)) {
                     free(y_data);
                     free(cb_data);
                     free(cr_data);

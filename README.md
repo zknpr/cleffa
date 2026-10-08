@@ -765,7 +765,8 @@ differently:
   entropy data with fill bytes before a stuffed zero (`FF FF 00`, not standard; libjpeg-turbo's
   own result for it depends on how its input is buffered), JPEG blocks whose IDCT output leaves
   [-512, 511] (no encoder was measured above 397; libjpeg-turbo's C and NEON builds decode them
-  differently), WebP; and images over the decode limits;
+  differently), JPEG scans whose entropy data ends early (libjpeg fills the gap with a warning, and
+  Pillow refuses such a file when it also lacks EOI), WebP; and images over the decode limits;
 - a literal `<|image_pad|>` in request text in parity mode (the reference raises later, on the
   placeholder count).
 
