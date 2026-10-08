@@ -263,7 +263,8 @@ Images come in the hosted API's two forms in the request's `images` list, a `dat
 checks a declared type (object `content_type` or data URL media type) against the signature and
 rejects WebP. The encoder builds the schema first, then computes each image's `smart_resize`
 geometry and refuses an image over the per-image limit, or one that cannot fit the context with the
-fixed prompt, the schema and the images before it, before resizing or allocating patches: the resized area is
+fixed prompt, the schema, the images before it and, when truncation is refused (the server's default),
+the state, before resizing or allocating patches: the resized area is
 request-controlled through `media_kwargs` and reached 1.85 GB resident from a 40x40 file when the
 check came after preprocessing. `media_kwargs` integers are parsed range-checked, never with `atol`.
 The server's startup warm-up includes one image sized to the per-image limit when the model has a

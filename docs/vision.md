@@ -347,6 +347,17 @@ no record) loaded before and are refused now. A 15-minute differential run on th
 86.3 million inputs with no finding; coverage rose from 706 to 752 edges with the new path.
 Evidence: `golden/fuzz-image-2026-10-07/review10/`.
 
+An eleventh round (Codex on `a99a8a9`) raised one point, the state's counterpart of (27). (33)
+Confirmed: with truncation refused, which is the server's default, a state that cannot fit is
+refused, but only after the images were decoded and preprocessed. A 14,336-token image with a
+2,500-token state peaked at 479 MB before that refusal. When truncation is refused, the state is
+now tokenized before the images, capped at `max_length + 1` tokens (a limited encode is a prefix
+of the full one), and counted in each image's budget. The later state check reuses those tokens,
+and the same request is refused before preprocessing at 127 MB, a fourth `tests/test_record.py`
+peak. With truncation allowed the state yields to the images and is tokenized after them, as before.
+`tests/test_truncation.py` adds the same boundary sweep with a 256-token image: refusal is exactly
+where the reference would truncate, and accepted ids equal reference-mode encoding.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to

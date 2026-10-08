@@ -137,10 +137,11 @@ void clef_record_free(clef_record *r) {
     memset(r, 0, sizeof(*r));
 }
 
-/* Decodes and preprocesses the request's images into out->images, after the schema is built so
- * that its length counts toward each image's budget (see the reserve below). */
+/* Decodes and preprocesses the request's images into out->images. It runs after the schema, and
+ * the state when truncation is refused, are tokenized; reserved_tokens counts them toward each
+ * image's budget (see the reserve below). */
 static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval *images, size_t n_images,
-                          clef_encode_opts opts, size_t schema_tokens, clef_record *out, char *err, size_t errlen) {
+                          clef_encode_opts opts, size_t reserved_tokens, clef_record *out, char *err, size_t errlen) {
     /* media_kwargs: the reference forwards them to the processor; only its pixel bounds are
      * taken here (deliberate divergence: other processor arguments are rejected, not ignored).
      * The processor applies the bounds only when both are given and silently ignores a lone
@@ -178,14 +179,16 @@ static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval
         if (prm.min_pixels > prm.max_pixels) return fail(err, errlen, "media_kwargs: min_pixels exceeds max_pixels", NULL, 0);
     }
     /* Images are never truncated, and the fixed prompt, one start/end pair per image, the
-     * newline after them and the schema always come with them: an image is refused before
+     * newline after them, the schema and, when truncation is refused, the state always come with
+     * them (reserved_tokens holds the last two): an image is refused before
      * preprocessing when it, the images before it and all of those cannot fit the context. That
      * is exactly the final length check's sum less the later images, so it refuses nothing the
      * reference accepts, only earlier. A per-image comparison with the whole context let an image
      * of exactly 16,384 tokens allocate 384 MiB of patches, and several large images each pass
      * it, before the length check refused the request (review #3); without the schema, a request
-     * whose schema could never fit still preprocessed its images (review #3, Codex on 600ddfe). */
-    size_t reserve = 1 + 2 * n_images + schema_tokens;
+     * whose schema could never fit still preprocessed its images (review #3, Codex on 600ddfe),
+     * and so did one whose state could not (Codex on a99a8a9). */
+    size_t reserve = 1 + 2 * n_images + reserved_tokens;
     {
         jbuf pb = {0};
         clef_tokens pt = {0};
@@ -233,8 +236,8 @@ static bool encode_images(const clef_tokenizer *tok, const jval *req, const jval
         }
         if ((size_t)out->n_image_tokens + (size_t)tokens + reserve > (size_t)opts.max_length) {
             clef_rgb_free(&rgb);
-            snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens; with %d image tokens before it and the "
-                     "%zu-token prompt the request cannot fit %d tokens",
+            snprintf(err, errlen, "images[%zu]: %dx%d resizes to %ld tokens; with %d image tokens before it and "
+                     "%zu tokens of prompt, schema and untruncated state the request cannot fit %d tokens",
                      i, width, height, tokens, out->n_image_tokens, reserve, opts.max_length);
             return false;
         }
@@ -431,10 +434,29 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         }
     }
 
-    /* Images after the schema, so that its length is part of each image's budget. */
-    if (ok && n_images && !encode_images(tok, req, images, n_images, opts, schema.len, out, err, errlen)) {
+    /* With truncation refused the state is never cut, so like the schema it is part of each image's
+     * budget: tokenize it before the images, at most max_length + 1 tokens (enough to know it cannot
+     * fit; a limited encode is a prefix of the full one). The state check below then refuses nothing
+     * new, but before any patches exist rather than after (Codex on a99a8a9). With truncation the
+     * state yields to the images and is tokenized later, as before. */
+    bool state_done = false;
+    size_t state_reserve = 0;
+    if (ok && n_images && opts.reject_truncation) {
+        size_t cap = (size_t)opts.max_length + 1;
+        if (opts.max_state_tokens >= 0 && (size_t)opts.max_state_tokens + 1 < cap) cap = (size_t)opts.max_state_tokens + 1;
+        b.len = 0;
+        render(&b, state);
+        ok = !b.oom && clef_tok_encode_ex(tok, b.p ? b.p : "", b.len, cap, opts.strict, &state_ids);
+        b.len = 0;
+        state_done = ok;
+        state_reserve = state_ids.len;
+    }
+
+    /* Images after the schema (and that state), whose lengths are part of each image's budget. */
+    if (ok && n_images && !encode_images(tok, req, images, n_images, opts, schema.len + state_reserve, out, err, errlen)) {
         jbuf_free(&b);
         clef_tokens_free(&schema);
+        clef_tokens_free(&state_ids);
         return false;
     }
 
@@ -465,11 +487,13 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         const size_t fixed0 = prefix.len + schema.len + suffix.len;
         size_t keep = fixed0 < (size_t)opts.max_length ? (size_t)opts.max_length - fixed0 : 0;
         if (opts.max_state_tokens >= 0 && (size_t)opts.max_state_tokens < keep) keep = (size_t)opts.max_state_tokens;
-        render(&b, state);
-        /* one token past the budget is enough to know whether truncation would happen */
-        const size_t probe = opts.reject_truncation ? keep + 1 : keep;
-        ok = ok && !b.oom && clef_tok_encode_ex(tok, b.p ? b.p : "", b.len, probe, opts.strict, &state_ids);
-        b.len = 0;
+        if (!state_done) {
+            render(&b, state);
+            /* one token past the budget is enough to know whether truncation would happen */
+            const size_t probe = opts.reject_truncation ? keep + 1 : keep;
+            ok = ok && !b.oom && clef_tok_encode_ex(tok, b.p ? b.p : "", b.len, probe, opts.strict, &state_ids);
+            b.len = 0;
+        }
         if (ok && opts.reject_truncation && state_ids.len > keep) {
             jbuf_free(&b);
             clef_tokens_free(&schema); clef_tokens_free(&prefix); clef_tokens_free(&suffix); clef_tokens_free(&state_ids);

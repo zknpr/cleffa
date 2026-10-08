@@ -347,8 +347,9 @@ def image_budget_memory(gguf_path: str) -> int:
     16,384-token context) reached 542 MB resident and two 4096x2048 images 492 MB; after, 139 MB
     and 291 MB (the first of the two fits alone and is preprocessed). The schema counts too: a
     14,336-token image fits the prompt alone, but not with a 2,500-token question, and was
-    preprocessed before the final length check refused it (review #3, Codex on 600ddfe). Peak RSS
-    of clef-tool, which applies no per-image token limit, as the CLI does by default."""
+    preprocessed before the final length check refused it (review #3, Codex on 600ddfe); so does a
+    state when truncation is refused, as the server refuses it by default (Codex on a99a8a9). Peak
+    RSS of clef-tool, which applies no per-image token limit, as the CLI does by default."""
     def png(w: int, h: int) -> str:
         y, x = np.indices((h, w))
         arr = np.stack([x * 255 // (w - 1), y * 255 // (h - 1), (x + y) % 256], -1).astype(np.uint8)
@@ -359,12 +360,15 @@ def image_budget_memory(gguf_path: str) -> int:
     q = {"q": {"type": "noul", "instructions": "Is it blue?"}}
     long_q = {"q": {"type": "noul", "instructions": "Is it blue? " + "alpha " * 2500}}
     half = png(4096, 2048)
-    cases = [("one 16,384-token image", [png(4096, 4096)], q, 300), ("two 8,192-token images", [half, half], q, 400),
-             ("a 14,336-token image with a 2,500-token schema", [png(4096, 3584)], long_q, 300)]
+    near = png(4096, 3584)
+    cases = [("one 16,384-token image", [png(4096, 4096)], q, "x", "encode", 300),
+             ("two 8,192-token images", [half, half], q, "x", "encode", 400),
+             ("a 14,336-token image with a 2,500-token schema", [near], long_q, "x", "encode", 300),
+             ("a 14,336-token image with a 2,500-token state, truncation refused", [near], q, "alpha " * 2500, "encode-notrunc", 300)]
     failures = 0
-    for name, images, questions, limit_mb in cases:
-        line = json.dumps({"model": "clef-flash", "state": "x", "images": images, "questions": questions}) + "\n"
-        r = subprocess.run(["/usr/bin/time", "-l", str(ROOT / "clef-tool"), "encode", gguf_path], input=line,
+    for name, images, questions, state, mode, limit_mb in cases:
+        line = json.dumps({"model": "clef-flash", "state": state, "images": images, "questions": questions}) + "\n"
+        r = subprocess.run(["/usr/bin/time", "-l", str(ROOT / "clef-tool"), mode, gguf_path], input=line,
                            capture_output=True, text=True)
         rss = next((int(l.split()[0]) for l in r.stderr.splitlines() if "maximum resident set size" in l), None)
         refused = r.stdout.startswith("ERR") and "cannot fit" in r.stdout
