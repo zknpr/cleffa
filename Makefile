@@ -183,7 +183,9 @@ test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/tes
 	    tests/vision-config/vision-image-id-vocab.gguf "below the vocabulary size" tests/vision-config/vision-video-id-2p31.gguf "below the vocabulary size" \
 	    tests/vision-config/vision-4-heads.gguf "unsupported vision shape" \
 	    tests/vision-config/vision-processor-bilinear.gguf "does not implement" tests/vision-config/vision-processor-clip-mean.gguf "does not implement" \
-	    tests/vision-config/vision-processor-max-pixels.gguf "does not implement" tests/vision-config/vision-processor-missing.gguf "no image_processor"
+	    tests/vision-config/vision-processor-max-pixels.gguf "does not implement" tests/vision-config/vision-processor-missing.gguf "no image_processor" \
+	    tests/vision-config/vision-start-is-image.gguf "must be distinct" tests/vision-config/vision-end-is-image.gguf "must be distinct" \
+	    tests/vision-config/vision-start-is-end.gguf "must be distinct"
 	rm -rf tests/vision-config
 	tests/test-prefix-owner
 	tests/test-prefix-planner

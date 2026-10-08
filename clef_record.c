@@ -629,6 +629,16 @@ bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, s
         snprintf(err, errlen, "model: vision token ids must be below the vocabulary size %u", vocab);
         return false;
     }
+    /* The encoder emits start, the image's placeholders, end; the reference finds images by its
+     * start token and counts placeholders by the image token. A start or end id equal to the image
+     * id made every image request fail its placeholder count after decoding and preprocessing
+     * (Codex on e4f4e1d), so the four ids must differ, as in the released models. */
+    if (image_id == start_id || image_id == end_id || image_id == video_id || start_id == end_id ||
+        start_id == video_id || end_id == video_id) {
+        snprintf(err, errlen, "model: vision token ids must be distinct (image %u, start %u, end %u, video %u)",
+                 image_id, start_id, end_id, video_id);
+        return false;
+    }
     if (!processor_supported(f, patch, merge, temporal, min_px, max_px, err, errlen)) return false;
     v->image = (clef_image_params){ (long)min_px, (long)max_px, (int)patch, (int)merge, (int)temporal };
     v->image_token_id = (int32_t)image_id;

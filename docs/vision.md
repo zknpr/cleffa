@@ -372,6 +372,13 @@ scan reordered as a parity case (a guard: it decoded correctly before too). A 15
 differential run on the result executed 89.8 million inputs with no finding
 (`golden/fuzz-image-2026-10-07/review12/`).
 
+A thirteenth round (Codex on `e4f4e1d`) raised one point. (36) Confirmed for a crafted model file:
+the loader did not require the four vision token ids to differ. With a start or end id equal to the
+image id, the encoder's start and end tokens counted as placeholders, so every image request failed
+its placeholder check after being decoded and preprocessed. The loader now requires image, start,
+end and video ids to be distinct, as they are in both released models; three crafted headers
+(start equal to image, end equal to image, start equal to end) loaded before and are refused now.
+
 ## Numerical parity
 
 Corpus: `ref/corpus_vision.py`, 16 requests / 41 questions with 1 to 3 images each, 16 to

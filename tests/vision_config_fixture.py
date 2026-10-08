@@ -71,7 +71,13 @@ def main() -> None:
     write(out / "vision-processor-max-pixels.gguf", kvs, {"clef.vision.image_processor": processor(
         size={"shortest_edge": ip["size"]["shortest_edge"], "longest_edge": ip["size"]["longest_edge"] // 2})})
     write(out / "vision-processor-missing.gguf", kvs, {}, frozenset({"clef.vision.image_processor"}))
-    print(f"wrote 12 fixtures with {len(kvs)} clef.* keys to {out}")
+    # Codex on e4f4e1d: colliding vision token ids failed every image request after preprocessing
+    image_id = next(v for n, v, _, _ in kvs if n == "clef.vision.image_token_id")
+    end_id = next(v for n, v, _, _ in kvs if n == "clef.vision.end_token_id")
+    write(out / "vision-start-is-image.gguf", kvs, {"clef.vision.start_token_id": image_id})
+    write(out / "vision-end-is-image.gguf", kvs, {"clef.vision.end_token_id": image_id})
+    write(out / "vision-start-is-end.gguf", kvs, {"clef.vision.start_token_id": end_id})
+    print(f"wrote 15 fixtures with {len(kvs)} clef.* keys to {out}")
 
 
 if __name__ == "__main__":

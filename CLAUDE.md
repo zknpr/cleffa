@@ -243,7 +243,7 @@ internal GPU/head entry points. `clef_main.c` (CLI) and `clef_server.c` (HTTP) a
 converter change and the engine must move together. Shape assumptions baked into the kernels are
 enforced at load (`hd == 256`, `n_rot == 64`, `dk == 128`, ...), including, for a vision model,
 interleaved M-RoPE section `[11, 11, 10]` (the kernels' `lane % 3`; text cannot reveal a mismatch),
-vision token ids below the vocabulary, at least 8 vision heads (`vis_qkv_rope` clears the
+four distinct vision token ids below the vocabulary, at least 8 vision heads (`vis_qkv_rope` clears the
 attention tail with one thread per head and patch, and the smallest image has 4 patches), and a
 recorded `clef.vision.image_processor` describing exactly the preprocessing `clef_image.c`
 implements (checked field by field, as the converter checks it). The GGUF is mmap'd and wrapped as a
