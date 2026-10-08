@@ -152,6 +152,40 @@ class EvidenceArchive(unittest.TestCase):
         self.assertIn('clef-flash-video-f32/encoded.jsonl', names)
         self.assertNotIn('clef-flash-video-f32/layers/vd000.safetensors', names)
 
+    def test_dashed_date_experiments(self):
+        # The vision and video reports cite golden/<name>-YYYY-MM-DD/ directories; the compact
+        # 20261005 form alone silently dropped all of their evidence from the archive.
+        for name in ['vision-opt-2026-10-07', 'video-sync-2026-10-08', 'gemm-probe-20261004',
+                     'bad-date-2026-1007', 'bad-date-2026-10-7']:
+            (self.root / name).mkdir(exist_ok=True)
+            (self.root / name / 'result.json').write_text('{"ok": true}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'dated.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertIn('vision-opt-2026-10-07/result.json', names)
+        self.assertIn('video-sync-2026-10-08/result.json', names)
+        self.assertIn('gemm-probe-20261004/result.json', names)
+        self.assertNotIn('bad-date-2026-1007/result.json', names)   # mixed forms stay undated
+        self.assertNotIn('bad-date-2026-10-7/result.json', names)
+
+    def test_dated_non_evidence(self):
+        # Dated is not enough: the showcase app is a private repository, and a worktree transfer
+        # bundle is a pre-merge copy of engine sources and a patch (Codex on PR #5). Both must stay
+        # out of a default run, in either date form, any capitalization and at any depth.
+        files = {'showcase-check-2026-10-07/snapshot-triage.txt': 'login form\n',
+                 'Showcase-Check-20261007/result.json': '{}\n',
+                 'vision-opt-2026-10-07/showcase-ui/result.json': '{}\n',
+                 'video-worktree-transfer-2026-10-07/video.patch': '--- a/clef_video.c\n',
+                 'video-worktree-transfer-2026-10-07/manifest.json': '{}\n',
+                 'video-worktree-transfer-2026-10-07/files/clef_record.c': 'int x;\n',
+                 'Video-Worktree-Transfer-20261007/video.patch': '--- a/x\n',
+                 'vision-opt-2026-10-07/result.json': '{"ok": true}\n'}
+        for rel, text in files.items():
+            (self.root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / rel).write_text(text)
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'scope.tar.gz', 'ev')
+        names = {e['path'] for e in manifest['files']}
+        self.assertEqual({n for n in names if n in files}, {'vision-opt-2026-10-07/result.json'})
+
     def test_selection_and_rewrite(self):
         out = Path(self.tmp.name) / 'ev.tar.gz'
         manifest = ea.build(self.root, out, 'ev')
