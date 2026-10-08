@@ -12,7 +12,7 @@ cleffa is built after [ds4](https://github.com/antirez/ds4) by antirez and the d
 would not exist without it (see [Acknowledgements](#acknowledgements)). It is an independent
 project, not affiliated with or endorsed by Cloudflare.
 
-Text and images. BF16 weights, never quantized. Videos are not supported.
+Text, images and video. BF16 weights, never quantized.
 
 ## Requirements
 
@@ -23,6 +23,7 @@ Text and images. BF16 weights, never quantized. Videos are not supported.
   or more. The 27B's is 55 GB, so plan on 64 GB or more. Long inputs add a few GB of activations
   on top.
 - **Tools:** Xcode command-line tools (`clang`, `xxd`) and macOS's system zlib (`-lz`).
+  The optional MP4/MOV conversion tool also needs `ffmpeg` and `ffprobe` in PATH (`brew install ffmpeg`).
   Python 3.12 is needed only for conversion and tests: `uv` if installed, otherwise `python3.12`,
   plus `requirements.txt`.
 
@@ -48,6 +49,11 @@ What `./download_models.sh` does for each model:
 
 Use `clef` for the 27B, `all` for both, and `--skip-download` to use (and still verify) a snapshot
 already in `model/` or `model-flash/`.
+
+Missing files, extra files and symbolic links fail verification; only `.cache/huggingface/`
+download bookkeeping is excluded. Remove stale `__pycache__` bytecode in an existing snapshot
+before verifying it, and run Python reference scripts with `-B` to keep the snapshot unchanged.
+Verify snapshots before invoking reference scripts directly; those scripts do not run the verifier.
 
 ### Images
 
@@ -89,10 +95,64 @@ together. Measured on Flash, eight concurrent 24-megapixel JPEGs peaked 1.20 GB 
 64-megapixel cap a decode holds about 0.5 GB, so the slot count then bounds about 4 GB.
 Measured parity, costs and the unsupported formats are in [docs/vision.md](docs/vision.md).
 
-Missing files, extra files and symbolic links fail verification; only `.cache/huggingface/`
-download bookkeeping is excluded. Remove stale `__pycache__` bytecode in an existing snapshot
-before verifying it, and run Python reference scripts with `-B` to keep the snapshot unchanged.
-Verify snapshots before invoking reference scripts directly; those scripts do not run the verifier.
+### Video
+
+A request's `videos` list holds ordered frame arrays, `{"frames": [...], "fps": 24}`. Each frame
+takes the same PNG/JPEG forms as `images`, and `fps` is the source frame rate, in `(0, 1000]`.
+Frames must share dimensions, at least 32 pixels a side. The engine and server never decode
+compressed video: `tools/video_request.py` converts a local MP4/MOV clip into a frame request,
+running FFmpeg in a separate process (`ffmpeg`/`ffprobe` in PATH). Put `model`, `state` and
+`questions` in a request template, then convert:
+
+```sh
+.venv/bin/python -B tools/video_request.py clip.mp4 --request request.json > video.jsonl
+./clef -m gguf/clef-flash.gguf video.jsonl
+# Or submit the same converted request to the server:
+curl localhost:8080/v1/systemone -H 'Content-Type: application/json' --data-binary @video.jsonl
+```
+
+The engine reproduces the pinned video processor: it samples frames uniformly at a target 2 FPS
+(at least four when available, at most 768), resizes them against one pixel budget for the whole
+video, pairs them for the tower's two temporal taps (repeating an unpaired last frame), and writes
+each pair's timestamp, placeholder tokens and M-RoPE positions as the reference does. All images
+precede all videos, which precede the state. Existing vision GGUFs already contain the weights and
+the video token id; no reconversion is needed.
+
+Sampling and sizing controls live under `media_kwargs.videos_kwargs`:
+
+```json
+{"videos_kwargs":{"fps":2,"size":{"shortest_edge":4096,"longest_edge":1048576}}}
+```
+
+`size` is a pixel budget across sampled frames, with both positive bounds required; the reference
+defaults are 4,096 and 25,165,824. `num_frames` selects a count instead of `fps` (it clears the
+default sampling FPS, as `fps: null` does in the reference), and `do_sample_frames: false` keeps
+every supplied frame. Other processor controls are rejected. Top-level
+`media_kwargs.min_pixels`/`max_pixels` continue to control still images only.
+
+A frame array without metadata may describe up to 18,000 source frames or 600 seconds. Presampled
+frames carry their source positions instead: `frame_indices` (strictly increasing integers within
+`total_num_frames`, one per frame) with the original average `fps` and `do_sample_frames: false`,
+so their timestamps match a request carrying every frame. The engine rejects indexed frames when
+sampling is enabled, and rejects compressed video uploads with an instruction to use the converter.
+
+The server allows one video, 32 sampled frames and 1,024 tokens per video by default
+(`--max-videos`, `--max-video-frames`, `--max-video-tokens`; 0 uses the processor and context
+bounds, as the CLI does by default). These limits reject requests rather than reduce resolution
+or sampling rate, and are checked before resizing or allocating patches. `--max-image-pixels` also
+bounds each source frame, and `--max-image-requests` counts video requests too. Prefix and template
+caches serve videos, with exact patch identity and timestamp-token matching.
+
+The converter accepts H.264, HEVC, ProRes and MJPEG in MP4/MOV with exactly one video track. Audio
+is ignored; stored orientation is preserved and HDR is not tone-mapped. Clips need a known frame
+count and FPS, at most 18,000 frames, 600 seconds and 16,777,216 pixels per frame. By default it
+samples 2 FPS, at most 32 frames, into an 8 MiB request, matching the server's frame and body
+defaults, and exceeding a cap fails explicitly: use `--num-frames` or `--fps` to reduce sampling,
+and `--max-frames` / `--max-body` only when the receiving server allows larger requests. Set the
+model's pixel budget through `media_kwargs.videos_kwargs.size` in the template. Its output keeps
+the source `frame_indices`, `total_num_frames` and FPS. The converter's isolation is under
+[Security notes](#security-notes); sampling details, parity, costs and the converter's internals
+are in [docs/video.md](docs/video.md).
 
 ### Server
 
@@ -240,13 +300,16 @@ for the full-input comparisons, memory costs and validation scope.
 `--logits` prints raw logits, and `--dump FILE` writes per-layer residuals for the first request.
 `--max-images N`, `--max-image-tokens N` and `--max-image-pixels N` apply the server's image
 limits (the CLI, as the test harness, defaults to the reference's, and to the decoders' 64-megapixel
-cap for source images).
+cap for source images); `--max-videos N`, `--max-video-frames N` and `--max-video-tokens N` do the
+same for videos (default 0, the processor and context bounds).
 For diagnostics, `CLEF_PROFILE=1` reports GPU time per kernel category (it serializes the GPU,
 so don't use it for latency) and `CLEF_ATTN_REF=1` switches to the simple reference attention
 kernel. `CLEF_ATTN_TU=0` selects the prior tiled FP32 attention path; the
 default uses compensated tensor-unit attention with FP32 accumulation. The vision tower keeps
 FP32 residual GEMMs and compensates non-residual projections; `CLEF_VIS_COMP=0` restores direct
 FP32 products throughout. `CLEF_VIS_F32=0` selects plain 16-bit vision operands (see Accuracy).
+`CLEF_VIS_GROUP=0` gives every image or video frame pair its own tower dispatches instead of
+sharing projections within a record.
 
 The model snapshots are pinned to revisions `2f3de3dd` (clef) and `17f0b0ad` (clef-flash).
 `joint_schema_model.py` from those revisions has been reviewed, and only the oracle imports it.
@@ -370,6 +433,7 @@ Host-side pieces must match Python byte for byte, and they do:
 | Request encoding (`encode_record`) | 3,089 requests, 43 with images (ids, spans, image runs, 3D positions) |
 | Response building (`systemone_answer`) | 1,338 responses |
 | Image decoding, resizing, normalization, patches, position interpolation | 100 PNG/JPEG images of every color type, scan layout, JPEG colour-space marking and quantization-table placement, byte-identical to PIL, torchvision and the processor |
+| Video sampling, resizing, patches, timestamp tokens, 3D positions | 14 frame-array requests, byte-identical to the processor (`tests/test_video.py`) |
 
 **Images.** The vision tower runs its 27 layers before any text is read, so operand rounding there
 compounds. Its producers retain f32 outputs. Non-residual GEMMs use compensated high/residual
@@ -380,6 +444,12 @@ and the 27B 41/41 with max |Δp| 0.0010; with
 16-bit tower operands (`CLEF_VIS_F32=0`) two of clef-flash's questions exceed the limits (max |Δp|
 0.0025, features 2.9e-3 away). The text corpus is unchanged on both models. Details and costs:
 [docs/vision.md](docs/vision.md).
+
+**Video.** On the separate 8-request / 16-question synthetic video corpus (`ref/corpus_video.py`)
+against the streamed FP32 oracle, clef-flash answers 16/16 with max |Δp| 0.0002 and the 27B 16/16
+with max |Δp| 0.0007. That is parity on synthetic clips, not measured accuracy on real video.
+These GPU results predate the branch's rebase onto the final image-path changes; see
+[docs/video.md](docs/video.md#numerical-parity) for scope.
 
 ## Speed
 
@@ -423,7 +493,10 @@ suffix; the measured hit times are under
 Images add their tokens to the backbone and the tower's own pass: a 336x252 webcam frame with
 three questions (373 tokens, 80 of them image) takes 134 ms on clef-flash and 416 ms on the 27B,
 a 1024x1024 photo (1,363 tokens, 1,024 image) 773 ms and 1,857 ms, warm single requests on
-2026-10-07 ([docs/vision.md](docs/vision.md)).
+2026-10-07 ([docs/vision.md](docs/vision.md)). An eight-frame 128x96 video request (316 tokens)
+takes 116.9 ms on clef-flash and 352.1 ms on the 27B, warm. Converting and answering a four-second
+1280x720 H.264 clip sampled to eight frames, FFmpeg included, takes 717.8 ms and 1,702.7 ms end
+to end ([docs/video.md](docs/video.md#cost)).
 
 ### Against PyTorch
 
@@ -543,11 +616,14 @@ length: 3× (flash) to 11× (27B) at 2k tokens, 39× to 127× at 16k.
 - **`clef_json.c`:** a JSON DOM with Python semantics: exact integer digits, `repr()` floats,
   `NaN`/`Infinity`, and for duplicate keys the last value at the first position.
 - **`clef_record.c`:** `encode_record`, `systemone()` validation and `systemone_answer`,
-  including CPython 3.12's Neumaier `sum()`; with images, the placeholder runs and the 3D
-  rotary positions of `get_rope_index`.
+  including CPython 3.12's Neumaier `sum()`; with images and videos, the placeholder runs,
+  video frame sampling and timestamps, and the 3D rotary positions of `get_rope_index`.
 - **`clef_image.c`:** base64, the PNG/JPEG decoders imported from ds4's `iris`, and the
   reference's image processor: `smart_resize`, PyTorch's uint8 antialiased bicubic kernel
   arithmetic for arithmetic, normalization and the merge-window patch layout.
+- **`clef_video.c`:** the video processor's resize geometry; frames are decoded and resized by
+  `clef_image.c`. **`tools/video_request.py`** is the optional MP4/MOV client converter, which runs
+  FFmpeg in its own process; no engine binary links a video decoder.
 - **`metal/clef.metal`:**
   - MPP tensor-op GEMM, BF16 weights × FP16 activations with f32 accumulation. Tiles are
     32×128, 32×256 or 64×128 by packed token count and matrix shape, with identical
@@ -560,9 +636,11 @@ length: 3× (flash) to 11× (27B) at 2k tokens, 39× to 127× at 16k.
     records of at least 4,096 tokens, a 32-token FP32 block recurrence, and the gated norm.
   - RMSNorm, LayerNorm, SwiGLU.
   - The Qwen3.5 vision tower: patch embedding and position resampling, LayerNorm, 2D rotary
-    embedding, bidirectional attention on simdgroup matrices (FP32 matrix primitives from 2,048 patches), GELU MLP and the merger, one
-    dispatch sequence per image; features replace the placeholder embeddings, and the
-    backbone's rotary prep applies interleaved M-RoPE from per-token 3D positions.
+    embedding, bidirectional attention on simdgroup matrices (FP32 matrix primitives from 2,048
+    patches), GELU MLP and the merger. Equal-grid images or video frame pairs in one record share
+    projection and norm dispatches up to 1,024 patches, with attention per image or pair; features
+    replace the placeholder embeddings, and the backbone's rotary prep applies interleaved M-RoPE
+    from per-token 3D positions.
 - **`clef_head.c`:** the joint schema head, in f32 on the CPU via Accelerate, with packed
   transposed weight copies, per-record option batching in the residual scorer and two workers
   for large projections and attention calls. The memory-side K/V projections run on the GPU,
@@ -578,7 +656,7 @@ The tests need `gguf/clef-flash.gguf` and `model-flash/` (`./download_models.sh 
 parity tests also need golden data from the PyTorch oracles (below).
 
 ```sh
-make test                                            # host parity (incl. images), HTTP write failures, verifier/parity, cache-planner and collector regressions
+make test                                            # host parity (incl. images and video), HTTP write failures, verifier/parity, cache-planner and collector regressions
 make test-errors                                     # CLI allocation/output errors, HTTP errors, Metal failures
 make test-attention                                  # production attention vs float64 samples, packing and tail guards; no model needed
 make test-gemm                                       # production GEMM tile/packing parity, float64 and NaN guards; no model needed
@@ -592,6 +670,13 @@ tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.j
 tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl   # also with CLEF_VIS_F32=0 and CLEF_ATTN_REF=1
 .venv/bin/python -B tests/test_server_images.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl   # starts its own servers: HTTP bytes, limits, strict mode, caches
 .venv/bin/python -B tests/test_vision_cache.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl    # repeat with clef/27B
+.venv/bin/python -B tests/test_video_request.py                                          # MP4/MOV converter; needs ffmpeg/ffprobe, not in make test
+.venv/bin/python -B ref/oracle_f32_stream.py model-flash --name clef-flash-video-f32 --corpus video   # video corpus, FP32
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-video-f32 --dump
+tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+.venv/bin/python -B tests/test_vision_groups.py gguf/clef-flash.gguf                     # shared vs separate tower dispatches: exact logits, batch, poison, overflow
+.venv/bin/python -B tests/test_server_video.py gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl   # starts its own servers: limits, strict tokens, caches
 .venv/bin/python -B ref/oracle.py model-flash --name clef-flash                  # BF16 oracle (MPS)
 .venv/bin/python -B ref/oracle.py model-flash --name clef-flash-f32 --dtype float32
 .venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-f32 --dump   # vs FP32: vs BF16 it fails where BF16 is wrong
@@ -640,6 +725,7 @@ It upcasts one layer at a time and is bitwise identical to the full FP32 oracle 
 .venv/bin/python -B ref/oracle.py model --name clef --safe-attn
 .venv/bin/python -B ref/oracle_f32_stream.py model --name clef-f32 --safe-attn
 .venv/bin/python -B ref/oracle_f32_stream.py model --name clef-vision-f32 --safe-attn --corpus vision
+.venv/bin/python -B ref/oracle_f32_stream.py model --name clef-video-f32 --safe-attn --corpus video
 .venv/bin/python -B tests/compare3.py golden/clef golden/clef-f32 golden/engine_logits_clef.jsonl
 .venv/bin/python -B ref/mps_sdpa_bug.py              # the MPS attention bug, standalone
 ```
@@ -693,7 +779,21 @@ Requests and GGUF files are treated as untrusted:
   Huffman tables, each component once per scan, DC symbols at most 15) and libjpeg's arithmetic widths (wrapping 16-bit DC
   coefficients, a 64-bit IDCT) after crafted files overflowed the unmodified copy under
   AddressSanitizer or reached undefined behavior under UBSan ([docs/vision.md](docs/vision.md));
-  every file is a regression case (`tests/test_image.py`, `tests/test_jpeg_ub.c`).
+  every file is a regression case (`tests/test_image.py`, `tests/test_jpeg_ub.c`). Progressive
+  scans must also follow each coefficient's bitplanes and fit a block-visit budget of 16
+  full-resolution passes at the source-pixel limit: a progressive scan walks every block even with
+  empty entropy data, so a 10 KB file of 1,000 empty refinement scans over a 4096x4096 frame asked
+  for 262 million block visits. It is now refused in 3 ms (`tests/test_jpeg_regressions.py`).
+- **Video:** the engine and server never decode compressed video. Frames are PNG/JPEG under the
+  image decoders' checks, the source-pixel limit and the `--max-image-requests` slots, and the
+  per-video frame and token limits are checked before resizing or patch allocation.
+  `tools/video_request.py` is a client tool, never an HTTP upload handler. It takes regular local
+  files, copies at most 64 MiB into a private temporary directory, disables MOV external data
+  references and restricts FFmpeg's input protocols to files; its test checks that a MOV's
+  local-file and loopback HTTP references are not followed. It runs FFmpeg as your user, without
+  an OS sandbox, so FFmpeg's demuxers and decoders parse the clip with your privileges. Probe and
+  decode share a 30-second deadline, after which the child process is killed and reaped, and
+  sampled RGB is capped at 256 MiB.
 - **Server exposure:** the server binds to localhost by default. Exposing it with `--host` puts
   the GPU behind one FIFO queue. A long request (16k tokens takes ~7 s on clef-flash) is never
   co-batched with short ones, but it does delay everything queued behind it. Connection slots
@@ -752,8 +852,9 @@ differently:
 - score criteria that are not a list;
 - noul criteria given as a list of pairs;
 - a question with an empty id and no instructions (the reference returns NaN);
-- videos;
-- `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
+- compressed video, and video frame counts, durations, FPS or sample counts outside the limits
+  under [Video](#video) ([docs/video.md](docs/video.md#host-parity));
+- `media_kwargs` other than the two image bounds and `videos_kwargs`, or only one image bound (the
   processor silently ignores a lone bound); bounds that are not positive integers within int32;
 - a data URL whose media type is not `image/png` or `image/jpeg`, or contradicts the bytes (the
   reference's PIL decode ignores the label);
@@ -765,7 +866,8 @@ differently:
   entropy data with fill bytes before a stuffed zero (`FF FF 00`, not standard; libjpeg-turbo's
   own result for it depends on how its input is buffered), JPEG blocks whose IDCT output leaves
   [-512, 511] (no encoder was measured above 397; libjpeg-turbo's C and NEON builds decode them
-  differently), JPEG scans whose entropy data ends early (libjpeg fills the gap with a warning, and
+  differently), progressive JPEGs whose scans repeat, skip or reorder a coefficient's bitplanes or
+  exceed the block-visit budget (Pillow decodes most of these), JPEG scans whose entropy data ends early (libjpeg fills the gap with a warning, and
   Pillow refuses such a file when it also lacks EOI), JPEGs without EOI (Pillow refuses every
   progressive one, but a baseline one only depending on its read-ahead), WebP; and images over
   the decode limits;
@@ -774,7 +876,9 @@ differently:
 
 ## Not done yet
 
-- Videos and WebP ([docs/vision.md](docs/vision.md)).
+- WebP ([docs/vision.md](docs/vision.md)).
+- Compressed video in the engine and server, live or unknown-length clips, and converter codecs
+  beyond H.264, HEVC, ProRes and MJPEG ([docs/video.md](docs/video.md)).
 - Full-input latency parity with Cloudflare's hosted API on long inputs
   ([hosted comparison](docs/hosted-comparison.md)).
 

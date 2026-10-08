@@ -34,16 +34,40 @@ from safetensors.torch import save_file
 sys.path.insert(0, str(Path(__file__).parent))
 import corpus  # noqa: E402
 import corpus_vision  # noqa: E402
+import corpus_video  # noqa: E402
 import golden_io  # noqa: E402
 
 
 def with_pil_images(request: dict) -> dict:
-    """The record the reference encodes: base64 images decoded with PIL, as a client would hand them over."""
-    if not request.get("images"):
+    """Decode wire images and video frames, preserving original source timing metadata."""
+    if not request.get("images") and not request.get("videos"):
         return request
     from PIL import Image
+    import numpy as np
 
-    return dict(request, images=[Image.open(io.BytesIO(base64.b64decode(s.split(",", 1)[-1]))) for s in request["images"]])
+    def payload(item):
+        s = item['base64'] if isinstance(item, dict) else item.split(',', 1)[-1]
+        return base64.b64decode(s)
+
+    result = dict(request)
+    if request.get('images'):
+        result['images'] = [Image.open(io.BytesIO(payload(s))) for s in request['images']]
+    if request.get('videos'):
+        arrays, metadata = [], []
+        for v in request['videos']:
+            rgb = np.stack([np.asarray(Image.open(io.BytesIO(payload(s))).convert('RGB')) for s in v['frames']])
+            arrays.append(rgb)
+            metadata.append({'total_num_frames': v.get('total_num_frames', len(rgb)), 'fps': v['fps'],
+                             'frames_indices': v.get('frame_indices', list(range(len(rgb))))})
+        result['videos'] = arrays
+        mk = dict(request.get('media_kwargs', {}))
+        vk = dict(mk.get('videos_kwargs', {}))
+        if 'num_frames' in vk:
+            vk.setdefault('fps', None)  # clear the processor's default sampling rate
+        vk['video_metadata'] = metadata
+        mk['videos_kwargs'] = vk
+        result['media_kwargs'] = mk
+    return result
 
 
 def sync(device: str) -> None:
@@ -64,7 +88,7 @@ def main() -> None:
     parser.add_argument("--only", nargs="*", help="request ids to run (default: all)")
     parser.add_argument("--safe-attn", action="store_true", help="head-chunked SDPA (MPS >= 2^32 offset bug, ref/safe_attn.py)")
     parser.add_argument("--dump-last", type=int, default=0, help="dump only the last N token rows per layer")
-    parser.add_argument("--corpus", default="text", choices=["text", "vision"])
+    parser.add_argument("--corpus", default="text", choices=["text", "vision", "video"])
     args = parser.parse_args()
 
     sys.path.insert(0, str(args.model_dir.resolve()))
@@ -86,7 +110,7 @@ def main() -> None:
     device = torch.device(args.device)
 
     tail = (lambda t: t[-args.dump_last:]) if args.dump_last > 0 else (lambda t: t)
-    requests = corpus.build() if args.corpus == "text" else corpus_vision.build()
+    requests = {"text": corpus, "vision": corpus_vision, "video": corpus_video}[args.corpus].build()
     full_model = model.language_model.model   # Qwen3_5Model: vision tower + get_rope_index + language model
     if args.only:
         requests = [r for r in requests if r["id"] in set(args.only)]
@@ -101,7 +125,8 @@ def main() -> None:
                 types_ = torch.zeros_like(ids)
                 offset = encoded.media["token_offset"]
                 types_[0, offset:offset + len(encoded.media["mm_token_type_ids"])] = torch.tensor(encoded.media["mm_token_type_ids"])
-                pos, _ = full_model.get_rope_index(ids, types_, image_grid_thw=encoded.media["image_grid_thw"])
+                pos, _ = full_model.get_rope_index(ids, types_, image_grid_thw=encoded.media.get("image_grid_thw"),
+                                                   video_grid_thw=encoded.media.get("video_grid_thw"))
                 position_ids = pos[:, 0].tolist()
             ef.write(golden_io.encoded_line(request, encoded, position_ids))
 
@@ -116,8 +141,11 @@ def main() -> None:
                     lambda m, a, kw: captured.__setitem__("embed", tail(kw["inputs_embeds"][0]).float().cpu())
                     if kw.get("inputs_embeds") is not None else None, with_kwargs=True))
                 def capture_vision(m, a, kw, o):   # a hook must return None, or it replaces the output
-                    for k, f in enumerate(torch.split(o.pooler_output, (kw["grid_thw"].prod(-1) // 4).tolist())):
+                    sizes = [h * w // 4 for t, h, w in kw["grid_thw"].tolist() for _ in range(t)]
+                    k = sum(key.startswith("vision.") for key in captured)
+                    for f in torch.split(o.pooler_output, sizes):
                         captured[f"vision.{k}"] = f.float().cpu()
+                        k += 1
                 hooks.append(full_model.visual.register_forward_hook(capture_vision, with_kwargs=True))
                 for li, layer in enumerate(text_model.layers):
                     hooks.append(layer.register_forward_hook(

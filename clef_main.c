@@ -19,6 +19,7 @@
  *                 reference's own bound is 16,384 tokens, 16.7 megapixels)
  *   --max-image-pixels N  reject a source image with more pixels, at its header, before decoding
  *                 (default: the decoders' 64-megapixel cap)
+ *   --max-videos N, --max-video-frames N, --max-video-tokens N bound video work (0: processor/context).
  * Images are data URLs or {"content_type","base64"} objects (the hosted API's forms; bare base64
  * is accepted too) in the request's "images" list.
  */
@@ -105,8 +106,17 @@ int main(int argc, char **argv) {
     int max_images = 0;
     long max_image_tokens = 0;
     long max_image_pixels = 0;
+    int max_videos = 0, max_video_frames = 0;
+    long max_video_tokens = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
+        else if ((!strcmp(argv[i], "--max-videos") || !strcmp(argv[i], "--max-video-frames") || !strcmp(argv[i], "--max-video-tokens")) && i + 1 < argc) {
+            const char *flag = argv[i]; long v;
+            if (!parse_count(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef: %s must be a whole number (0 = processor/context limit)\n", flag); return 2; }
+            if (!strcmp(flag, "--max-videos")) max_videos = (int)v;
+            else if (!strcmp(flag, "--max-video-frames")) max_video_frames = (int)v;
+            else max_video_tokens = v;
+        }
         else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
             long v;
             if (!parse_count(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef: --max-images must be a whole number (0 = the reference's limit)\n"); return 2; }
@@ -136,7 +146,7 @@ int main(int argc, char **argv) {
             prefix_cache = template_cache = true;
         }
         else if (argv[i][0] != '-' && !input) input = argv[i];
-        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
+        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-videos N] [--max-video-frames N] [--max-video-tokens N] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
     }
     if (!model || batch < 1) { fprintf(stderr, "clef: -m MODEL.gguf is required\n"); return 2; }
     if (prefix_cache && (batch != 1 || dump_path)) { fprintf(stderr, "clef: %s takes one request per pass and no --dump\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
@@ -192,6 +202,9 @@ int main(int argc, char **argv) {
             opts.vision.max_images = max_images;
             opts.vision.max_image_tokens = max_image_tokens;
             opts.vision.max_image_pixels = max_image_pixels;
+            opts.vision.max_videos = max_videos;
+            opts.vision.max_video_frames = max_video_frames;
+            opts.vision.max_video_tokens = max_video_tokens;
             it->ok = it->encoded = it->req && clef_encode_request(e->tok, it->req, opts, &it->rec, it->err, sizeof(it->err));
         }
         /* getline() returns -1 for EOF and for a read error (EISDIR, EIO, ENOMEM) alike; an error

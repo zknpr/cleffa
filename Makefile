@@ -9,7 +9,7 @@ LDLIBS  += -lz
 LDFLAGS ?=
 FRAMEWORKS = -framework Metal -framework Foundation -framework Accelerate
 
-HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o
+HOST_OBJS = clef_gguf.o clef_json.o clef_tok.o clef_record.o clef_image.o clef_video.o
 
 .PHONY: all clean test test-image-diff test-errors test-attention test-vision-attention test-vision-gemm test-gemm test-gdn test-head-tsan test-prefix-attention test-prefix-model unicode
 
@@ -40,6 +40,9 @@ tests/test-base64: tests/test_base64.o clef_image.o
 
 image-bench: bench/image_latency.c clef_image.o clef_json.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS)
+
+video-host-bench: bench/video_host.c clef_record.c clef_record.h clef_gguf.o clef_json.o clef_tok.o clef_image.o clef_video.o
+	$(CC) $(CFLAGS) -o $@ bench/video_host.c clef_gguf.o clef_json.o clef_tok.o clef_image.o clef_video.o $(LDFLAGS) $(LDLIBS)
 
 attention-bench: bench/attention_bench.m
 	$(CC) $(OBJCFLAGS) -o $@ $< $(LDFLAGS) $(LDLIBS) -framework Metal -framework Foundation
@@ -196,6 +199,9 @@ test: clef-tool clef-server tests/test-base64 tests/test-vision-config tests/tes
 	tests/test-server-writes
 	.venv/bin/python -B tests/test_json.py
 	.venv/bin/python -B tests/test_image.py
+	.venv/bin/python -B tests/test_resize.py
+	.venv/bin/python -B tests/test_jpeg_regressions.py
+	.venv/bin/python -B tests/test_video.py
 	.venv/bin/python -B tests/test_tokenizer.py gguf/clef-flash.gguf model-flash
 	.venv/bin/python -B tests/test_verify_gguf.py
 	.venv/bin/python -B tests/test_verify_snapshot.py
@@ -214,6 +220,6 @@ test-errors: all tests/test-metal-errors tests/test-cli-alloc
 	tests/test-metal-errors gguf/clef-flash.gguf
 
 clean:
-	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image fuzz-jpeg-diff clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image fuzz-jpeg-diff clef clef-server clef-tool attention-bench vision-attention-bench vision-gemm-bench image-bench video-host-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
 
 -include $(wildcard *.d tests/*.d)

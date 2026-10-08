@@ -27,12 +27,14 @@ typedef struct {
     const jval *question;    /* the request's question object */
 } clef_question;
 
-/* One image of a record: its preprocessed patches and where its tokens sit in ids. The
+/* One still image or temporal video group: patches and their token placement. The
  * reference places every image's <|vision_start|> <|image_pad|>*n <|vision_end|> run right
  * after the template prefix, then one newline, then the state. */
 typedef struct {
     clef_image_patches pt;
-    int32_t tok_start;       /* index of the first <|image_pad|> token in ids; the run is pt.n_tokens long */
+    int32_t tok_start;       /* index of the first image/video placeholder in ids; the run is pt.n_tokens long */
+    int video_group;         /* 0: still image; otherwise 1-based video index, one ref per frame pair */
+    double timestamp;       /* average source time of the pair, rendered by the video processor */
 } clef_image_ref;
 
 typedef struct {
@@ -43,9 +45,9 @@ typedef struct {
     int q_alloc;             /* allocated question slots (freed even if encoding stopped early) */
     /* option-id strings created for noul ("true"/"false") and score ("0".."n-1") */
     char *owned;
-    clef_image_ref *images;  /* images in request order (NULL when none) */
+    clef_image_ref *images;  /* still images then video frame pairs in token order (NULL when none) */
     int n_images;
-    int32_t n_image_tokens;  /* sum of the images' tokens */
+    int32_t n_image_tokens;  /* sum of all visual tokens, including video pairs */
 } clef_record;
 
 /* Vision input configuration, from the model file (clef_vision_opts_load). Images are refused
@@ -57,6 +59,9 @@ typedef struct {
     long max_image_tokens;          /* per image after resizing; 0: unlimited (the reference) */
     long max_image_pixels;          /* per source image, enforced before decoding allocates;
                                        0: the decoders' cap, CLEF_IMAGE_MAX_PIXELS */
+    int max_videos;                 /* per request; 0: bounded only by context */
+    int max_video_frames;           /* sampled frames per video; 0: processor's 768-frame cap */
+    long max_video_tokens;          /* per video after resizing; 0: context bound */
 } clef_vision_opts;
 
 typedef struct {

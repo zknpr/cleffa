@@ -7,7 +7,7 @@ Usage: test_server_images.py MODEL.gguf VISION_REQUESTS.jsonl
     answer identically; an unsupported or mislabeled content_type is a 400
   - limits: a fifth image is a 400 naming the limit; an image past the token limit is a 400 that
     names media_kwargs.max_pixels, and the same image with those media_kwargs is served; a lone
-    media_kwargs bound, bad base64, a truncated PNG and a video are 400s; the limits can be raised
+    media_kwargs bound, bad base64, a truncated PNG and a malformed video are 400s; the limits can be raised
   - strict mode: a literal <|image_pad|> in the state is text and the request is served; with
     --no-strict the engine refuses it as the reference would fail (placeholder count)
   - --template-cache and --prefix-cache-mb: image requests answer byte-identically to the plain
@@ -204,7 +204,7 @@ with tempfile.TemporaryDirectory() as t:
         st, body = plain.post(dict(small, images=[base64.b64encode(base64.b64decode(tiny)[:40]).decode()]))
         expect(st, body, 400, "images[0]", "truncated PNG")
         st, body = plain.post(dict(small, videos=[[0]]))
-        expect(st, body, 400, "videos are not supported", "video")
+        expect(st, body, 400, "video must be", "malformed video")
         st, body = plain.post(dict(small, state="<|image_pad|> in the state"))
         if st != 200:
             fail(f"strict mode: placeholder text was not served: {st} {body[:200]!r}")

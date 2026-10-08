@@ -170,7 +170,7 @@ int main(int argc, char **argv) {
         gguf_close(&f);
         return 0;
     }
-    if (!strcmp(mode, "encode") || !strcmp(mode, "encode-strict") || !strcmp(mode, "encode-notrunc") || !strcmp(mode, "respond")) {
+    if (!strcmp(mode, "encode") || !strcmp(mode, "encode-patches") || !strcmp(mode, "encode-strict") || !strcmp(mode, "encode-notrunc") || !strcmp(mode, "respond")) {
         if (argc < 3) { fprintf(stderr, "%s needs a model path\n", mode); return 2; }
         gguf_file f;
         if (!gguf_open(&f, argv[2], err, sizeof(err))) { fprintf(stderr, "%s\n", err); return 1; }
@@ -207,6 +207,17 @@ int main(int argc, char **argv) {
                 free(probs);
                 clef_record_free(&rec);
             } else {
+                if (!strcmp(mode, "encode-patches")) {
+                    if (argc != 4) { fprintf(stderr, "encode-patches needs an output file\n"); return 2; }
+                    FILE *fp = fopen(argv[3], "wb");
+                    bool written = fp != NULL;
+                    for (int i = 0; written && i < rec.n_images; i++) {
+                        size_t count = (size_t)rec.images[i].pt.n_patch * rec.images[i].pt.patch_dim;
+                        written = fwrite(rec.images[i].pt.patches, sizeof(float), count, fp) == count;
+                    }
+                    if (fp && fclose(fp)) written = false;
+                    if (!written) { fprintf(stderr, "cannot write patch output\n"); return 1; }
+                }
                 jbuf b = {0};
                 jbuf_puts(&b, "{\"input_ids\":[");
                 char num[32];

@@ -1,7 +1,9 @@
 # Vision
 
 How images enter the engine, what was checked against the reference, and what it costs. Numbers
-are from the one tested M5 Max (128 GB), one GPU job at a time, as the other reports.
+are from the one tested M5 Max (128 GB), one GPU job at a time, as the other reports. Video
+reuses this path as pairs of frames; its sampling, converter, parity and costs are in
+[video.md](video.md).
 
 ## Pipeline
 
@@ -21,14 +23,20 @@ with the 3D rotary positions of `get_rope_index`. The engine does the same from 
    antialiased bicubic CPU kernel, ported arithmetic for arithmetic (int16 weights, integer
    accumulation, width pass then height pass). That kernel is what torchvision's `resize` runs
    on Apple Silicon for uint8 input; it differs from PIL by ±1 in a few hundred pixels per image
-   and from the float path by much more, so the port is specific to it.
+   and from the float path by much more, so the port is specific to it. On AArch64 the integer
+   products run on NEON across horizontal taps and adjacent vertical channel bytes, with the same
+   weights, rounding and saturation as the scalar tails; `tests/test_resize.py` compares
+   arbitrary dimensions, SIMD tails included, against torchvision.
 3. **Normalize and patch**: `(x - 127.5) / 127.5` in f32, 16x16 patches in 2x2 merge-window
    order with the frame duplicated for the two temporal taps, `[n_patch][1536]`.
 4. **Tower** (`metal/clef.metal` "vision tower", `clef_metal.m` `encode_vision`): patch
    embedding as one GEMM, bilinearly resampled learned positions, 27 blocks of LayerNorm,
    bidirectional attention with 2D rotary embedding, LayerNorm, GELU MLP; merger LayerNorm,
-   four patches per row, GELU, projection to the backbone width. One dispatch sequence per
-   image, independent of the batch.
+   four patches per row, GELU, projection to the backbone width. Equal-grid images in one
+   record share GEMM and normalization dispatches up to 1,024 patches in total; position
+   resampling, rotary embedding and attention stay per image, and nothing is shared across
+   records, so the result is independent of the batch (`CLEF_VIS_GROUP=0` restores one dispatch
+   sequence per image; `tests/test_vision_groups.py` checks exact logits both ways).
 5. **Backbone**: the features replace the placeholder rows in the embedding (`embed` kernel),
    and `attn_prep*` apply interleaved M-RoPE: pair `i` of the 32 rotary pairs turns by the
    token's temporal, row or column position for `i mod 3 = 0, 1, 2`, which is the plain RoPE for
@@ -44,10 +52,11 @@ Byte parity with the reference, `make test`:
 |---|---|---|
 | Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and four sequential frames split across scans, bytes after EOI, and a PNG chunk before IHDR) | 100/100 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
-| Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
+| Rejections | both | lone `media_kwargs` bound, unsupported processor arguments, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
 Divergences from the reference (it answers or behaves differently; the engine errors):
-videos; `media_kwargs` other than `min_pixels` and `max_pixels`, or only one of the two (the
+`media_kwargs` other than `min_pixels`, `max_pixels` and `videos_kwargs` (video divergences are in
+[video.md](video.md#host-parity)), or only one of the two image bounds (the
 processor silently ignores a lone bound), or bounds that are not positive integers within int32; a
 data URL whose media type is not `image/png` or `image/jpeg` or contradicts the bytes (the object
 form's `content_type` is checked the same way; the reference's PIL decode ignores both labels); an
@@ -56,6 +65,7 @@ reference builds the patches and then fails on length); PNGs that are 16-bit, su
 interlaced; JPEGs that are CMYK, 12-bit, lossless or arithmetic-coded, whose first component is
 sampled below another (Y 1x1 under Cb 2x2, which libjpeg accepts), or progressive with scans that
 stop before full precision (libjpeg smooths those; the smoothing is not implemented), or whose
+scans repeat, skip or reorder a coefficient's bitplanes or exceed the scan-work budget (below), or whose
 entropy data has fill bytes before a stuffed zero (`FF FF 00`, not standard); images over 64 MiB encoded,
 16,384 pixels on a side or 64 megapixels decoded; a literal `<|image_pad|>` in request text in
 parity mode (the reference raises on the placeholder count); the server's per-request image
@@ -408,6 +418,22 @@ decoder already matched it pixel for pixel; refusing it would diverge. It stays 
 with tEXt before IHDR is a parity case. A 15-minute differential run on the result executed
 185.9 million inputs with no finding; most mutated files now stop at the EOI requirement, as
 libjpeg's warning already kept them out of the comparison (`golden/fuzz-image-2026-10-07/review15/`).
+
+**Progressive scan work.** A progressive scan walks every block of its component even when its
+entropy data is empty, so a 10,130-byte file of 1,000 empty DC refinement scans over a 4096x4096
+grayscale frame asked for 262 million block visits. Before a scan is decoded, each coefficient it
+covers must now be at the bitplane the scan expects: a first scan may not repeat, an AC scan needs
+the component's DC, and a refinement continues from the previous bitplane. Decoding also draws on a
+block-visit budget of a quarter of the source-pixel limit (at least 1,024), charged for every
+component and scan, empty ones included: 16 full-resolution single-component passes at that
+limit. That file, and a 41,728-byte one of 883 legal split-band scans, are refused in 3 to 7 ms; a
+legal 203-scan progression of a small image still decodes at parity. Both checks are divergences:
+of five bitplane-order violations tried, Pillow decodes four (repeated first DC, repeated DC
+refinement, AC before DC, overlapping AC bands) and refuses a skipped bitplane, and it decodes a
+legal progression past the budget. A JFIF APP0 segment shorter than its fixed fields is refused,
+as Pillow refuses it. `tests/test_jpeg_regressions.py` (in `make test`) holds these files, plus
+RGB-coded files and cjpeg fixtures with separate DC scans, compared with Pillow byte for byte;
+the timings are `scan-work.log` in `golden/video-sync-2026-10-08/`.
 
 ## Numerical parity
 
@@ -778,7 +804,6 @@ invalid-byte/position checks also passed ASan. The two command/result ledgers ar
 
 ## Not done
 
-- Live or unknown-length video streams; video codecs outside H.264, HEVC, ProRes and MJPEG.
 - WebP (the hosted API accepts it); 16-bit, low-bit and interlaced PNGs; CMYK JPEGs.
 - Attention remains quadratic in patches. The large-image FP32 MPP path reduces its cost;
   further tensor-unit work remains open.

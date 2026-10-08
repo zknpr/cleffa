@@ -9,8 +9,7 @@ import json
 
 
 def encoded_line(request: dict, encoded, position_ids=None) -> str:
-    """position_ids: the [3][T] rotary positions of a record with images (Qwen3_5Model.get_rope_index);
-    with them the line also lists each image's first token index and patch grid."""
+    """[3][T] rotary positions and the first token/grid of each still image or video frame pair."""
     line = {
         "id": request["id"],
         "input_ids": list(encoded.input_ids),
@@ -26,11 +25,15 @@ def encoded_line(request: dict, encoded, position_ids=None) -> str:
         ],
     }
     if position_ids is not None:
-        starts, t = [], encoded.media["token_offset"]
-        for g in encoded.media["image_grid_thw"].tolist():
-            t += 1   # <|vision_start|>
-            starts.append([t, g[1], g[2]])
-            t += g[1] * g[2] // 4 + 1
+        starts = []
+        images = encoded.media["image_grid_thw"].tolist() if "image_grid_thw" in encoded.media else []
+        videos = encoded.media["video_grid_thw"].tolist() if "video_grid_thw" in encoded.media else []
+        grids = {1: iter(images), 2: iter([[1, h, w] for t, h, w in videos for _ in range(t)])}
+        types = encoded.media["mm_token_type_ids"]
+        for i, kind in enumerate(types):
+            if kind and (i == 0 or types[i - 1] != kind):
+                g = next(grids[int(kind)])
+                starts.append([encoded.media["token_offset"] + i, g[1], g[2]])
         line["images"] = starts
         line["position_ids"] = position_ids
     return json.dumps(line, ensure_ascii=False) + "\n"

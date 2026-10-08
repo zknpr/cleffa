@@ -65,6 +65,10 @@ bool clef_resize_bicubic_aa(const uint8_t *src, int sw, int sh, uint8_t *dst, in
 
 /* The whole pipeline after decoding. out->patches is malloc'd. */
 bool clef_image_preprocess(const clef_rgb *img, const clef_image_params *p, clef_image_patches *out, char *err, size_t errlen);
+/* One temporal group at an already checked video resize geometry. Both frames have the same
+ * source dimensions; pass the last frame twice to pad an odd-length video. */
+bool clef_video_pair_preprocess(const clef_rgb *first, const clef_rgb *second, int rh, int rw,
+                               clef_image_patches *out, char *err, size_t errlen);
 void clef_image_patches_free(clef_image_patches *p);
 
 /* Learned position table interpolation (get_vision_bilinear_indices_and_weights): for each patch

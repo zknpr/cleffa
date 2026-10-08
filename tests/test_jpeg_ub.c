@@ -11,13 +11,15 @@
  *                         scan has been decoded under UBSan)
  *   6 duplicate-scan      a 3-component baseline SOS naming component 1 three times, only table 1
  *                         defined: components 2 and 3 decoded with undefined table 0 (values[-1])
- * Every case must now be refused. Cases 3 and 4 decoded until the decoder began refusing blocks
+ * Cases 1-6 must now be refused. Cases 3 and 4 decoded until the decoder began refusing blocks
  * whose IDCT output leaves [-512, 511], where libjpeg's builds disagree (review #3, Codex on
  * 3f3eb03). Case 3's block still runs the whole 64-bit IDCT under UBSan before the refusal. Case 4
  * now stops at its first block, so its long accumulation no longer runs; a baseline file cannot
  * reach it any more, since every accepted block bounds the predictor, and the arithmetic stays
  * defined regardless (unsigned sum, 16-bit coefficient, a product below 2^31). Case 5 still
  * accumulates across a whole progressive scan before its refusal.
+ * Case 7 keeps a complete 1-pixel progressive image working under a 1-pixel source limit,
+ * despite the cumulative scan-work limit. It is a compatibility check.
  * Built with UBSan and ASan and -fno-sanitize-recover; includes clef_image.c so the decoders are
  * instrumented. Usage: test-jpeg-ub [CASE...]  (all cases without arguments) */
 #include "../clef_image.c"
@@ -77,7 +79,7 @@ static jbuf_t frame(int w, int h, uint8_t qt0, uint8_t dc_symbol, int dc_select,
     uint8_t dht_ac[18] = { 0x10, 1 };
     dht_ac[17] = 0x00;
     seg(&j, 0xc4, dht_ac, sizeof(dht_ac));
-    const uint8_t sos[6] = { 1, 1, (uint8_t)(dc_select << 4), 0, (uint8_t)(progressive ? 0 : 63), (uint8_t)(progressive ? 13 : 0) };
+    const uint8_t sos[6] = { 1, 1, (uint8_t)(dc_select << 4), 0, (uint8_t)(progressive ? 0 : 63), (uint8_t)(progressive && !zero_scan ? 13 : 0) };
     seg(&j, 0xda, sos, sizeof(sos));
     const long blocks = (long)((w + 7) / 8) * ((h + 7) / 8);
     if (zero_scan) {
@@ -88,6 +90,12 @@ static jbuf_t frame(int w, int h, uint8_t qt0, uint8_t dc_symbol, int dc_select,
             bits(&j, 0x7ff, 11);         /* +2047 */
             if (!progressive) bits(&j, 0, 1);   /* EOB */
         }
+        flush(&j);
+    }
+    if (progressive && zero_scan) {
+        const uint8_t ac_sos[6] = { 1, 1, 0, 1, 63, 0 };
+        seg(&j, 0xda, ac_sos, sizeof(ac_sos));
+        for (long b = 0; b < blocks; b++) bits(&j, 0, 1);
         flush(&j);
     }
     const uint8_t eoi[2] = { 0xff, 0xd9 };
@@ -120,7 +128,7 @@ static jbuf_t duplicate_scan_components(void) {
 }
 
 static int run(int c) {
-    static const char *names[] = { "", "undefined-dc-table", "dc-symbol-255", "idct-overflow", "dc-accumulation", "progressive-dc", "duplicate-scan-components" };
+    static const char *names[] = { "", "undefined-dc-table", "dc-symbol-255", "idct-overflow", "dc-accumulation", "progressive-dc", "duplicate-scan-components", "tiny-progressive-limited" };
     jbuf_t j;
     switch (c) {
     case 1: j = frame(8, 8, 1, 0, 1, false, true); break;
@@ -129,19 +137,22 @@ static int run(int c) {
     case 4: j = frame(1024, 512, 255, 11, 0, false, false); break;
     case 5: j = frame(128, 128, 1, 11, 0, true, false); break;
     case 6: j = duplicate_scan_components(); break;
+    case 7: j = frame(1, 1, 1, 0, 0, true, true); break;
     default: fprintf(stderr, "jpeg ub: no case %d\n", c); return 1;
     }
     clef_rgb rgb;
     char err[256] = "";
-    const bool ok = clef_image_decode(j.p, j.n, &rgb, err, sizeof(err));
+    const bool ok = c == 7 ? clef_image_decode_limited(j.p, j.n, 1, &rgb, err, sizeof(err)) :
+                            clef_image_decode(j.p, j.n, &rgb, err, sizeof(err));
     free(j.p);
-    const bool want_ok = false;
+    const bool want_ok = c == 7;
     if (ok != want_ok) {
         fprintf(stderr, "jpeg ub: case %d %s: %s\n", c, names[c], ok ? "decoded, expected refusal" : err);
         if (ok) clef_rgb_free(&rgb);
         return 1;
     }
     printf("jpeg ub: case %d %s: %s\n", c, names[c], ok ? "decoded" : "refused");
+    if (ok) clef_rgb_free(&rgb);
     return 0;
 }
 
@@ -152,9 +163,9 @@ int main(int argc, char **argv) {
         char *end;
         errno = 0;
         const long c = strtol(argv[i], &end, 10);
-        if (!*argv[i] || *end || errno || c < 1 || c > 6) { fprintf(stderr, "jpeg ub: case must be 1-6, not \"%s\"\n", argv[i]); return 2; }
+        if (!*argv[i] || *end || errno || c < 1 || c > 7) { fprintf(stderr, "jpeg ub: case must be 1-7, not \"%s\"\n", argv[i]); return 2; }
     }
     if (argc > 1) for (int i = 1; i < argc; i++) failures += run((int)strtol(argv[i], NULL, 10));
-    else for (int c = 1; c <= 6; c++) failures += run(c);
+    else for (int c = 1; c <= 7; c++) failures += run(c);
     return failures ? 1 : 0;
 }

@@ -87,7 +87,7 @@ TEXT_EXT = {'.json', '.jsonl', '.log', '.txt', '.md', '.csv', '.patch', '.diff',
 TEXT_NAMES = {'Makefile', 'LICENSE'}   # the only extensionless files admitted
 ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latency.json'}
 EXPERIMENT = re.compile(r'^[a-z0-9-]+-20\d{6}$')
-ORACLE_DIR = re.compile(r'^clef(-flash)?(-vision)?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
+ORACLE_DIR = re.compile(r'^clef(-flash)?(-(vision|video))?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
 
 EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
