@@ -47,8 +47,8 @@ make clean
 - `bench/compare_mlx.py T K N --output OUT.json` compares the MPP GEMM algorithm with MLX on
   identical FP16/BF16 operands and FP32 output. It requires optional MLX/NumPy dependencies;
   see `docs/rejected-experiments.md` for isolated installation, measurements and rejected probes.
-- `docs/` holds seven topic reports indexed by `docs/README.md`: performance history, attention,
-  prefix cache, hosted comparison, long-request timing, rejected experiments and vision. Add new
+- `docs/` holds eight topic reports indexed by `docs/README.md`: performance history, attention,
+  prefix cache, hosted comparison, long-request timing, rejected experiments, vision and video. Add new
   measurements to the matching report rather than starting a dated file. The raw evidence they
   cite lives in git-ignored `golden/<experiment>-<date>/` directories.
 - `third_party/iris/` holds the PNG/JPEG single-header decoders imported from ds4 (MIT,
@@ -104,7 +104,8 @@ and `clef-f32` (27B streamed FP32), both generated with `--safe-attn`. The visio
 `clef-flash-vision-f32s` (streamed, bitwise identical to it) and `clef-vision-f32` (27B streamed,
 `--safe-attn`). Vision golden `encoded.jsonl` lines also carry each image's token run and the
 reference's 3D `position_ids`; their `layers/` dumps hold the embeddings after the image features
-were scattered in, plus `vision.<k>` per image. `clef-unsafe-attn` and
+were scattered in, plus `vision.<k>` per image. The video corpus (`ref/corpus_video.py`, `--corpus video` on both oracles) has
+`clef-flash-video-f32` and `clef-video-f32` (streamed, `--safe-attn`). `clef-unsafe-attn` and
 `clef-f32-unsafe-attn` are the first 27B runs without it, kept as evidence of the MPS SDPA bug
 (wrong `r021`, and `r020` in FP32); don't compare against them. The `clef-f32-r020*`/`*-r021*`
 directories are single-request diagnostic runs with last-512-row layer dumps.
@@ -158,7 +159,9 @@ requests with images are rejected.
 
 `make test` runs the head and UTF-8 error unit tests, JSON byte parity, the image pipeline parity
 (`tests/test_image.py`: decode, resize, patches and position interpolation against PIL, torchvision
-and the processor), tokenizer parity against `gguf/clef-flash.gguf` + `model-flash`, HTTP
+and the processor; `tests/test_resize.py`, `tests/test_jpeg_regressions.py`), video host parity
+(`tests/test_video.py`: sampling, patches, timestamp tokens and positions against the processor),
+tokenizer parity against `gguf/clef-flash.gguf` + `model-flash`, HTTP
 write-failure handling, snapshot/GGUF verifier and numerical parity regressions using tiny generated
 fixtures, the model-free prefix-cache ownership, planner and test-mode checks, the Cloudflare
 collector/comparator unit tests, and the checkout latency report test.
@@ -187,6 +190,14 @@ tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.j
 tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl   # repeat with CLEF_VIS_F32=0, CLEF_ATTN_REF=1
 .venv/bin/python -B tests/test_server_images.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl
 .venv/bin/python -B tests/test_vision_cache.py gguf/clef-flash.gguf golden/clef-flash-vision-f32/requests.jsonl  # keyed image reuse, exact logits, poison
+
+# video (ref/corpus_video.py; tests/test_video.py runs in make test)
+.venv/bin/python -B tests/test_parity.py gguf/clef-flash.gguf golden/clef-flash-video-f32 --dump
+tests/test_batch.sh gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+tests/test_poison.sh gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+.venv/bin/python -B tests/test_vision_groups.py gguf/clef-flash.gguf      # grouped vs separate tower dispatches
+.venv/bin/python -B tests/test_server_video.py gguf/clef-flash.gguf golden/clef-flash-video-f32/requests.jsonl
+.venv/bin/python -B tests/test_video_request.py   # MP4/MOV converter; needs ffmpeg/ffprobe, not in make test
 
 # image decoders: libFuzzer with ASan and UBSan (Homebrew LLVM; Apple's clang has no libFuzzer).
 # The harness repairs PNG chunk CRCs and the zlib trailer, or mutations rarely pass them.
@@ -366,6 +377,7 @@ apply to videos. `max_video_*` limits are independent of still-image count/token
 pixels and concurrent media-request admission use the existing image limits. The standalone video
 corpus preserves existing image golden data: `ref/corpus_video.py`, `--corpus video` on both oracles,
 `tests/test_video.py` for exact host bytes, `tests/test_server_video.py` for HTTP/cache transitions.
+`docs/video.md` holds the parity, cost and validation-scope record.
 
 ### GPU forward (clef_metal.m + metal/clef.metal)
 
@@ -503,7 +515,8 @@ requests encode identically either way. Keep that asymmetry when adding options.
 8 SwiGLU, 16 vision compensation or plain 16-bit operands; default 31, 0 = BF16 backbone with FP32 vision),
 `CLEF_VIS_F32` (1, the default: retain f32 vision operands; 0: plain 16-bit per the mask),
 `CLEF_VIS_COMP` (1, the default: compensated non-residual vision GEMMs; 0: direct FP32),
-`CLEF_VIS_MPP` (1, the default: FP32 MPP vision attention at 2,048+ patches; 0: prior simdgroup kernel), `CLEF_HEAD_BF16=1`
+`CLEF_VIS_MPP` (1, the default: FP32 MPP vision attention at 2,048+ patches; 0: prior simdgroup kernel),
+`CLEF_VIS_GROUP=0` (one tower dispatch sequence per image or frame pair instead of shared projections), `CLEF_HEAD_BF16=1`
 (round the head's input to BF16 as HF does; with `CLEF_ACT_F16=0` this reproduces the pre-FP16 engine
 bitwise),
 `CLEF_DEBUG_F16_LIMIT` (lower the FP16 overflow limit to exercise the rerun),
@@ -663,7 +676,8 @@ mode) are there and in `docs/vision.md`.
   queued at once (slots held from before decoding until the patches are freed). Every image limit
   is a memory bound; check that a new one applies before the allocation it is meant to prevent.
 - `ref/corpus_vision.py` is the fixed 16-request vision corpus. Changing it invalidates every
-  `golden/*vision*` directory.
+  `golden/*vision*` directory. `ref/corpus_video.py` is the fixed 8-request video corpus; changing
+  it invalidates every `golden/*video*` directory.
 - The comment density is high and explains *why* (precision choices, parity reasoning, security).
   Match it.
 - `ref/corpus.py` is the fixed 22-request corpus for both parity and latency. Changing it invalidates
