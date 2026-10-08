@@ -218,6 +218,40 @@ SEQUENTIAL_SCAN_PER_COMPONENT_JPEG = (
 )
 
 
+# The same 24x16 image as a sequential JPEG with a Y scan, then Cb and Cr interleaved in one scan
+# (`cjpeg -quality 85 -sample 2x2,1x1,1x1 -scans` with "0; 1,2;").
+SEQUENTIAL_Y_THEN_CBCR_JPEG = (
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0d"
+    "Hx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4e"
+    "Hh4eHh4eHh7/wAARCAAQABgDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUF"
+    "BAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVW"
+    "V1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi"
+    "4+Tl5ufo6erx8vP09fb3+Pn6/9oACAEBAAA/AE8Qf8TP/hJ/+Fl/8ST+2vsn/C2PsPzf2D5OP7H+x48zf5+I/M2/aMZOfK7HiD/i"
+    "Z/8ACT/8LL/4kn9tfZP+FsfYfm/sHycf2P8AY8eZv8/EfmbftGMnPldjxB/xM/8AhJ/+Fl/8ST+2vsn/AAtj7D839g+Tj+x/sePM"
+    "3+fiPzNv2jGTnyux/wAgv/qov9h/9tv+Fn+f/wB/PP8A7Nz/ANPOzy/+WPY/5Bf/AFUX+w/+23/Cz/P/AO/nn/2bn/p52eX/AMse"
+    "x/yC/wDqov8AYf8A22/4Wf5//fzz/wCzc/8ATzs8v/lj2//EAB8BAAMBAQEBAQEBAQEAAAAAAAABAgMEBQYHCAkKC//EALURAAIB"
+    "AgQEAwQHBQQEAAECdwABAgMRBAUhMQYSQVEHYXETIjKBCBRCkaGxwQkjM1LwFWJy0QoWJDThJfEXGBkaJicoKSo1Njc4OTpDREVG"
+    "R0hJSlNUVVZXWFlaY2RlZmdoaWpzdHV2d3h5eoKDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT"
+    "1NXW19jZ2uLj5OXm5+jp6vLz9PX29/j5+v/aAAoCAhEDEQA/AAAA/9k="
+)
+
+
+def with_scan_order(jpeg: bytes, scan: int, order: tuple[int, ...]) -> bytes:
+    """The JPEG with the component selectors of its scan-th SOS listed in the given order; the
+    entropy-coded data is unchanged, so it is decoded in the new order."""
+    out, n = [], 0
+    for m, seg in jpeg_segments(jpeg):
+        if m == 0xDA:
+            if n == scan:
+                seg = bytearray(seg)
+                pairs = [bytes(seg[5 + 2 * k:7 + 2 * k]) for k in range(seg[4])]
+                seg[5:5 + 2 * len(pairs)] = b"".join(pairs[k] for k in order)
+                seg = bytes(seg)
+            n += 1
+        out.append(seg)
+    return b"".join(out)
+
+
 def jpeg_segments(jpeg: bytes) -> list[tuple[int, bytes]]:
     """(marker, bytes) for each segment from SOI to EOI, entropy-coded data attached to its SOS."""
     segs, pos = [(0xD8, jpeg[:2])], 2
@@ -567,7 +601,10 @@ def main() -> None:
             sys.exit("sequential fixture: expected a three-component SOF0 frame with three scans")
         for name, data in (("seq-scan-per-component", seq),
                            ("seq-cr-never-scanned", b"".join(s for i, (_, s) in enumerate(segs) if i != sos[2])),
-                           ("seq-cb-scanned-twice", b"".join(s for _, s in segs[:-1]) + segs[sos[1]][1] + b"\xff\xd9")):
+                           ("seq-cb-scanned-twice", b"".join(s for _, s in segs[:-1]) + segs[sos[1]][1] + b"\xff\xd9"),
+                           # a partial scan may list its components in a later-first order, which
+                           # libjpeg accepts and decodes in scan order (Codex on 1a0b186)
+                           ("seq-cr-then-cb", with_scan_order(base64.b64decode(SEQUENTIAL_Y_THEN_CBCR_JPEG), 1, (1, 0)))):
             cases.append((name, base64.b64encode(data).decode(), Image.open(io.BytesIO(data)), MIN_PIXELS, MAX_PIXELS))
         lines = [json.dumps({"image": b64, "out": f"{tmp}/{name}", "min_pixels": mn, "max_pixels": mx})
                  for name, b64, _, mn, mx in cases]
@@ -676,7 +713,24 @@ def main() -> None:
         scan_first = (segs[0][1] + b"".join(s for m, s in segs if m not in (0xD8, 0xC0, 0xDA, 0xD9)) +
                       next(s for m, s in segs if m == 0xDA) + frame + b"\xff\xd9")
         two_frames = b"".join(s + s if m == 0xC0 else s for m, s in segs)
-        for name, data in (("sos-before-sof", scan_first), ("two-sof", two_frames),
+        # A full scan out of frame order (libjpeg: "Invalid component ID") and refinement scans whose
+        # Al is not Ah - 1 (JERR_BAD_PROGRESSION): the decoder decoded both, the first with its
+        # planes swapped (Codex on 1a0b186).
+        rgb = io.BytesIO()
+        Image.fromarray(synth(np.random.default_rng(71), 16, 24)).save(rgb, "JPEG", quality=85, subsampling=0)
+        prog = io.BytesIO()
+        Image.fromarray(synth(np.random.default_rng(71), 16, 24)).save(prog, "JPEG", quality=85, progressive=True)
+        refine = next(i for i, (m, s) in enumerate(jpeg_segments(prog.getvalue()))
+                      if m == 0xDA and s[5 + 2 * s[4] + 2] == 0x10)
+        def with_ahal(value: int) -> bytes:
+            segs_ = jpeg_segments(prog.getvalue())
+            seg = bytearray(segs_[refine][1])
+            seg[5 + 2 * seg[4] + 2] = value
+            return b"".join(bytes(seg) if i == refine else s for i, (_, s) in enumerate(segs_))
+        for name, data in (("scan-order-102", with_scan_order(rgb.getvalue(), 0, (1, 0, 2))),
+                           ("scan-order-210", with_scan_order(rgb.getvalue(), 0, (2, 1, 0))),
+                           ("refine-ah2-al0", with_ahal(0x20)), ("refine-ah1-al1", with_ahal(0x11)),
+                           ("sos-before-sof", scan_first), ("two-sof", two_frames),
                            ("no-dqt", no_dqt), ("dqt-wrong-id", wrong_id), ("dqt-after-scan", after_scan),
                            ("dqt1-after-first-scan", late_table1), ("ac-category-15", single_coefficient_jpeg(1, 16384)),
                            ("idct-513", single_coefficient_jpeg(0, 4104))):
@@ -702,7 +756,7 @@ def main() -> None:
         # the crafted JPEGs' unmodified sources still decode, and PIL reads the unusual sampling layout
         Image.open(io.BytesIO(base64.b64decode(LUMA_UNDER_CHROMA_JPEG))).load()
         print("errors: bad base64, truncated PNG, aspect ratio, 16-bit PNG, a non-base64 data URL, a progressive scan "
-              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, a scan before the frame header, two frame headers, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
+              "with Se = 255, a luma-under-chroma JPEG, fill before stuffed zeros, JPEGs cut before their first scan, a scan before the frame header, two frame headers, full scans out of frame order, refinements with Al != Ah - 1, undefined quantization tables, IDCT output beyond [-512, 511], seven malformed zlib "
               "streams and three corrupt CRCs rejected"
               if not failures else "errors: see above")
     sys.exit(1 if failures else 0)

@@ -91,4 +91,5 @@ empty = b"\x00\x00\x00\x00IDAT" + (0x35AF061E).to_bytes(4, "big")   # CRC-32 of 
 save(data[:first_idat] + empty + data[first_idat:], "empty-first-idat.png")
 # a sequential frame with one scan per component (Codex on a82292d)
 save(base64.b64decode(test_image.SEQUENTIAL_SCAN_PER_COMPONENT_JPEG), "sequential-scan-per-component.jpg")
+save(test_image.with_scan_order(base64.b64decode(test_image.SEQUENTIAL_Y_THEN_CBCR_JPEG), 1, (1, 0)), "sequential-cr-then-cb.jpg")
 print(f"{n} seeds in {out}")

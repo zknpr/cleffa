@@ -42,7 +42,7 @@ Byte parity with the reference, `make test`:
 
 | Check | Test | Result |
 |---|---|---|
-| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and three sequential frames split across scans) | 97/97 byte-identical to PIL, torchvision and the processor's `pixel_values` |
+| Decode, resize, patches, position interpolation | `tests/test_image.py` (60 random PNG/JPEG images of every color type, up- and downscaling, `media_kwargs` bounds, plus three DEFLATE variants and seven JPEG layouts Pillow cannot write: two with a DC scan per component, 4:4:0 chroma, SOF1, two with fill bytes before every marker and a one-component frame declaring 2x2; 13 with rewritten JFIF/Adobe markers and component ids, four of them RGB-coded; and nine for quantization-table latching, AC categories above 10, the IDCT range and runs overshooting their band; two PNGs with empty IDAT chunks; and four sequential frames split across scans) | 98/98 byte-identical to PIL, torchvision and the processor's `pixel_values` |
 | Request encoding with images (ids, spans, image runs, 3D positions) | `tests/test_record.py` (43 image requests among 3,089) | 3,089/3,089 |
 | Rejections | both | lone `media_kwargs` bound, other processor arguments, videos, non-list images, bad base64, truncated/unsupported images, placeholder text in parity mode |
 
@@ -357,6 +357,20 @@ and the same request is refused before preprocessing at 127 MB, a fourth `tests/
 peak. With truncation allowed the state yields to the images and is tokenized after them, as before.
 `tests/test_truncation.py` adds the same boundary sweep with a 256-token image: refusal is exactly
 where the reference would truncate, and accepted ids equal reference-mode encoding.
+
+A twelfth round (Codex on `1a0b186`) raised two points, both confirmed against `djpeg` and Pillow.
+(34) A full baseline scan listing its components out of frame order was decoded in frame order,
+coefficients landing on the wrong planes; libjpeg refuses all five other orders of a three-component
+scan ("Invalid component ID"). Its `get_sos` searches each scan entry's component from that entry's
+position on, so a partial scan may still reorder forward (Cr then Cb), and libjpeg decodes that in
+scan order, as the buffered sequential path already did. The decoder now searches the same way.
+(35) A refinement scan whose Al is not Ah - 1 (Ah 2 and Al 0, or Ah 1 and Al 1) was decoded where
+libjpeg fails with `JERR_BAD_PROGRESSION`; it is now refused, and that rule replaces an `Ah > 13`
+check that had refused the legal Ah 14, Al 13. `tests/test_image.py` adds both scan orders and both
+approximation pairs as refusals (all decoded before), and a Y-then-CbCr cjpeg file with its chroma
+scan reordered as a parity case (a guard: it decoded correctly before too). A 15-minute
+differential run on the result executed 89.8 million inputs with no finding
+(`golden/fuzz-image-2026-10-07/review12/`).
 
 ## Numerical parity
 

@@ -86,6 +86,8 @@
  *   - a sequential frame may split its components across scans: its coefficients are buffered
  *     and finished like a progressive frame's, as libjpeg does; a scan before the frame header,
  *     or a second frame header, is refused (JERR_SOS_NO_SOF, JERR_SOF_DUPLICATE);
+ *   - scan components are looked up from the scan position on, as libjpeg does, so a full scan
+ *     out of frame order is refused, and a refinement scan needs Al = Ah - 1;
  *   - 0xFF fill bytes before a marker are skipped one at a time, so "FF FF D9" is an EOI;
  *     inside entropy data "FF FF 00" (not standard) is refused, since libjpeg-turbo's own
  *     result for it depends on how its input is buffered. */
@@ -1583,9 +1585,14 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
                 int cs = file_data[pos + 3 + i * 2];
                 int td_ta = file_data[pos + 4 + i * 2];
 
-                /* Find component index */
+                /* Find component index. cleffa: from this scan position on, as libjpeg's get_sos
+                 * searches: entry i names a component at frame index i or later, so a full scan
+                 * lists the frame's components in order and a partial one may only reorder
+                 * forward (Cr then Cb is accepted, Cb then Y is not). A full baseline scan in
+                 * another order was decoded in frame order, its planes swapped; libjpeg refuses
+                 * it, "Invalid component ID" (Codex on 1a0b186). */
                 int comp_idx = -1;
-                for (int j = 0; j < dec.num_components; j++) {
+                for (int j = i; j < dec.num_components; j++) {
                     if (dec.comp[j].id == cs) {
                         comp_idx = j;
                         dec.comp[j].dc_idx = td_ta >> 4;
@@ -1613,7 +1620,11 @@ jpeg_image *jpeg_load_mem(const uint8_t *file_data, size_t file_size) {
              * block's coefficients (jpeg_prog_decode_ac_first/_refine); bound it as
              * libjpeg's jdinput.c does before any scan data is read. */
             if (dec.is_progressive) {
-                if (dec.ss > 63 || dec.se > 63 || dec.ss > dec.se || dec.ah > 13 || dec.al > 13) goto fail;
+                /* cleffa: a refinement scan must lower the precision by one bit, Al = Ah - 1, as
+                 * libjpeg's start_pass_phuff_decoder requires (JERR_BAD_PROGRESSION); others were
+                 * decoded (Codex on 1a0b186). That also bounds Ah, where Ah = 14 had been refused. */
+                if (dec.ss > 63 || dec.se > 63 || dec.ss > dec.se || dec.al > 13) goto fail;
+                if (dec.ah != 0 && dec.al != dec.ah - 1) goto fail;
                 if (dec.ss == 0 && dec.se != 0) goto fail;      /* a DC scan carries DC only */
                 if (dec.ss != 0 && ns != 1) goto fail;          /* AC scans are one component */
             } else if (dec.ss != 0 || dec.se != 63 || dec.ah != 0 || dec.al != 0) {
