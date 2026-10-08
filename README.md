@@ -14,6 +14,11 @@ project, not affiliated with or endorsed by Cloudflare.
 
 Text, images and video. BF16 weights, never quantized.
 
+To see it work, [cleffa showcase](https://github.com/zknpr/cleffa-showcase) is a browser client
+for `clef-server`: live camera, video, batch triage and repeated questions on one image, with
+every option's probability. Run it next to the server, or open
+[cleffa.zknpr.xyz](https://cleffa.zknpr.xyz) and connect your own engine.
+
 ## Requirements
 
 - **Tested hardware:** only an M5 Max with 128 GB, on macOS 27.
