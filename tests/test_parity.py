@@ -61,6 +61,8 @@ def main() -> None:
     parser.add_argument("--max-layer-rel-l2", type=tolerance, default=0.01)
     parser.add_argument("--bound-by", type=Path, metavar="FP32_GOLDEN",
                         help="GOLDEN is FP64; allow each question FP32_GOLDEN's own error (Omni)")
+    parser.add_argument("--report", type=Path, metavar="JSONL",
+                        help="write each question's errors (and the bound's) for comparing builds")
     args = parser.parse_args()
     gguf, golden, do_dump = args.gguf, args.golden, args.dump
     requests = golden / "requests.jsonl"
@@ -158,6 +160,7 @@ def main() -> None:
         sys.exit("engine failed")
     golden_logits = load_file(str(golden / "logits.safetensors"))
     bound_logits = load_file(str(args.bound_by / "logits.safetensors")) if args.bound_by else None
+    report = args.report.open("w") if args.report else None
     rows = list(io.StringIO(out.stdout))
     max_dl = max_dp = 0.0
     n_q = agree = 0
@@ -199,6 +202,10 @@ def main() -> None:
                 limit_l = max(limit_l, float(np.abs(b - g).max()))
                 limit_p = max(limit_p, float(np.abs(softmax(b) - softmax(g)).max()))
                 agrees = agrees or e.argmax() == b.argmax()
+            if report:
+                report.write(json.dumps({"id": req["id"], "question": qid, "logit_error": dl, "prob_error": dp,
+                                         "limit_logit": limit_l, "limit_prob": limit_p,
+                                         "argmax_equal": bool(e.argmax() == g.argmax())}) + "\n")
             if not (np.isfinite(dl) and np.isfinite(dp)) or dl > limit_l or dp > limit_p:
                 print(f"  {req['id']}/{qid}: FAIL |d logit|={dl:.6g} (limit {limit_l:.6g}), "
                       f"|d p|={dp:.6g} (limit {limit_p:.6g})")
@@ -210,6 +217,8 @@ def main() -> None:
             max_dl, max_dp = max(max_dl, dl), max(max_dp, dp)
     print(f"decisions: argmax agreement {agree}/{n_q}; max |d logit| {max_dl:.4f}; max |d p| {max_dp:.4f}"
           + (f" (worst {worst[0]}/{worst[1]})" if worst else ""))
+    if report:
+        report.close()
     if agree != n_q or n_q == 0:
         failures += max(1, n_q - agree)
     sys.exit(1 if failures else 0)

@@ -361,6 +361,7 @@ test: clef-tool clef-server tests/test-dump tests/test-base64 tests/test-vision-
 	.venv/bin/python -B tests/test_omni_qualification_checks.py
 	.venv/bin/python -B tests/test_verify_snapshot.py
 	.venv/bin/python -B tests/test_parity_checks.py
+	.venv/bin/python -B tests/test_compare_fp64_errors.py
 	.venv/bin/python -B tests/test_prefix_cache_checks.py
 	.venv/bin/python -B tests/test_prefix_checkpoint_checks.py
 	.venv/bin/python -B tests/test_cloudflare_checkout.py
