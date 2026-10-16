@@ -221,7 +221,7 @@ def capture_native(plan_path: Path, output: Path, model: str) -> None:
     command = [str(ROOT/'clef-server'), '-m', str(weights), '--port', str(port),
                '--no-warmup', '--no-keep-warm', '--max-images', '0', '--max-image-tokens', '0',
                '--max-videos', '0', '--max-video-frames', '0', '--max-video-tokens', '0',
-               '--max-body', '67108864']
+               '--max-body', '67108864', '--allow-encoded-video']
     report = dict(complete=False, arm='strict native HTTP', model=model,
         started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
         plan_sha256=hashlib.sha256(raw).hexdigest(), command=command, strict=True,
