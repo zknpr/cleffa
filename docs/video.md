@@ -58,7 +58,10 @@ use the existing image limits.
 
 Build the optional worker with `make media`, using the FFmpeg development libraries
 and pkg-config. `clef`, `clef-server` and `clef-tool` find `clef-media` beside their
-own executable. A missing worker is an explicit request error. The main executables
+own executable. The server accepts uploads only with `--allow-encoded-video` and the CLI unless it
+gets `--no-encoded-video`; a refused upload is rejected before any decoding. `clef-tool` always
+allows them. A missing worker is an explicit
+request error. The main executables
 retain their existing dependencies; no Python interpreter participates in decoding.
 
 The wire forms are `{"content_type":"video/mp4","base64":"..."}`,

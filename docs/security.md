@@ -40,8 +40,12 @@ Requests and GGUF files are treated as untrusted:
   full-resolution passes at the source-pixel limit: a progressive scan walks every block even with
   empty entropy data, so a 10 KB file of 1,000 empty refinement scans over a 4096x4096 frame asked
   for 262 million block visits. It is now refused in 3 ms (`tests/test_jpeg_regressions.py`).
-- **Video:** once `clef-media` is built (`make media`) and sits beside the executable, the CLI and
-  server accept MP4/MOV uploads; there is no flag, so remove the binary to close that path. libav
+- **Video:** MP4/MOV uploads need the `clef-media` worker (`make media`) beside the executable.
+  The server refuses them unless started with `--allow-encoded-video`; the CLI, as the test
+  harness, accepts them unless given `--no-encoded-video` (the same asymmetry as strict mode); a
+  refused clip is rejected before its envelope is decoded or a process starts
+  (`tests/test_server_encoded_video.py`, `tests/test_cli_errors.py`). `clef-tool`, the host test
+  driver, always allows them. libav
   decodes each clip in a child process started without a shell. It inherits only stdin (a private,
   unlinked copy of the clip), stdout and stderr, may open no other resource, and is killed after 30
   seconds. Input is capped at 64 MiB, sampled RGB at 256 MiB and its JSON output at 384 MiB

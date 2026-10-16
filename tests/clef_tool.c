@@ -223,6 +223,7 @@ int main(int argc, char **argv) {
         }
         clef_vision_opts vision = {0};
         if (!clef_vision_opts_load(&f, &vision, err, sizeof(err))) { fprintf(stderr, "%s\n", err); return 1; }
+        vision.allow_encoded_video = true;   /* host test driver: encoded-video parity runs here */
         clef_audio_opts audio = {.max_items=4,.max_samples=4800000};
         if (!clef_audio_opts_load(&f,&audio,err,sizeof(err))) { fprintf(stderr,"%s\n",err);return 1; }
         while ((line = read_line(stdin, &len))) {

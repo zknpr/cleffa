@@ -70,8 +70,9 @@ PyAV 19.0.1; a decoder upgrade needs requalification. The checked build links li
 reference/conversion dependency.
 
 **Encoded video.** The optional `clef-media` C worker links the codec libraries; the inference
-executables do not. Build it with `make media` and keep it beside the CLI, server and host tool.
-It accepts MP4/MOV base64 envelopes or data URLs in `videos`, preserving soundtracks. No Python
+executables do not. Build it with `make media`, keep it beside the CLI, server and host tool,
+and start the server with `--allow-encoded-video` (the CLI accepts uploads by default). It
+accepts MP4/MOV base64 envelopes or data URLs in `videos`, preserving soundtracks. No Python
 runtime is needed for this path. See [the video report](video.md#encoded-uploads) for bounds and
 isolation.
 

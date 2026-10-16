@@ -24,7 +24,7 @@ class EncodedVideoServer(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self.path = Path(tmp) / 'clip.mov'
             for model, family, audio in [('clef-flash', 'qwen3_5', False),
-                                         ('clef-omni-full', 'qwen3_omni_moe', True)]:
+                                         ('clef-omni', 'qwen3_omni_moe', True)]:
                 with self.subTest(model=model):
                     self.model = ROOT / 'gguf' / (model + '.gguf')
                     self.clip(audio=audio)
@@ -35,7 +35,14 @@ class EncodedVideoServer(unittest.TestCase):
                                'base64': base64.b64encode(self.path.read_bytes()).decode()}]}
                     # A soft cap above the processor's hard cap must still accept
                     # bounded clips, exactly as the original frame-array path did.
+                    # Uploads are opt-in: without the flag the server refuses the clip
+                    # before spawning a decoder, and frame arrays keep working.
                     with self.server('--max-video-frames', '1000') as (port, log):
+                        status, body = self.post(port, encoded)
+                        self.assertEqual(status, 400, body)
+                        self.assertIn('--allow-encoded-video', json.dumps(body))
+                        self.assertEqual(self.post(port, frames)[0], 200)
+                    with self.server('--max-video-frames', '1000', '--allow-encoded-video') as (port, log):
                         status, expected = self.post(port, frames)
                         self.assertEqual(status, 200, expected)
                         with ThreadPoolExecutor(max_workers=2) as pool:

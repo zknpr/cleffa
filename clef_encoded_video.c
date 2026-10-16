@@ -109,6 +109,8 @@ bool clef_video_expand(const jval *request,clef_encode_opts opts,clef_video_requ
     const jval *videos=json_get(request,"videos");if(!videos||videos->type!=J_ARRAY||!videos->n)return true;
     size_t encoded=0;for(size_t i=0;i<videos->n;i++)encoded+=!json_get(videos->items[i],"frames");
     if(!encoded)return true;
+    // Refused before the envelope is decoded or a worker is spawned; see allow_encoded_video.
+    if(!opts.vision.allow_encoded_video)return error(err,errlen,"MP4/MOV uploads are disabled (clef-server --allow-encoded-video enables them)");
     if(encoded!=videos->n)return error(err,errlen,"use encoded clips or frame arrays consistently in one request");
     if(!opts.vision.video_token_id)return error(err,errlen,"model has no video tower");
     if(videos->n>32||(opts.vision.max_videos>0&&videos->n>(size_t)opts.vision.max_videos))return error(err,errlen,"too many videos");

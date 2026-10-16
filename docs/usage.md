@@ -49,10 +49,11 @@ A request's `videos` list holds ordered frame arrays, `{"frames": [...], "fps": 
 takes the same PNG/JPEG forms as `images`, and `fps` is the source frame rate, in `(0, 1000]`.
 Frames must share dimensions, at least 32 pixels a side.
 
-After `make media`, the CLI and server also accept MP4/MOV uploads as
-`{"content_type":"video/mp4","base64":"..."}` or `data:video/quicktime;base64,...`.
-The native `clef-media` worker decodes in a bounded child process. Keep it beside
-the executable. Omni includes the soundtrack; dense models use video only.
+After `make media`, MP4/MOV uploads are accepted as `{"content_type":"video/mp4","base64":"..."}`
+or `data:video/quicktime;base64,...`: by the CLI unless it gets `--no-encoded-video`, by the
+server only with `--allow-encoded-video`. The native `clef-media` worker decodes in a bounded child
+process without an OS sandbox ([security](security.md#untrusted-inputs)); keep it beside the
+executable. Omni includes the soundtrack; dense models use video only.
 URLs and file paths are rejected. [Decoder limits and isolation](video.md#encoded-uploads)
 apply before the normal frame, token and audio limits.
 
@@ -281,6 +282,8 @@ same for videos (default 0, the processor and context bounds). For Omni, `--max-
 `--max-audio-samples N` bound clips per request (default 4, soundtracks included) and total samples
 (default 4,800,000, 300 seconds at 16 kHz) on both the CLI and the server; 0 removes that limit
 only.
+`--no-encoded-video` makes the CLI refuse MP4/MOV uploads; the server refuses them unless started
+with `--allow-encoded-video`.
 For diagnostics, `CLEF_PROFILE=1` reports GPU time per kernel category (it serializes the GPU,
 so don't use it for latency) and `CLEF_ATTN_REF=1` switches to the simple reference attention
 kernel. `CLEF_ATTN_TU=0` selects the prior tiled FP32 attention path; the

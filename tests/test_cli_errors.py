@@ -3,6 +3,7 @@
 The HTTP arm starts its own localhost server and stops it before exiting.
 """
 
+import base64
 import http.client
 import json
 import os
@@ -110,6 +111,25 @@ class CliErrors(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0)
                 self.assertIn("command buffer", json.loads(p.stdout)["error"])
                 self.assertIn("(16384 tokens)", p.stderr)
+
+    def test_encoded_video_cli_default_and_opt_out(self):
+        # The CLI, as the test harness, decodes uploads by default (clef-server needs
+        # --allow-encoded-video). Bytes with an MP4 signature pass the envelope checks, so by
+        # default the request reaches the worker (missing or rejecting the clip); with
+        # --no-encoded-video nothing is spawned.
+        clip = base64.b64encode(b"\0\0\0\x18ftypisom" + bytes(16)).decode()
+        request = {**REQUEST, "videos": ["data:video/mp4;base64," + clip]}
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}
+        env["CLEF_DEBUG_NIL_CMDBUF"] = "1"
+        for flags, disabled in (([], False), (["--no-encoded-video"], True)):
+            with self.subTest(flags=flags):
+                p = subprocess.run([ROOT / "clef", "-m", MODEL, *flags],
+                                   input=json.dumps(request) + "\n", text=True,
+                                   capture_output=True, timeout=60, env=env)
+                self.assertEqual(p.returncode, 0, p.stderr)
+                error = json.loads(p.stdout)["error"]
+                self.assertIn("encoded video", error)
+                self.assertEqual("disabled" in error, disabled, error)
 
     def test_unwritable_stdout_is_an_error(self):
         # Small responses fail on fflush; the long model name also exercises a write

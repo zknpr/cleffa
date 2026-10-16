@@ -22,6 +22,9 @@
  *                 (default: the decoders' 64-megapixel cap)
  *   --max-videos N, --max-video-frames N, --max-video-tokens N bound video work (0: processor/context).
  *   --max-audio N, --max-audio-samples N bound clips and total samples (defaults 4 and 4800000).
+ *   --no-encoded-video refuse MP4/MOV uploads instead of decoding them with the clef-media worker.
+ *                 The CLI, as the test harness, allows them by default; clef-server does not
+ *                 (--allow-encoded-video), the same asymmetry as --strict.
  * Images are data URLs or {"content_type","base64"} objects (the hosted API's forms; bare base64
  * is accepted too) in the request's "images" list.
  */
@@ -126,6 +129,7 @@ static bool parse_count(const char *s, long max, long *out) {
 int main(int argc, char **argv) {
     const char *model = NULL, *input = NULL, *dump_path = NULL, *route_path = NULL;
     bool logits = false, timing = false, strict = false, no_truncate = true, prefix_cache = false, template_cache = false;
+    bool allow_encoded_video = true;
     int batch = 1;
     int dump_last = 0;
     int max_images = 0;
@@ -172,6 +176,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--logits")) logits = true;
         else if (!strcmp(argv[i], "--time")) timing = true;
         else if (!strcmp(argv[i], "--strict")) strict = true;
+        else if (!strcmp(argv[i], "--no-encoded-video")) allow_encoded_video = false;
         else if (!strcmp(argv[i], "--truncate")) no_truncate = false;
         else if (!strcmp(argv[i], "--no-truncate")) no_truncate = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump_path = argv[++i];
@@ -192,7 +197,7 @@ int main(int argc, char **argv) {
             prefix_cache = template_cache = true;
         }
         else if (argv[i][0] != '-' && !input) input = argv[i];
-        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-length N] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-videos N] [--max-video-frames N] [--max-video-tokens N] [--max-audio N] [--max-audio-samples N] [--dump FILE] [--dump-routes FILE] [--dump-last N] [requests.jsonl]\n"); return 2; }
+        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-length N] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-videos N] [--max-video-frames N] [--max-video-tokens N] [--max-audio N] [--max-audio-samples N] [--no-encoded-video] [--dump FILE] [--dump-routes FILE] [--dump-last N] [requests.jsonl]\n"); return 2; }
     }
     if (!model || batch < 1) { fprintf(stderr, "clef: -m MODEL.gguf is required\n"); return 2; }
     if (prefix_cache && (batch != 1 || dump_path || route_path)) { fprintf(stderr, "clef: %s takes one request per pass and no diagnostic dumps\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
@@ -267,6 +272,7 @@ int main(int argc, char **argv) {
             opts.vision.max_videos = max_videos;
             opts.vision.max_video_frames = max_video_frames;
             opts.vision.max_video_tokens = max_video_tokens;
+            opts.vision.allow_encoded_video = allow_encoded_video;
             it->ok = it->encoded = it->req && clef_encode_request(e->tok, it->req, opts, &it->rec, it->err, sizeof(it->err));
         }
         /* getline() returns -1 for EOF and for a read error (EISDIR, EIO, ENOMEM) alike; an error

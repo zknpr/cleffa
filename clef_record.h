@@ -80,6 +80,12 @@ typedef struct {
     int max_videos;                 /* per request; 0: bounded only by context */
     int max_video_frames;           /* sampled frames per video; 0: processor's 768-frame cap */
     long max_video_tokens;          /* per video after resizing; 0: context bound */
+    /* MP4/MOV uploads in "videos" are decoded by the clef-media libav child process, which runs
+     * with the caller's privileges and no OS sandbox. Zero-initialized options refuse them;
+     * clef-server enables them only with --allow-encoded-video, so having clef-media beside a
+     * server does not by itself expose libav to every client. The CLI, as the test harness,
+     * enables them unless --no-encoded-video (the --strict asymmetry). Frame arrays are unaffected. */
+    bool allow_encoded_video;
 } clef_vision_opts;
 
 typedef struct {

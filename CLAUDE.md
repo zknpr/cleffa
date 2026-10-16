@@ -573,6 +573,9 @@ class reached 46/46 there without lowering the error; FP16 on all classes cut it
 `<|im_end|>` etc. cannot become control tokens. Server default is strict (`--no-strict` for reference
 parity); CLI default is parity (`--strict` to opt in) because the CLI is the test harness. Benign
 requests encode identically either way. Keep that asymmetry when adding options.
+Encoded MP4/MOV uploads follow it: `clef_vision_opts.allow_encoded_video` is false when
+zero-initialized, the server sets it only with `--allow-encoded-video`, the CLI unless
+`--no-encoded-video`, and `clef-tool` always.
 
 ### Debug / diagnostic env vars
 

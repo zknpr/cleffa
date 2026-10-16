@@ -63,8 +63,8 @@ with Python `-B`.
   byte. An image costs one token per 32x32 pixels of the resized image, from 64 up to 16,384, so
   shrink photos or pass `"media_kwargs": {"min_pixels": ..., "max_pixels": ...}`. The server allows
   4 images and 1,024 tokens per image by default.
-- **Video:** `videos` takes frame arrays, `{"frames": [...], "fps": 24}`, or MP4/MOV uploads once
-  `make media` has built the `clef-media` worker. `tools/video_request.py` converts a local clip
+- **Video:** `videos` takes frame arrays, `{"frames": [...], "fps": 24}`, or MP4/MOV uploads when
+  `make media` has built the `clef-media` worker (the server also needs `--allow-encoded-video`). `tools/video_request.py` converts a local clip
   to frames. Frames are sampled at 2 FPS and paired for the tower; the server allows one video,
   32 sampled frames and 1,024 tokens per video by default.
 - **Audio (Omni):** `audio` takes finite mono 16 kHz sample arrays or inline WAV;
@@ -208,9 +208,10 @@ Requests and GGUF files are treated as untrusted. In summary:
 - **Bounded parsing:** every GGUF count, offset, type and shape is checked; JSON depth is capped at
   512 and duplicate-key and NFC handling are linear-time; images, video frames and audio are
   capped before decoding or allocating, and the server bounds concurrently held media requests.
-- **The video worker is not sandboxed:** with `clef-media` beside the executable, uploaded MP4/MOV
-  clips are decoded by libav in a child process with a deadline and size caps, but it runs as the
-  server's user. Remove the binary to close that path.
+- **The video worker is not sandboxed:** uploaded MP4/MOV clips are decoded by libav in a child
+  process with a deadline and size caps, but it runs as the caller's user. The server refuses
+  uploads unless started with `--allow-encoded-video`; the CLI, as the test harness, accepts them
+  unless given `--no-encoded-video`.
 - **Server exposure:** the server binds to localhost. One GPU serves one FIFO queue and keep-alive
   connections can hold slots, so put it behind an authenticating proxy with per-client rate and
   connection limits before exposing it.
