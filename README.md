@@ -111,7 +111,8 @@ and [docs/prefix-cache.md](docs/prefix-cache.md).
 
 Hosted decision agreement and labeled accuracy are the primary metrics. On the 2026-10-10 core
 comparison, decisions agree with Cloudflare's hosted API on 80/81 questions for Flash, 80/81 for
-the 27B and 86/93 for Omni, whose video discrepancies remain unresolved. On paired labeled text
+the 27B and 86/93 for Omni; on the generated corpora's ground truth, native is right on three of
+Omni's seven disagreements and hosted on two ([docs/omni.md](docs/omni.md#hosted-and-labeled-agreement)). On paired labeled text
 subsets, a corrected BF16 PyTorch comparison finds no significant accuracy difference from
 cleffa ([hosted and labeled results](docs/hosted-comparison.md#fresh-core-comparison-2026-10-10)).
 

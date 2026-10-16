@@ -254,6 +254,11 @@ provenance is producer-reported. These small stratified subsets are not the publ
 benchmark. Evidence:
 `golden/evaluation-standard-2026-10-10/labeled/omni-completed-20261011/manifest.json`.
 
+A 2026-10-17 recapture with the exact-rotary Omni default (CLI) reproduces every native decision
+on both subsets and the core 86/93 agreement with the same seven disagreements, scored against
+these saved hosted answers with no new calls. Ground truth for the core disagreements is in
+[the Omni report](omni.md#hosted-and-labeled-agreement); evidence is in `golden/omni-recheck-20261017/`.
+
 ## Corrected BF16 comparison, 2026-10-11
 
 The stock Flash CLINC shift comes from PyTorch 2.11 MPS `scaled_dot_product_attention(...,

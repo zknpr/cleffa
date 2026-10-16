@@ -9,7 +9,8 @@ and host-side byte parity. Clef-Omni's status is in [the Omni report](omni.md).
 Hosted decision agreement and paired labeled accuracy are the primary evaluation
 metrics. The fresh 2026-10-10 core comparison gives 80/81 decisions agreeing with
 hosted for Flash, 80/81 for 27B, and 86/93 for Omni. Omni's video discrepancies
-remain unresolved. On exact-body paired labeled text subsets, Omni agrees with
+remain unresolved; against the generated ground truth, native is right on three of the
+seven Omni disagreements and hosted on two ([table](omni.md#hosted-and-labeled-agreement)). On exact-body paired labeled text subsets, Omni agrees with
 hosted on 383/385 BANKING77 and 331/332 CLINC decisions (mixed CLI/HTTP native captures);
 Flash scores higher than hosted on BANKING77. The earlier stock BF16 CLINC
 advantage used PyTorch 2.11 MPS with incorrect implicit causal attention. The corrected

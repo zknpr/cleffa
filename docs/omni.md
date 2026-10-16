@@ -570,7 +570,34 @@ probe supports a hosted serialization difference behind two records' two-token c
 On exact-body paired labeled subsets, native/hosted accuracy is 355/385 versus 356/385 on BANKING77
 (decision agreement 383/385) and 327/332 versus 326/332 on CLINC150+OOS (331/332), exact McNemar
 p = 1.0 for both, with no significant difference
-([expanded results](hosted-comparison.md#expanded-omni-labeled-results-2026-10-11)). The earlier
+([expanded results](hosted-comparison.md#expanded-omni-labeled-results-2026-10-11)).
+
+**Recheck on the exact-rotary default, 2026-10-17.** Recapturing native answers with the current
+default and scoring them against the saved hosted answers (no new hosted calls) gives the same
+results. Core agreement stays 86/93 with the same seven disagreements; the mean maximum
+probability difference moves from 0.04378 to 0.04381. On the labeled subsets every decision
+matches the earlier native capture (385/385 on BANKING77, all 453 on CLINC), so accuracy stays
+355/385 and 327/332 (447/453 on the full CLINC subset). The largest probability change is 0.015
+on BANKING77 and 0.028 on CLINC.
+
+Agreement with hosted is not the target. The generated corpora fix the true answer for six of the
+seven core disagreements, and hosted is wrong on more of them than native:
+
+| Question | Truth (generator) | Native | Hosted | Correct |
+|---|---|---|---|---|
+| `ot001/direction` | right: the box moves right in every clip (`ref/corpus_video.py` `frames`) | left | still | neither |
+| `ot003/moving` | true | true | false | native |
+| `ot003/direction` | right | right | still | native |
+| `ot004/direction` | right: both attached videos move right | right | still | native |
+| `oav002/audible` | true: 2 s of uniform ±0.2 noise (`ref/corpus_omni_av.py`) | false | true | hosted |
+| `r015/language` | ja: one Japanese sentence plus Latin-script filler | en | ja | hosted |
+| `r021/service` | none: a long log with no designed answer | billing | db-primary | — |
+
+On `oav002` and `r015` the native answer equals the FP64 reference's, so the released weights,
+computed exactly, answer wrong there; hosted reaches the right answer through arithmetic or
+preprocessing that is not visible. Hosted answers "still" on every moving clip, so matching it
+on video would make three correct answers wrong. Evidence and the recompute script:
+`golden/omni-recheck-20261017/`. The earlier
 stock BF16 CLINC advantage on Flash came from PyTorch 2.11's incorrect implicit causal attention on
 MPS; the corrected eager comparison does not address Omni's hosted differences or its numerical
 failures ([corrected comparison](hosted-comparison.md#corrected-bf16-comparison-2026-10-11)).
@@ -588,7 +615,9 @@ accuracy estimate, and no faulty native operation was isolated. Evidence:
   their last 512 rows, so earlier rows of the four long records are not compared.
 - **FP32-compatible branches.** Unmerged and no longer needed for acceptance. Merging one would
   also mean accepting C++ PocketFFT and SLEEF-derived code, absent from `THIRD_PARTY_NOTICES.md`.
-- **Hosted differences.** Seven core disagreements, four of them on video, remain unexplained.
+- **Hosted differences.** Seven core disagreements, four of them on video, remain unexplained;
+  against the generated ground truth native is right on three, hosted on two
+  ([table](#hosted-and-labeled-agreement)).
   The stock BF16 control and stock PyTorch latency are unmeasured because the stock loader crossed
   the 32 GiB memory reserve and was stopped.
 - **Coverage.** Encoded video is checked with one generated H.264/AAC MOV; general codec coverage
