@@ -116,3 +116,6 @@ records, converter and verifier fixtures, reference staging, memory guards and q
 bookkeeping. The model-backed matrix runs one gate at a time through
 `tests/test_omni_qualification.py --model gguf/clef-omni.gguf --inventory INVENTORY.json --output DIR`;
 its references, gates and current results are in [the Omni report](omni.md#numerical-verification-policy).
+Acceptance of an arithmetic change runs `tests/test_parity.py gguf/clef-omni.gguf FP64_GOLDEN
+--bound-by FP32_GOLDEN --report DIR/NAME.jsonl` for every FP64 reference on both the baseline and
+the candidate, then `tests/compare_fp64_errors.py BASE_DIR CANDIDATE_DIR` for non-inferiority.

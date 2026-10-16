@@ -30,7 +30,9 @@ owns audio placements and multimodal positions. Float frontend parity follows th
 bounded policy in the Omni report. Omni acceptance is FP64-bounded (user decision,
 2026-10-16): `tests/test_parity.py MODEL FP64_GOLDEN --bound-by FP32_GOLDEN` against the
 independent CPU FP64 reference, allowing each question the larger of the fixed limits and the
-FP32 blocked-attention reference's own error; layer L2 is a diagnostic. Routing is reported only
+FP32 blocked-attention reference's own error; layer L2 is a diagnostic. Every arithmetic change
+must also be non-inferior to the build it replaces (`test_parity.py --report` for both, then
+`tests/compare_fp64_errors.py`), because the bound alone admits regressions where FP32 is far off. Routing is reported only
 as a diagnostic; historical FP64 arbitration does not qualify a run. Never relax the limits
 beyond that bound to obtain a passing result.
 
@@ -602,7 +604,6 @@ swiglu, head, vision and, for Omni, omni_router, omni_experts and omni_moe, with
 serializes the GPU, so not for latency),
 `CLEF_STAGE_TIME=1` (host encode, commit-to-completion wait, GPU execution and CPU head time),
 `CLEF_ATTN_TU=0` (tiled FP32 attention control; compensated tensor-unit attention defaults on),
-`CLEF_OMNI_ATTN=comp` (Omni attention compensates every 8-key product; the default compensates per 32-key block),
 `CLEF_ATTN_REF=1` (reference attention kernels for the backbone and the vision tower), `CLEF_DEBUG_POISON=1`, `CLEF_DEBUG_FAIL_MULTI=1`
 (fails every multi-record forward; exercises the server's per-record retry), `CLEF_SCAN_LPC`
 (lanes per value column in the sequential `gdn_scan`), `CLEF_DEBUG_NIL_CMDBUF=N` (the Nth Metal command-buffer

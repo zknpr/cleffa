@@ -1548,11 +1548,21 @@ the same attention change without it passed. The 22-bit Q/K operands feed long-c
 Rejected and removed.
 
 **Plain FP32 attention accumulation, 2026-10-17.** Summing every probability-value product in
-plain FP32 cut attention to 187 ms at 2,231 tokens and 3.38 s at 8,069 and passed the
-FP64-bounded check, but drifts by about n * eps / 2 on flat rows (1.56e-5 at 8,193 keys against
-2.98e-8 compensated), about 2e-3 at the 64k context where no reference checks it. The retained
-block-compensated form ([performance history](performance-history.md#omni-block-compensated-attention-2026-10-17))
-keeps most of the gain with error that does not grow with length. Evidence for both:
+plain FP32 cut attention to 187 ms at 2,231 tokens and 3.38 s at 8,069 (from 322 ms and 4.24 s)
+and passed the FP64-bounded check, but drifts by about n * eps / 2 on flat rows (1.56e-5 at 8,193
+keys against 2.98e-8 compensated), about 2e-3 at the 64k context where no reference checks it.
+Not kept.
+
+**Block-compensated attention, 2026-10-17.** Summing each 32-key block's four products in plain
+FP32 and folding the block into the two-float accumulators once kept flat-row error bounded
+(7.45e-8 at both 2,049 and 8,193 keys), cut attention to 262 ms and 3.62 s, made whole requests
+3.7%, 5.4% and 9.3% faster at 2,231, 8,069 and 16,344 tokens, and passed the FP64-bounded check
+on all 43 requests. It was merged, then reverted: compared directly with the previous default
+against FP64 (`tests/compare_fp64_errors.py`), mean logit error over all 93 questions rose
+27.2% and mean probability error 40.8%, against a 7.2% / 6.7% spread between the two FP32
+PyTorch references, and every long-request question got worse (`r020/service` |d p| 0.000816 →
+0.009748, `r021/service` 0.002549 → 0.007324). That comparison is now part of the acceptance
+check ([policy](omni.md#numerical-verification-policy)). Evidence for both:
 `golden/omni-attention-block-20261017/`.
 
 **Expert GEMM bandwidth.** `bench/expert_bench.m` reproduces the expert GEMMs at 298 tokens: 128
