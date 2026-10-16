@@ -24,6 +24,7 @@ class CliErrors(unittest.TestCase):
         for flags in (["--prefix-cache", "--template-cache"],
                       ["--template-cache", "--prefix-cache"],
                       ["--template-cache", "--batch", "2"],
+                      ["--template-cache", "--dump-routes", "/unused"],
                       ["--template-cache", "--dump", "/unused"]):
             with self.subTest(flags=flags):
                 p = subprocess.run([ROOT / "clef", "-m", "/nonexistent", *flags],
@@ -35,7 +36,9 @@ class CliErrors(unittest.TestCase):
     def test_image_limit_flags_are_validated_before_model_open(self):
         # negatives, non-numbers, suffixes, empty and out-of-range values: atoi would have read "foo"
         # as 0, which means unlimited, so a typo silently lifted the cap (review #3)
-        for args in (["--max-images", "-1"], ["--max-image-tokens", "-5"], ["--max-images", "foo"], ["--max-image-tokens", "1k"],
+        for args in (["--max-audio", "-1"], ["--max-audio", "2147483648"], ["--max-audio-samples", "1.5"],
+                     ["--max-audio-samples", "18446744073709551616"], ["--max-audio", "oops"],
+                     ["--max-images", "-1"], ["--max-image-tokens", "-5"], ["--max-images", "foo"], ["--max-image-tokens", "1k"],
                      ["--max-images", ""], ["--max-image-tokens", "99999999999999999999"],
                      ["--max-image-pixels", "16M"], ["--max-image-pixels", "-1"], ["--max-image-requests", "x"],
                      ["--max-image-requests", "99999999999"], ["--max-videos", "-1"],
@@ -49,6 +52,14 @@ class CliErrors(unittest.TestCase):
                     self.assertEqual(p.returncode, 2, p.stderr)
                     self.assertIn(args[0], p.stderr)
                     self.assertNotIn("cannot open", p.stderr)
+
+    def test_dump_limit_is_validated_before_model_open(self):
+        for value in ("0", "-1", "1k", "", "99999999999999999999"):
+            p = subprocess.run([ROOT/"clef", "-m", "/nonexistent", "--dump-last", value],
+                               text=True, capture_output=True)
+            self.assertEqual(p.returncode, 2)
+            self.assertIn("--dump-last", p.stderr)
+            self.assertNotIn("cannot open", p.stderr)
 
     def test_server_size_flags_are_validated_before_model_open(self):
         # strtoull accepts "-1" (wrapping to ULLONG_MAX) and trailing junk, and the MiB shift can

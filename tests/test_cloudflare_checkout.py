@@ -12,6 +12,49 @@ from cloudflare_checkout import collect, response_info
 
 
 class ResponseTests(unittest.TestCase):
+    def test_budget_stop_prevents_dispatch_and_resume_does_not_repeat_calls(self):
+        import hashlib
+        payload={'model':'clef','state':'test','questions':{'q':{}}}
+        row=dict(model='clef',id='probe',request=payload,full_input_tokens=10,
+                 request_sha256=hashlib.sha256(json.dumps(payload).encode()).hexdigest())
+        with patch('cloudflare_checkout.http.client.HTTPSConnection') as connection:
+            def stop(*args): raise ValueError('free allowance exhausted')
+            with self.assertRaisesRegex(ValueError,'free allowance'):
+                collect(dict(requests=[row],passes=2),io.StringIO(),'a'*32,'secret',before_call=stop)
+            connection.return_value.request.assert_not_called()
+        out=io.StringIO();seen=[]
+        with patch('cloudflare_checkout.http.client.HTTPSConnection') as connection:
+            response=connection.return_value.getresponse.return_value
+            response.status=422;response.read.return_value=b'{"errors":["invalid request"]}'
+            response.getheader.return_value=None
+            collect(dict(requests=[row],passes=2,completed_calls=[['clef','probe',-1],['clef','probe',0]],
+                         record_validation_failures=True),out,'a'*32,'secret',after_call=seen.append)
+            connection.return_value.request.assert_called_once()
+        self.assertEqual(len(seen),1)
+        self.assertEqual(json.loads(out.getvalue())['pass'],1)
+        self.assertIn('error',seen[0])
+
+    def test_fresh_passes_record_timestamps_revisions_and_gap(self):
+        import hashlib
+        payload = {'model':'clef','state':'test','questions':{'q':{'type':'noul'}}}
+        row = dict(model='clef', id='probe', request=payload, full_input_tokens=10,
+                   request_sha256=hashlib.sha256(json.dumps(payload).encode()).hexdigest())
+        out = io.StringIO()
+        with patch('cloudflare_checkout.http.client.HTTPSConnection') as connection, \
+             patch('cloudflare_checkout.time.sleep') as sleep:
+            response = connection.return_value.getresponse.return_value
+            response.status = 200
+            response.read.return_value = json.dumps(dict(answers={'q':{'type':'noul','noul':.5}},
+                                                        usage={'input_tokens':10})).encode()
+            response.getheader.side_effect = lambda name: 'revision-fake-secret' if name == 'x-model-version' else None
+            collect(dict(requests=[row],passes=2,pass_gap_seconds=60),out,'a'*32,'fake-secret')
+            sleep.assert_called_once_with(60)
+        calls = list(map(json.loads,out.getvalue().splitlines()))
+        self.assertEqual([call['pass'] for call in calls],[-1,0,1])
+        for call in calls:
+            self.assertLessEqual(call['started_at'],call['completed_at'])
+            self.assertEqual(call['model_revision_headers']['x-model-version'],'revision-[REDACTED]')
+
     def setUp(self):
         self.expected = {"request": {"questions": {"urgent": {}}}, "full_input_tokens": 4510}
         self.answer = {"answers": {"urgent": {"noul": 0.9}}, "usage": {"input_tokens": 4510}}

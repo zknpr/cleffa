@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 
 
-def encoded_line(request: dict, encoded, position_ids=None) -> str:
+def encoded_line(request: dict, encoded, position_ids=None, *, media_layout=None) -> str:
     """[3][T] rotary positions and the first token/grid of each still image or video frame pair."""
     line = {
         "id": request["id"],
@@ -24,7 +24,11 @@ def encoded_line(request: dict, encoded, position_ids=None) -> str:
             for q in encoded.questions
         ],
     }
-    if position_ids is not None:
+    if media_layout is not None:
+        if position_ids is not None:
+            raise ValueError('position_ids and media_layout are mutually exclusive')
+        line.update(media_layout)
+    elif position_ids is not None:
         starts = []
         images = encoded.media["image_grid_thw"].tolist() if "image_grid_thw" in encoded.media else []
         videos = encoded.media["video_grid_thw"].tolist() if "video_grid_thw" in encoded.media else []

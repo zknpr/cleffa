@@ -2,6 +2,7 @@
 # and ref/oracle*.py)
 /model/
 /model-flash/
+/model-omni/
 /gguf/
 /golden/
 golden-*.log
@@ -15,8 +16,11 @@ __pycache__/
 /clef
 /clef-server
 /clef-tool
+/clef-media
 /tests/test-head-attend
 /tests/test-head-linear
+/tests/test-head-load
+/tests/test-dense-buffers
 /tests/test-head-parallel
 /tests/test-head-parallel-tsan
 /tests/test-record-errors
@@ -42,6 +46,27 @@ __pycache__/
 /tests/test-vision-buffers
 /tests/test-base64
 /tests/test-vision-config
+/tests/test-omni-config
+/tests/test-omni-attention
+/tests/test-omni-assign
+/tests/test-omni-moe
+/tests/test-omni-router
+/tests/test-omni-buffers
+/tests/test-omni-deepstack
+/tests/test-omni-positions
+/tests/test-omni-audio
+/tests/test-audio
+/tests/test-audio-buffers
+/tests/test-audio-record
+/tests/test-audio-frontend
+/tests/audio-features
+/tests/audio-frontend-probe
+/tests/audio-layout
+/tests/audio-tower
+/tests/omni-layer-probe
+/tests/test-dump
+/tests/test-media-audio-format
+/tests/test-video-worker
 /tests/test-jpeg-ub
 /fuzz-image
 /fuzz-jpeg-diff
@@ -57,6 +82,7 @@ __pycache__/
 /jev.api
 docs/handoff-2026-10-03-throughput.md
 
-# Claude Code local settings and agent worktrees
+# agent-local state: Claude Code settings and worktrees, Superpowers plans and execution scratch
 /.claude/settings.local.json
 /.claude/worktrees/
+/.superpowers/

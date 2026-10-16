@@ -113,7 +113,13 @@ def run_bounded(command, limit, deadline):
             process.wait()
 
 
-def convert(path, request, *, fps=2.0, num_frames=None, max_frames=32, max_body=8 << 20, timeout=30):
+def convert(path, request, *, fps=2.0, num_frames=None, max_frames=32, max_body=8 << 20, timeout=30,
+            model_family='qwen3_5', max_audio_samples=4800000):
+    if model_family not in ('qwen3_5','qwen3_omni_moe'):
+        raise ValueError('unsupported model family')
+    omni=model_family=='qwen3_omni_moe'
+    if omni and (fps != 2 or num_frames is not None):
+        raise ValueError('Omni requires timestamp sampling at 2 FPS without num_frames')
     if not math.isfinite(fps) or not 0 < fps <= 1000:
         raise ValueError('sampling fps must be in (0,1000]')
     if not 1 <= max_frames <= 768 or num_frames is not None and not 1 <= num_frames <= 768:
@@ -150,10 +156,16 @@ def convert(path, request, *, fps=2.0, num_frames=None, max_frames=32, max_body=
         clip = Path(td) / 'input.mov'
         clip.write_bytes(data)
         del data
-        probe = run_bounded(['ffprobe', '-v', 'error', *INPUT_OPTIONS, '-select_streams', 'v',
-                             '-show_entries', 'stream=codec_name,width,height,nb_frames,avg_frame_rate',
+        probe = run_bounded(['ffprobe', '-v', 'error', *INPUT_OPTIONS, *([] if omni else ['-select_streams','v']),
+                             '-show_entries', 'stream=codec_type,codec_name,width,height,nb_frames,avg_frame_rate,time_base',
                              '-of', 'json', str(clip)], 65536, deadline)
         streams = json.loads(probe)['streams']
+        soundtrack=None
+        if omni:
+            if any(s.get('codec_type')=='audio' for s in streams):
+                from audio_request import decode_audio,wav_data_url
+                soundtrack=wav_data_url(decode_audio(clip,max_samples=max_audio_samples,deadline=deadline))
+            streams=[s for s in streams if s.get('codec_type')=='video']
         if len(streams) != 1:
             raise ValueError('exactly one video track is required')
         stream = streams[0]
@@ -169,19 +181,47 @@ def convert(path, request, *, fps=2.0, num_frames=None, max_frames=32, max_body=
             raise ValueError('clip exceeds 18000 frames / 600 seconds or has invalid FPS')
         if not 32 <= width <= 16384 or not 32 <= height <= 16384 or width * height > MAX_PIXELS:
             raise ValueError('source dimensions exceed pixel limit or are below 32 pixels')
-        count = num_frames if num_frames is not None else min(max(int(total / source_fps * fps), 4), 768, total)
-        if count > total or count > max_frames:
-            raise ValueError(f'{count} sampled frames exceeds source count or --max-frames={max_frames}; lower --fps/--num-frames')
-        indices = [round(i * ((total - 1) / (count - 1))) for i in range(count)] if count > 1 else [0]
-        if count > 1:
-            indices[-1] = total - 1
+        source_pixels=width*height
+        if omni:
+            times=run_bounded(['ffprobe','-v','error',*INPUT_OPTIONS,'-select_streams','v:0',
+                               '-show_frames','-show_entries','frame=pts,chroma_location','-of','json',str(clip)],3<<20,deadline)
+            frames=json.loads(times)['frames']
+            if len(frames)!=total: raise ValueError('decoded timeline disagrees with container frame count')
+            time_base=Fraction(stream['time_base'])
+            indices=[]
+            for i,frame in enumerate(frames):
+                if 'pts' not in frame: continue
+                stamp=float(int(frame['pts'])*time_base)
+                if not math.isfinite(stamp): raise ValueError('invalid frame timestamp')
+                if stamp+1e-6>=len(indices)/2: indices.append(i)
+            count=len(indices)
+            if not count or count+(count%2)>max_frames:
+                raise ValueError('Omni sampled frames including final duplication exceed --max-frames')
+            locations={frames[i].get('chroma_location','unspecified') for i in indices}
+            chroma={'unspecified':0,'left':1,'center':2,'topleft':3,'top':4,'bottomleft':5,'bottom':6}
+            if len(locations)!=1 or next(iter(locations)) not in chroma:
+                raise ValueError('Omni conversion requires a fixed supported chroma location')
+            location=chroma[next(iter(locations))]
+            scale=min(1.,math.sqrt(256*32*32/source_pixels))
+            width=max(2,round(width*scale/2)*2);height=max(2,round(height*scale/2)*2)
+        else:
+            count = num_frames if num_frames is not None else min(max(int(total / source_fps * fps), 4), 768, total)
+            if count > total or count > max_frames:
+                raise ValueError(f'{count} sampled frames exceeds source count or --max-frames={max_frames}; lower --fps/--num-frames')
+            indices = [round(i * ((total - 1) / (count - 1))) for i in range(count)] if count > 1 else [0]
+            if count > 1:
+                indices[-1] = total - 1
         size = width * height * 3
         if size * count > MAX_RAW:
             raise ValueError('sampled RGB exceeds 256 MiB; lower sampling count or source dimensions')
         select = "select='" + '+'.join(f'eq(n,{i})' for i in indices) + "'"
+        # FFmpeg's scale auto mode assumes centered chroma, while PyAV's
+        # sws_scale_frame consumes frame metadata. Preserve the declared location
+        # explicitly or downscaled H.264 pixels differ despite equal dimensions.
+        if omni: select+=f',scale={width}:{height}:flags=bilinear:in_chroma_loc={location}'
         # Software frame threads preserve the exact RGB conversion. Cap each stage at four
         # workers and reduce parallelism with source size, down to one for large sources.
-        threads = str(max(1, min(4, MAX_PIXELS // (width * height))))
+        threads = str(max(1, min(4, MAX_PIXELS // source_pixels)))
         command = ['ffmpeg', '-v', 'error', '-nostdin', '-xerror', *INPUT_OPTIONS,
                            '-threads', threads, '-max_pixels', str(MAX_PIXELS), '-err_detect', 'explode',
                            '-noautorotate', '-i', str(clip), '-map', '0:v:0', '-an', '-sn', '-dn',
@@ -190,7 +230,15 @@ def convert(path, request, *, fps=2.0, num_frames=None, max_frames=32, max_body=
 
         def serialize(images):
             vk['do_sample_frames'] = False
-            result['videos'] = [{'frames': images, 'fps': source_fps, 'frame_indices': indices, 'total_num_frames': total}]
+            if omni:
+                if len(images)%2: images=images+[images[-1]]
+                vk['fps']=2
+                result['videos']=[{'frames':images,'fps':2}]
+                if soundtrack is not None:
+                    result['videos'][0]['audio']=soundtrack
+                    vk['use_audio_in_video']=True
+            else:
+                result['videos'] = [{'frames': images, 'fps': source_fps, 'frame_indices': indices, 'total_num_frames': total}]
             serialized = json.dumps(result, ensure_ascii=False, allow_nan=False, separators=(',', ':')) + '\n'
             if len(serialized.encode('utf-8')) > max_body:
                 raise OutputLimitError('request exceeds --max-body')
@@ -231,7 +279,9 @@ def main():
     group.add_argument('--num-frames', type=int, help='explicit sampled frame count')
     parser.add_argument('--max-frames', type=int, default=32)
     parser.add_argument('--max-body', type=int, default=8 << 20, help='maximum output bytes, default 8 MiB')
+    parser.add_argument('--max-audio-samples',type=int,default=4800000,help='Omni soundtrack sample limit at 16 kHz')
     parser.add_argument('--timeout', type=float, default=30, help='probe plus decode deadline in seconds')
+    parser.add_argument('--model-family',choices=['qwen3_5','qwen3_omni_moe'],default='qwen3_5')
     args = parser.parse_args()
     try:
         with args.request.open('rb') as source:
@@ -239,7 +289,8 @@ def main():
         if len(raw) > 8 << 20:
             raise ValueError('request template exceeds 8 MiB')
         result = convert(args.clip, json.loads(raw), fps=args.fps, num_frames=args.num_frames,
-                         max_frames=args.max_frames, max_body=args.max_body, timeout=args.timeout)
+                         max_frames=args.max_frames, max_body=args.max_body, timeout=args.timeout,model_family=args.model_family,
+                         max_audio_samples=args.max_audio_samples)
     except (OSError, ValueError, KeyError) as exc:
         parser.exit(1, f'video_request: {exc}\n')
     sys.stdout.write(result)

@@ -1,0 +1,119 @@
+{
+  "repo": "Cloudflare/clef-omni",
+  "revision": "0db1cd2607d76a7bdb2a382f659e7b313079f84b",
+  "source": "https://huggingface.co/api/models/Cloudflare/clef-omni/revision/0db1cd2607d76a7bdb2a382f659e7b313079f84b?blobs=true",
+  "files": {
+    ".gitattributes": {
+      "size": 1570,
+      "hash": "52373fe24473b1aa44333d318f578ae6bf04b49b"
+    },
+    "LICENSE": {
+      "size": 11544,
+      "hash": "f938136e3adacfd92be087f6e113b5d6d97f678f"
+    },
+    "README.md": {
+      "size": 10419,
+      "hash": "15b25dd309cdbc140eb59bb27c250448ebb96df4"
+    },
+    "chat_template.jinja": {
+      "size": 6519,
+      "hash": "1efcce1402ae5d1d61d4a4cf56accea5921251cf"
+    },
+    "config.json": {
+      "size": 13671,
+      "hash": "18c714a7fa2d8881e8e1441ec3759b6338c9c5ea"
+    },
+    "generation_config.json": {
+      "size": 146,
+      "hash": "59f9fe8f7db6b35dc244fc7eb52743b31533bbb5"
+    },
+    "joint_head.safetensors": {
+      "size": 218364000,
+      "hash": "d5ee8d7e75c9a503edce94400dda9074fc0f2f4d62729012bf0a827df947ba9c"
+    },
+    "joint_head_config.json": {
+      "size": 119,
+      "hash": "e9ed6f616016c6c6e4bc7437a0a0e2ec5de08942"
+    },
+    "joint_schema_model.py": {
+      "size": 29376,
+      "hash": "61de2f67fd6880ae0efd97521e3cf86fea537d8e"
+    },
+    "model-00001-of-00015.safetensors": {
+      "size": 4997899632,
+      "hash": "c9d19a20a3ae967e9d0e603a21494aceb4447fdd97878f759924d5b35b8f9803"
+    },
+    "model-00002-of-00015.safetensors": {
+      "size": 4997754216,
+      "hash": "cd8c09ee40792a40dffcbc6eade1c83c6356cb6d662b8a5124305e6755d28259"
+    },
+    "model-00003-of-00015.safetensors": {
+      "size": 4997754216,
+      "hash": "c37e3fee71e8ecb8952868bbdda16dbce5246d33dff0efa264762447896f4d51"
+    },
+    "model-00004-of-00015.safetensors": {
+      "size": 4997755648,
+      "hash": "68b643796653a0eb78ea90381564f44e75b922070ae20963fe8c0e9e2450f40e"
+    },
+    "model-00005-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "6a333846a40416c2c70ce916600a2817932ff5f64f8ca34a9e62807dbda7fd91"
+    },
+    "model-00006-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "44c9929f4e348ddc4d8b42b6ce16e00f482f3467a74b0cd9548cc8a08e9095f6"
+    },
+    "model-00007-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "1812065f61317f429286451db4899342744964eabeb3ef5d376fb32f345e2aa2"
+    },
+    "model-00008-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "dacccad2028f0a8e2393ff87c7a42ee74532cebfd9616144f14ff055a8152fb1"
+    },
+    "model-00009-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "b1111e4a69c181f0fda808cdeecfe4e1d7b27b856604d7b8335c5375537aae06"
+    },
+    "model-00010-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "4a7518df7919f5e22502e6e4df1f19ee751e1140e127af2ba09adbc93a2a2f17"
+    },
+    "model-00011-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "92c75abe9d87cb67c67605a631e09c89a54c764e2a710e981a6dc5bf56a924ba"
+    },
+    "model-00012-of-00015.safetensors": {
+      "size": 4997755792,
+      "hash": "a4da2ff05a5d6ef7dabc195572cbea02d41233742a60f63f79484487ef617551"
+    },
+    "model-00013-of-00015.safetensors": {
+      "size": 4999771808,
+      "hash": "f858752d0c8dd3809b58005b86ae2098e8f381103be43ec2cc4fe362613d6eb0"
+    },
+    "model-00014-of-00015.safetensors": {
+      "size": 4996618552,
+      "hash": "73f09f187ff7b469a8937b39b8ac772e539e0d61311526c345558c5e6a6eb09a"
+    },
+    "model-00015-of-00015.safetensors": {
+      "size": 553698794,
+      "hash": "68880d566a50643807a4e73f5227c4f468bb31532925ed5fae78a51bdd39492a"
+    },
+    "model.safetensors.index.json": {
+      "size": 2727313,
+      "hash": "e76526beedd5a797e9ae24890a4501b3483241c1"
+    },
+    "processor_config.json": {
+      "size": 2356,
+      "hash": "a6ead2a8b5e68eb4719df71d1c65e412d31e1c4d"
+    },
+    "tokenizer.json": {
+      "size": 11424262,
+      "hash": "a7d41145c408f3062e824f965be1c29854cd809e111cdf8170aa8b0bcd5d1fab"
+    },
+    "tokenizer_config.json": {
+      "size": 907,
+      "hash": "08027b3984b45c48d87e24a3f487b7023e985e44"
+    }
+  }
+}

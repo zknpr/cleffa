@@ -6,29 +6,37 @@
 #include <stdint.h>
 
 #include "clef_gguf.h"
+#include "clef_dump.h"
+#include "clef_model.h"
 #include "clef_record.h"
 #include "clef_tok.h"
 
 #define CLEF_MAX_LAYERS 128
 #define CLEF_MAX_VLAYERS 64
+#define CLEF_MAX_ALAYERS 32
 
 typedef struct {
+    clef_model_info model;
     int n_layer, H, ffn, nh, nkv, hd, n_rot;
     float eps, rope_theta;
     int layer_full[CLEF_MAX_LAYERS];         /* 1: gated full attention, 0: Gated DeltaNet */
     int ssm_kernel, Hk, Hv, dk, dv;
+    int n_expert, n_expert_used;
     int vocab;
     /* joint head */
     int W, routing_layers, head_layers, head_heads, head_ff;
     /* vision tower (Qwen3_5VisionModel); has_vision is 0 for a model file converted without it */
     int has_vision, v_layers, v_E, v_ff, v_heads, v_hd, v_patch, v_merge, v_temporal, v_pos_side, v_in;
+    int v_deepstack[3];
     float v_eps;
+    clef_audio_config audio;
 } clef_config;
 
 typedef struct {
     const gguf_tensor *attn_norm, *ffn_norm, *ffn_gate_up, *ffn_down;
     const gguf_tensor *attn_qkv, *attn_output, *attn_q_norm, *attn_k_norm;
     const gguf_tensor *ssm_in, *ssm_out, *ssm_conv1d, *ssm_dt, *ssm_a, *ssm_norm;
+    const gguf_tensor *ffn_router, *ffn_gate_up_exps, *ffn_down_exps;
 } clef_layer_w;
 
 typedef struct {
@@ -36,11 +44,28 @@ typedef struct {
 } clef_vlayer_w;
 
 typedef struct {
+    const gguf_tensor *norm_w, *norm_b, *fc1_w, *fc1_b, *fc2_w, *fc2_b;
+} clef_vmerger_w;
+
+typedef struct {
+    const gguf_tensor *q_w, *q_b, *k_w, *k_b, *v_w, *v_b, *out_w, *out_b;
+    const gguf_tensor *ln1_w, *ln1_b, *ln2_w, *ln2_b, *up_w, *up_b, *down_w, *down_b;
+} clef_alayer_w;
+
+typedef struct {
+    const gguf_tensor *conv_w[3], *conv_b[3], *conv_out;
+    const gguf_tensor *ln_w, *ln_b, *proj1_w, *proj1_b, *proj2_w, *proj2_b;
+    clef_alayer_w layer[CLEF_MAX_ALAYERS];
+} clef_audio_weights;
+
+typedef struct {
     const gguf_tensor *token_embd, *output_norm, *output;
     clef_layer_w layer[CLEF_MAX_LAYERS];
     /* vision tower: BF16 matrices, F32 norms and biases, the BF16 position table */
     const gguf_tensor *v_patch_w, *v_patch_b, *v_pos, *v_post_ln_w, *v_post_ln_b, *v_mm0_w, *v_mm0_b, *v_mm2_w, *v_mm2_b;
     clef_vlayer_w vlayer[CLEF_MAX_VLAYERS];
+    clef_vmerger_w v_deepstack[3];
+    clef_audio_weights audio;
 } clef_weights;
 
 typedef struct clef_head clef_head;
@@ -57,19 +82,24 @@ typedef struct {
     clef_gpu *gpu;
     uint64_t instance_id;  /* cache ownership; unique for each successful or attempted open */
     clef_vision_opts vision;   /* for clef_encode_opts.vision: the model's image preprocessing; limits left at 0 */
+    clef_audio_opts audio;
+    bool capture_routes, routes_valid; /* opt-in, most recent successful single-record pass only */
+    int route_rows;                    /* capture last N rows, 0 = all; no retention when disabled */
 } clef_engine;
 
-/* The images of one packed batch, for the GPU: each image's patches, the pass row whose record
+/* Media of one packed batch, for the GPU: each image's patches, the pass row whose record
  * overflow slot it reports to, and its first row in the feature buffer. img_row[t] is the feature
  * row that replaces token t's embedding, -1 for a text token (clef_record_positions-style
- * bookkeeping done by clef.c). */
+ * bookkeeping done by clef.c). Borrowed records retain clip-local padding and audio scatter
+ * rows; their storage remains owned by the request for the complete synchronous pass. */
 typedef struct { const clef_image_patches *pt; int ovf_row, feat_row; } clef_gpu_image;
 /* cache/reuse are only for a keyed prefix entry whose owner checked exact image identity.
  * Cached descriptors retain all images, including ones entirely before the resumed row. */
 typedef struct {
     const clef_gpu_image *img; int n; const int32_t *img_row;
     bool cache, reuse;
-} clef_gpu_images;
+    const clef_record *records; /* optional borrowed n_seq records for audio, never a prefix-cache entry */
+} clef_gpu_media;
 
 /* GPU outputs the head consumes, for one packed batch (row-major, token-major). */
 typedef struct {
@@ -86,6 +116,8 @@ void clef_close(clef_engine *e);
  * clef_free_probs). Returns false with err set on failure. */
 bool clef_run(clef_engine *e, const clef_record *recs, int n, float ****probs, char *err, size_t errlen);
 void clef_free_probs(const clef_record *recs, int n, float ***probs);
+/* Requires capture_routes before the pass; any failed or uncaptured pass invalidates the trace. */
+bool clef_dump_routes(clef_engine *e, const char *path, char *err, size_t errlen);
 
 /* Prefix cache. An entry keeps the backbone's state for the leading tokens of the last request
  * served through it, up to where that request's schema begins. A request that starts with some
@@ -133,6 +165,7 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
 clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen);
 void clef_gpu_close(clef_gpu *g);
 bool clef_gpu_keepalive(clef_gpu *g, char *err, size_t errlen);
+bool clef_gpu_dump_routes(clef_gpu *g, const char *path, char *err, size_t errlen);
 /* Backbone + head-side GPU work for a packed batch. pos3 is [T][3]: each token's temporal, row and
  * column rotary position (clef_record_positions), all equal to its index in a record without
  * images. imgs lists the batch's images (NULL or n = 0 for none). On success *in points into GPU
@@ -144,8 +177,8 @@ bool clef_gpu_keepalive(clef_gpu *g, char *err, size_t errlen);
  * outputs are unaffected (act16 keeps the discarded values finite). */
 bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos3,
                       const int32_t *seq_start, const int32_t *seq_bounds, int n_seq, int T, bool bf16_only,
-                      bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows,
-                      const clef_gpu_images *imgs, char *err, size_t errlen);
+                      bool *overflow, clef_head_inputs *in, clef_dump *dump_layers, int dump_rows,
+                      const clef_gpu_media *imgs, char *err, size_t errlen);
 /* An entry keeps the DeltaNet state and conv tail of up to this many rows of its record, one
  * per slot. Which row a slot holds is the caller's bookkeeping. */
 #define CLEF_PREFIX_CKPT 12
@@ -169,6 +202,6 @@ int clef_gpu_prefix_class(const clef_engine *e, int length);
  * img_row indexed by pass row. */
 bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix *px, const int32_t *ids, const int32_t *pos3,
                              int T, int L, const clef_prefix_plan *plan, bool *overflow, clef_head_inputs *in,
-                             const clef_gpu_images *imgs, char *err, size_t errlen);
+                             const clef_gpu_media *imgs, char *err, size_t errlen);
 
 #endif

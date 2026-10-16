@@ -36,7 +36,8 @@ class ParityChecks(unittest.TestCase):
             if "encode" in args:
                 text = json.dumps(self.encoded, ensure_ascii=False) + '\n'
             elif "--dump" in args:
-                self.dump.tofile(args[args.index("--dump") + 1])
+                rows = int(args[args.index("--dump-last") + 1]) if "--dump-last" in args else self.dump.shape[1]
+                self.dump[:,-rows:].tofile(args[args.index("--dump") + 1])
                 text = ''
             else:
                 text = json.dumps({self.qid: self.engine.tolist()}, ensure_ascii=False) + '\n'
@@ -55,6 +56,27 @@ class ParityChecks(unittest.TestCase):
 
     def test_exact_reference_passes_including_layers(self):
         self.assertEqual(self.check('--dump')[0], 0)
+
+    def test_explicit_layer_suffix_uses_matching_native_rows(self):
+        (self.golden/'manifest.json').write_text(json.dumps(dict(records=[dict(id='r0',tokens=2,dump_start=1)])))
+        self.layers={key:value[1:].copy() for key,value in self.layers.items()}
+        self.dump[:,0]=17  # The discarded prefix must not affect suffix comparison.
+        self.assertEqual(self.check('--dump')[0],0)
+        self.dump[1,1]=1.2
+        self.assertNotEqual(self.check('--dump')[0],0)
+
+    def test_layer_suffix_requires_valid_manifest_geometry(self):
+        self.layers={key:value[1:].copy() for key,value in self.layers.items()}
+        self.assertNotEqual(self.check('--dump')[0],0)
+        for record in [dict(id='r0',tokens=3,dump_start=1),dict(id='r0',tokens=2,dump_start=-1),
+                       dict(id='r0',tokens=2,dump_start=2),dict(id='r0',tokens=2,dump_start=True),
+                       dict(id='other',tokens=2,dump_start=1)]:
+            with self.subTest(record=record):
+                (self.golden/'manifest.json').write_text(json.dumps(dict(records=[record])))
+                self.assertNotEqual(self.check('--dump')[0],0)
+        (self.golden/'manifest.json').write_text(json.dumps(dict(records=[dict(id='r0',tokens=2,dump_start=1)])))
+        self.layers['final_norm']=np.ones((2,2))
+        self.assertNotEqual(self.check('--dump')[0],0)
 
     def test_unicode_separators_are_not_jsonl_boundaries(self):
         for separator in ('\u0085', '\u2028', '\u2029'):

@@ -1560,6 +1560,50 @@ template [[host_name(NAME)]] kernel void layernorm_act_x<BIAS>(constant ln_act_a
 VIS_LN_VARIANT("layernorm_act", false)
 VIS_LN_VARIANT("layernorm_bias_act", true)
 
+// DeepStack's extra mergers normalize after the four-patch reshape. Read the
+// pending down-projection bias without consuming it: the next main-tower norm
+// owns that write, and adding it here too would double the residual bias.
+struct omni_merger_args { int E, rows; float eps; int add_pending; };
+kernel void omni_vision_merger_norm(constant omni_merger_args &a [[buffer(0)]],
+                                   device const float *x [[buffer(1)]],
+                                   device const float *pending [[buffer(2)]],
+                                   device const float *w [[buffer(3)]],
+                                   device const float *b [[buffer(4)]],
+                                   device float *out [[buffer(5)]],
+                                   uint row [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]],
+                                   uint nt [[threads_per_threadgroup]]) {
+    if (row >= uint(a.rows)) return;
+    threadgroup float scratch[32];
+    const int M = 4*a.E;
+    const long offset = (long)row*M;
+    float sum = 0;
+    for (int i=tid;i<M;i+=nt) sum += x[offset+i]+(a.add_pending?pending[i%a.E]:0.0f);
+    const float mean = tg_sum(sum,scratch,tid,nt)/float(M);
+    float var = 0;
+    for (int i=tid;i<M;i+=nt) { float z=(x[offset+i]+(a.add_pending?pending[i%a.E]:0.0f))-mean;var+=z*z; }
+    const float inv = rsqrt(tg_sum(var,scratch,tid,nt)/float(M)+a.eps);
+    for (int i=tid;i<M;i+=nt) out[offset+i]=((x[offset+i]+(a.add_pending?pending[i%a.E]:0.0f))-mean)*inv*w[i]+b[i];
+}
+
+struct omni_residual_args { int H,rows; };
+kernel void omni_vision_residual(constant omni_residual_args &a [[buffer(0)]],
+                                 device const float *branch [[buffer(1)]], device const float *bias [[buffer(2)]],
+                                 device float *x [[buffer(3)]], uint index [[thread_position_in_grid]]) {
+    if(index<uint(a.H)*uint(a.rows))x[index]=x[index]+(branch[index]+bias[index%a.H]);
+}
+
+struct omni_inject_args { int T,H; };
+kernel void omni_vision_inject(constant omni_inject_args &a [[buffer(0)]],
+                              device float *x [[buffer(1)]],
+                              device const float *features [[buffer(2)]],
+                              device const int *rows [[buffer(3)]],
+                              uint2 p [[thread_position_in_grid]]) {
+    if (p.x>=uint(a.H) || p.y>=uint(a.T)) return;
+    const int row=rows[p.y];
+    if (row>=0) x[(long)p.y*a.H+p.x]+=features[(long)row*a.H+p.x];
+}
+
 // qkv rows (+ bias) -> Q, K, V [heads][P][hd]. Q and K take the 2D rotary embedding
 // (apply_rotary_pos_emb_vision): rotate_half pairs (i, i + hd/2); the first hd/4 pairs turn by the
 // patch's grid row, the next hd/4 by its column, inv_freq[j] = 10000^(-2j/(hd/2)) in f32.
@@ -1993,4 +2037,562 @@ kernel void vis_bias_gelu(constant bias_act_args &a [[buffer(0)]],
     if (f32out == 2) vis_split_value(g, (device half *)y, (long)r * a.N + i, (long)a.rows * a.N, ac, ovf);
     else if (f32out) y32[(long)r * a.N + i] = g;
     else y[(long)r * a.N + i] = act16(g, ac, ovf);
+}
+
+// ---------------------------------------------------------------- Omni attention
+// Plain RMS weights and ungated [q|k|v]. Rotary pairs 60..63 use temporal
+// positions: the [24,20,20] layout has only 20 complete interleaved triplets.
+struct omni_prep_args { int nh, nkv, T; float eps; };
+kernel void omni_attn_prep(constant omni_prep_args &a [[buffer(0)]],
+                           device const float *qkv [[buffer(1)]],
+                           device const float *qw [[buffer(2)]],
+                           device const float *kw [[buffer(3)]],
+                           device const int *pos [[buffer(4)]],
+                           device const float *inv_freq [[buffer(5)]],
+                           device float *Q [[buffer(6)]],
+                           device float *K [[buffer(7)]],
+                           device float *V [[buffer(8)]],
+                           device atomic_uint *status [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    const int t = tg.x, h = tg.y, row = (a.nh + 2*a.nkv)*128;
+    const bool query = h < a.nh;
+    const int kh = h-a.nh;
+    device const float *src = qkv + (long)t*row + (long)h*128;
+    device const float *w = query ? qw : kw;
+    float x[4], sum = 0.0f;
+    bool bad = false;
+    for (int j = 0; j < 4; j++) { x[j] = src[lane+32*j]; bad |= !isfinite(x[j]); sum += x[j]*x[j]; }
+    const float inv = rsqrt(simd_sum(sum)/128.0f+a.eps);
+    for (int j = 0; j < 4; j++) x[j] = x[j]*inv*w[lane+32*j];
+    for (int j = 0; j < 2; j++) {
+        const int pair = lane+32*j, axis = pair < 60 ? pair%3 : 0;
+        const float angle = (float)pos[3*t+axis]*inv_freq[pair];
+        const float c = precise::cos(angle), s = precise::sin(angle), lo = x[j], hi = x[j+2];
+        x[j] = lo*c-hi*s; x[j+2] = hi*c+lo*s;
+    }
+    for (int j = 0; j < 4; j++) {
+        const long off = ((long)(query ? h : kh)*a.T+t)*128+lane+32*j;
+        bad |= !isfinite(x[j]);
+        if (query) Q[off] = x[j];
+        else {
+            const float v = qkv[(long)t*row+(a.nh+a.nkv+kh)*128+lane+32*j];
+            bad |= !isfinite(v);
+            K[off] = x[j]; V[off] = v;
+        }
+    }
+    // max() in masked softmax need not propagate NaN; preserve the error
+    // independently of the attention output and report it at checked completion.
+    if (simd_any(bad) && lane == 0) atomic_fetch_or_explicit(status, 2u, memory_order_relaxed);
+    // Only the final head needs slack. Interior speculative loads read the next
+    // head's initialized rows; clearing those would race its real producer.
+    if (t == 0 && ((query && h == a.nh-1) || (!query && kh == a.nkv-1))) {
+        for (int i = lane; i < 32*128; i += 32) {
+            if (query) Q[(long)a.nh*a.T*128+i] = 0.0f;
+            else { K[(long)a.nkv*a.T*128+i] = 0.0f; V[(long)a.nkv*a.T*128+i] = 0.0f; }
+        }
+    }
+}
+
+inline float2 omni_twofold_add(float2 a, float2 b) {
+    #pragma clang fp contract(off)
+    const float sum = a.x+b.x, back = sum-a.x;
+    const float error = (a.x-(sum-back))+(b.x-back);
+    const float tail = (a.y+b.y)+error, hi = sum+tail;
+    return float2(hi, tail-(hi-sum));
+}
+
+inline void omni_accumulate_fragment(thread simdgroup_float8x8 &hi,
+                                      thread simdgroup_float8x8 &lo,
+                                      simdgroup_float8x8 value) {
+    thread float2 &h = reinterpret_cast<thread float2 &>(hi.thread_elements());
+    thread float2 &l = reinterpret_cast<thread float2 &>(lo.thread_elements());
+    thread float2 &v = reinterpret_cast<thread float2 &>(value.thread_elements());
+    for (int j=0; j<2; j++) {
+        float2 sum = omni_twofold_add(float2(h[j],l[j]),float2(v[j],0.0f));
+        h[j]=sum.x; l[j]=sum.y;
+    }
+}
+
+inline void omni_rescale_fragment(thread simdgroup_float8x8 &hi,
+                                   thread simdgroup_float8x8 &lo,
+                                   simdgroup_float8x8 scale) {
+    #pragma clang fp contract(off)
+    thread float2 &h = reinterpret_cast<thread float2 &>(hi.thread_elements());
+    thread float2 &l = reinterpret_cast<thread float2 &>(lo.thread_elements());
+    thread float2 &s = reinterpret_cast<thread float2 &>(scale.thread_elements());
+    float2 product=h*s, error=fma(h,s,-product)+l*s;
+    h=product+error; l=error-(h-product);
+}
+
+// The established FP32 tiled attention reduction, specialized to hd=128 and
+// ungated FP32 output. Record-aligned key blocks preserve packed-batch parity.
+constant constexpr int OMNI_FA_BQ = 8, OMNI_FA_BK = 32, OMNI_FA_HD = 128, OMNI_FA_DT = OMNI_FA_HD / 8;
+kernel void omni_attention(constant attn_args &a [[buffer(0)]],
+                         device const float *Q [[buffer(1)]],
+                         device const float *K [[buffer(2)]],
+                         device const float *V [[buffer(3)]],
+                         device const int *seq_start [[buffer(4)]],
+                         device float *O [[buffer(5)]],
+                         threadgroup float *smem [[threadgroup(0)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    const int i0 = tg.x * OMNI_FA_BQ, kh = tg.y, grp = a.nh / a.nkv, h = kh * grp + sg;
+    const int T = a.T;
+    threadgroup float *S = smem + sg * (OMNI_FA_BQ * OMNI_FA_BK + 64);   // 8x32 scores/probs
+    threadgroup float *D = S + OMNI_FA_BQ * OMNI_FA_BK;                   // 8x8 diagonal
+    device const float *Qh = Q + ((long)h * T + i0) * OMNI_FA_HD;
+    device const float *Kh = K + (long)kh * T * OMNI_FA_HD;
+    device const float *Vh = V + (long)kh * T * OMNI_FA_HD;
+
+    // Unroll all three loops that index acc (init, update, epilogue) together: no
+    // dynamically indexed fragment access should remain. Unrolling only the update
+    // did not help in bench/attention_bench.m. Keep the Q.K loop compact; fully
+    // unrolling that independent loop was slower. The arithmetic order is unchanged.
+    simdgroup_float8x8 acc[OMNI_FA_DT], low[OMNI_FA_DT];
+    #pragma clang loop unroll(full)
+    for (int d = 0; d < OMNI_FA_DT; d++) { acc[d] = simdgroup_float8x8(0.0f); low[d] = simdgroup_float8x8(0.0f); }
+    // softmax state for row r = lane / 4 (replicated over the 4 lanes of the row)
+    const int r = lane / 4, c0 = (lane % 4) * 8;
+    const int q = i0 + r;
+    const bool qvalid = q < T;
+    const int qs = qvalid ? seq_start[q] : 0;
+    float m = -INFINITY, l = 0.0f, llow = 0.0f;
+
+    // A query block may straddle records. Keys are processed once per record present in
+    // the block, in 32-key blocks aligned to that record's start, so every query sees the
+    // same blocking (and float summation order) as when its record runs alone: results do
+    // not depend on batch composition. Rows of other records are masked in a pass, which
+    // is an exact no-op for them (max unchanged -> alpha = 1, probabilities = 0).
+    const int k_end = min(i0 + OMNI_FA_BQ, T);                       // exclusive
+    for (int seg = seq_start[i0]; seg >= 0;) {
+    for (int kb = seg; kb < k_end; kb += OMNI_FA_BK) {
+        simdgroup_float8x8 s[4];
+        for (int j = 0; j < 4; j++) s[j] = simdgroup_float8x8(0.0f);
+        for (int d = 0; d < OMNI_FA_DT; d++) {
+            simdgroup_float8x8 qt, kt;
+            simdgroup_load(qt, Qh + d * 8, OMNI_FA_HD);
+            for (int j = 0; j < 4; j++) {
+                simdgroup_load(kt, Kh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD, ulong2(0, 0), true);
+                simdgroup_multiply_accumulate(s[j], qt, kt, s[j]);
+            }
+        }
+        for (int j = 0; j < 4; j++) simdgroup_store(s[j], S + 8 * j, OMNI_FA_BK);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float v[8], mx = -INFINITY;
+        for (int c = 0; c < 8; c++) {
+            const int key = kb + c0 + c;
+            const bool ok = qvalid && qs == seg && key >= qs && key <= q;
+            v[c] = ok ? S[r * OMNI_FA_BK + c0 + c] * a.scale : -INFINITY;
+            mx = max(mx, v[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float mn = max(m, mx);
+        float alpha = 1.0f, sum = 0.0f;
+        if (mn != -INFINITY) {
+            alpha = m == -INFINITY ? 0.0f : exp(m - mn);
+            for (int c = 0; c < 8; c++) { v[c] = v[c] == -INFINITY ? 0.0f : exp(v[c] - mn); sum += v[c]; }
+        } else {
+            for (int c = 0; c < 8; c++) v[c] = 0.0f;
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        // Long rows must not accumulate thousands of P.V updates into one
+        // rounded component: that error can change a near-tied expert choice.
+        const float scaled = l*alpha;
+        float2 denominator = omni_twofold_add(float2(scaled,fma(l,alpha,-scaled)+llow*alpha),float2(sum,0.0f));
+        l = denominator.x; llow = denominator.y;
+        m = mn;
+        for (int c = 0; c < 8; c++) S[r * OMNI_FA_BK + c0 + c] = v[c];
+        D[r*8+(lane%4)*2] = alpha;
+        D[r*8+(lane%4)*2+1] = alpha;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_float8x8 dm, p[4];
+        simdgroup_load(dm, D, 8);
+        for (int j = 0; j < 4; j++) simdgroup_load(p[j], S + 8 * j, OMNI_FA_BK);
+        #pragma clang loop unroll(full)
+        for (int d = 0; d < OMNI_FA_DT; d++) {
+            omni_rescale_fragment(acc[d],low[d],dm);
+            for (int j = 0; j < 4; j++) {
+                simdgroup_float8x8 vt, t;
+                simdgroup_load(vt, Vh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD);
+                simdgroup_multiply(t, p[j], vt);
+                omni_accumulate_fragment(acc[d],low[d],t);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+        int next = -1;   // start of the next record in this query block, if any
+        for (int rr = 0; rr < OMNI_FA_BQ && i0 + rr < T; rr++) {
+            if (seq_start[i0 + rr] > seg) { next = seq_start[i0 + rr]; break; }
+        }
+        seg = next;
+    }
+
+    // Ungated FP32 o_proj operand: O = diag(1/l) acc.
+    D[lane] = 0.0f;
+    D[lane + 32] = 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (lane % 4 == 0) D[r * 8 + r] = l > 0.0f ? 1.0f / l : 0.0f;
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 dm;
+    simdgroup_load(dm, D, 8);
+    const int er = lane / 4, ec = (lane % 4) * 2;   // 2 elements per lane in the epilogue
+    #pragma clang loop unroll(full)
+    for (int d = 0; d < OMNI_FA_DT; d++) {
+        simdgroup_float8x8 t;
+        omni_accumulate_fragment(acc[d],low[d],simdgroup_float8x8(0.0f));
+        simdgroup_multiply(t, dm, acc[d]);
+        simdgroup_store(t, S, 8);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        const int qq = i0 + er;
+        if (qq < T) {
+            for (int c = 0; c < 2; c++) {
+                const long o = (long)qq * a.nh * OMNI_FA_HD + (long)h * OMNI_FA_HD + d * 8 + ec + c;
+                O[o] = S[er * 8 + ec + c];
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------- Omni routed experts
+// A chunk belongs to one record. Keeping its chunk origin relative to that
+// record makes the expert GEMM shapes independent of neighboring batch entries.
+struct omni_moe_args { int rows, H, F, padded; };
+#pragma clang fp contract(off)
+
+// Router boundaries can be much closer than a dense GEMM's FP32 accumulation
+// error. Track each product/reduction residual with two FP32 components, so a
+// rounding error cannot swap experts that an independent FP64 dot distinguishes.
+kernel void omni_router(constant gemm_args &a [[buffer(0)]],
+                        device const float *X [[buffer(1)]], device const bfloat *W [[buffer(2)]],
+                        device float *hi [[buffer(3)]], device float *lo [[buffer(4)]],
+                        uint2 tg [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    float2 sum = float2(0.0f);
+    for (int k = lane; k < a.K; k += 32) {
+        const float x = X[(long)tg.x*a.K+k], w = (float)W[(long)tg.y*a.K+k];
+        const float p = x*w;
+        sum = omni_twofold_add(sum, float2(p, fma(x,w,-p)));
+    }
+    for (int shift = 16; shift > 0; shift /= 2) {
+        const float2 other = float2(simd_shuffle_down(sum.x,shift),simd_shuffle_down(sum.y,shift));
+        if (lane < uint(shift)) sum = omni_twofold_add(sum,other);
+    }
+    if (lane == 0) { hi[(long)tg.x*a.N+tg.y] = sum.x; lo[(long)tg.x*a.N+tg.y] = sum.y; }
+}
+
+kernel void omni_route(device const float *logits [[buffer(0)]],
+                        device int *ids [[buffer(1)]],
+                        device float *weights [[buffer(2)]],
+                        device atomic_uint *status [[buffer(3)]],
+                        device const float *logits_low [[buffer(4)]],
+                        uint row [[threadgroup_position_in_grid]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+    float p[4], high[4], low[4], mx = -INFINITY;
+    bool bad = false;
+    for (int j = 0; j < 4; j++) {
+        high[j] = p[j] = logits[(long)row*128+lane+32*j];
+        low[j] = logits_low[(long)row*128+lane+32*j];
+        bad |= !isfinite(p[j]) || !isfinite(low[j]);
+        mx = max(mx, p[j]);
+    }
+    if (simd_any(bad)) {
+        if (lane == 0) {
+            atomic_fetch_or_explicit(status, 1u, memory_order_relaxed);
+            for (int k = 0; k < 8; k++) { ids[(long)row*8+k] = k; weights[(long)row*8+k] = 0.0f; }
+        }
+        return;
+    }
+    mx = simd_max(mx);
+    float sum = 0.0f;
+    for (int j = 0; j < 4; j++) { p[j] = exp(p[j]-mx); sum += p[j]; }
+    sum = simd_sum(sum);
+    for (int j = 0; j < 4; j++) p[j] /= sum;
+    float selected_sum = 0.0f;
+    for (int k = 0; k < 8; k++) {
+        const float best_hi = simd_max(max(max(high[0], high[1]), max(high[2], high[3])));
+        float best_lo = -INFINITY;
+        for (int j = 0; j < 4; j++) if (high[j] == best_hi) best_lo = max(best_lo,low[j]);
+        best_lo = simd_max(best_lo);
+        int idx = 128;
+        for (int j = 0; j < 4; j++) if (high[j] == best_hi && low[j] == best_lo) idx = min(idx, (int)lane+32*j);
+        idx = simd_min(idx);
+        // torch.topk has no stable tie guarantee. Native exact ties use the
+        // lowest expert ID. Rank before softmax, whose FP32 rounding can collapse
+        // distinct logits to the same probability; retain FP32 output weights.
+        float best = 0.0f;
+        for (int j = 0; j < 4; j++) if ((int)lane+32*j == idx) best = p[j];
+        best = simd_sum(best);
+        if (lane == 0) { ids[(long)row*8+k] = idx; weights[(long)row*8+k] = best; }
+        selected_sum += best;
+        for (int j = 0; j < 4; j++) if ((int)lane+32*j == idx) high[j] = low[j] = -INFINITY;
+    }
+    if (lane == 0) for (int k = 0; k < 8; k++) weights[(long)row*8+k] /= selected_sum;
+}
+
+// One SIMD group per expert. The router supplies IDs in [0,128), including its
+// nonfinite fallback. Integer counts and scans preserve the serial bucket order.
+kernel void omni_assign_count(constant omni_moe_args &a [[buffer(0)]],
+                               device const int *ids [[buffer(1)]],
+                               device int *counts [[buffer(2)]],
+                               device int *rowmap [[buffer(4)]],
+                               uint expert [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    int count = 0;
+    for (int i = (int)lane; i < a.rows*8; i += 32) count += ids[i] == (int)expert;
+    count = simd_sum(count);
+    if (lane == 0) counts[expert] = count;
+    // Clear the bounded arena, including unused padding after the last bucket.
+    for (int i = (int)(expert*32+lane); i < a.padded; i += 128*32) rowmap[i] = -1;
+}
+
+kernel void omni_assign_offsets(device const int *counts [[buffer(2)]],
+                                 device int *offsets [[buffer(3)]]) {
+    offsets[0] = 0;
+    for (int e = 0; e < 128; e++) offsets[e+1] = offsets[e]+((counts[e]+31)/32)*32;
+}
+
+kernel void omni_assign_scatter(constant omni_moe_args &a [[buffer(0)]],
+                                 device const int *ids [[buffer(1)]],
+                                 device const int *counts [[buffer(2)]],
+                                 device const int *offsets [[buffer(3)]],
+                                 device int *rowmap [[buffer(4)]],
+                                 device int *slots [[buffer(5)]],
+                                 uint expert [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    if (counts[expert] == 0) return;
+    int cursor = offsets[expert];
+    for (int first = 0; first < a.rows*8; first += 32) {
+        const int i = first+(int)lane;
+        const int match = i < a.rows*8 && ids[i] == (int)expert;
+        int prefix = match;
+        for (uint distance = 1; distance < 32; distance *= 2) {
+            const int previous = simd_shuffle_up(prefix, distance);
+            if (lane >= distance) prefix += previous;
+        }
+        if (match) {
+            const int row = cursor+prefix-1;
+            rowmap[row] = i/8;
+            slots[i] = row;
+        }
+        cursor += simd_sum(match);
+    }
+}
+
+kernel void omni_gather(constant omni_moe_args &a [[buffer(0)]],
+                         device const float *x [[buffer(1)]],
+                         device const int *rowmap [[buffer(2)]],
+                         device float *out [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= a.H || (int)gid.y >= a.padded) return;
+    const int row = rowmap[gid.y];
+    out[(long)gid.y*a.H+gid.x] = row < 0 ? 0.0f : x[(long)row*a.H+gid.x];
+}
+
+kernel void omni_expert_gemm(constant gemm_args &a [[buffer(0)]],
+                              device float *X [[buffer(1)]],
+                              device bfloat *W [[buffer(2)]],
+                              device float *Y [[buffer(3)]],
+                              device const int *counts [[buffer(4)]],
+                              device const int *offsets [[buffer(5)]],
+                              uint3 tg [[threadgroup_position_in_grid]]) {
+    // Offsets delimit padded expert runs. Search their upper bound so empty
+    // experts with equal offsets never claim a tile owned by a later expert.
+    const int tile = (int)tg.y*32;
+    if (tile >= offsets[128]) return;
+    int e = 0, end = 128;
+    while (e+1 < end) {
+        const int mid = (e+end)/2;
+        if (offsets[mid] <= tile) e = mid;
+        else end = mid;
+    }
+    const int rows = counts[e], first = offsets[e], row = tile-first;
+    if (row >= rows) return;
+    auto tX = tensor<device float, dextents<int32_t, 2>, tensor_inline>(X+(long)first*a.K, dextents<int32_t, 2>(a.K, rows));
+    auto tW = tensor<device bfloat, dextents<int32_t, 2>, tensor_inline>(W+(long)e*a.N*a.K, dextents<int32_t, 2>(a.K, a.N));
+    auto tY = tensor<device float, dextents<int32_t, 2>, tensor_inline>(Y+(long)first*a.N, dextents<int32_t, 2>(a.N, rows));
+    matmul2d<matmul2d_descriptor(32, 128, dynamic_length_v<int>, false, true, false), execution_simdgroups<4>> mm;
+    auto mX = tX.slice(0, row);
+    auto mW = tW.slice(0, (int)tg.x*128);
+    auto mY = tY.slice((int)tg.x*128, row);
+    mm.run(mX, mW, mY);
+}
+
+kernel void omni_swiglu(constant omni_moe_args &a [[buffer(0)]],
+                         device const float *gate_up [[buffer(1)]],
+                         device float *out [[buffer(2)]],
+                         device const int *rowmap [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if ((int)gid.x >= a.F || (int)gid.y >= a.padded) return;
+    const long at = (long)gid.y*2*a.F+gid.x;
+    out[(long)gid.y*a.F+gid.x] = rowmap[gid.y] < 0 ? 0.0f : silu(gate_up[at])*gate_up[at+a.F];
+}
+
+kernel void omni_combine(constant omni_moe_args &a [[buffer(0)]],
+                          device const float *expert_out [[buffer(1)]],
+                          device const int *ids [[buffer(2)]],
+                          device const float *weights [[buffer(3)]],
+                          device const int *slots [[buffer(4)]],
+                          device float *residual [[buffer(5)]],
+                          uint row [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint nt [[threads_per_threadgroup]]) {
+    #pragma clang fp contract(off)
+    threadgroup int order[8];
+    if (tid == 0) {
+        for (int i = 0; i < 8; i++) {
+            int j = i;
+            while (j > 0 && ids[row*8+order[j-1]] > ids[row*8+i]) { order[j] = order[j-1]; j--; }
+            order[j] = i;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int h = tid; h < a.H; h += nt) {
+        float sum = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            const int k = order[i];
+            const float contribution = expert_out[(long)slots[row*8+k]*a.H+h]*weights[row*8+k];
+            sum += contribution;
+        }
+        // Eager PyTorch adds experts in ascending ID, then adds the residual once.
+        residual[(long)row*a.H+h] += sum;
+    }
+}
+
+// Opt-in tail capture: source rows are chunk-local, destination rows are layer-major.
+struct omni_route_row { float logits[128], low[128]; int ids[8]; float weights[8]; };
+struct omni_trace_args { int rows, start, first, captured, layer; };
+kernel void omni_trace(constant omni_trace_args &a [[buffer(0)]],
+                       device const float *scores [[buffer(1)]], device const int *ids [[buffer(2)]],
+                       device const float *weights [[buffer(3)]], device omni_route_row *out [[buffer(4)]],
+                       device const float *low [[buffer(5)]],
+                       uint2 p [[thread_position_in_grid]]) {
+    int row = a.start+int(p.y)-a.first;
+    if (p.x >= 128 || p.y >= uint(a.rows) || row < 0 || row >= a.captured) return;
+    device omni_route_row &r = out[a.layer*a.captured+row];
+    r.logits[p.x] = scores[p.y*128+p.x];
+    r.low[p.x] = low[p.y*128+p.x];
+    if (p.x < 8) { r.ids[p.x] = ids[p.y*8+p.x]; r.weights[p.x] = weights[p.y*8+p.x]; }
+}
+
+// Audio keeps FP32 operands throughout. Windows are per clip, bidirectional,
+// and at most 104 rows; absolute packed offsets never enter the arithmetic.
+struct audio_attention_args { int T,H,heads; float scale; };
+kernel void audio_attention(constant audio_attention_args &a [[buffer(0)]],
+                            device const float *q [[buffer(1)]], device const float *k [[buffer(2)]],
+                            device const float *v [[buffer(3)]], device const int *starts [[buffer(4)]],
+                            device const int *ends [[buffer(5)]], device float *out [[buffer(6)]],
+                            device atomic_uint *status [[buffer(7)]],
+                            uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    int t=group.x,h=group.y,begin=starts[t],end=ends[t];
+    size_t row=size_t(t)*a.H+h*64;
+    if(begin<0 || begin>t || end<=t || end>a.T || end-begin>104) {
+        atomic_fetch_or_explicit(status,1u,memory_order_relaxed);
+        out[row+lane]=out[row+lane+32]=NAN;return;
+    }
+    threadgroup float scores[104];
+    float q0=q[row+lane],q1=q[row+lane+32],maximum=-INFINITY;
+    bool valid=isfinite(q0) && isfinite(q1);
+    for(int s=begin;s<end;s++) {
+        size_t index=size_t(s)*a.H+h*64+lane;
+        float k0=k[index],k1=k[index+32];
+        valid=valid && isfinite(k0) && isfinite(k1);
+        float score=simd_sum(q0*k0+q1*k1)*a.scale;
+        if(lane==0)scores[s-begin]=score;
+        maximum=max(maximum,score);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float2 denominator=0,acc0=0,acc1=0;
+    for(int s=begin;s<end;s++) {
+        float probability=exp(scores[s-begin]-maximum);
+        size_t index=size_t(s)*a.H+h*64+lane;
+        float v0=v[index],v1=v[index+32];
+        valid=valid && isfinite(v0) && isfinite(v1);
+        denominator=omni_twofold_add(denominator,float2(probability,0));
+        float p0=probability*v0,p1=probability*v1;
+        acc0=omni_twofold_add(acc0,float2(p0,fma(probability,v0,-p0)));
+        acc1=omni_twofold_add(acc1,float2(p1,fma(probability,v1,-p1)));
+    }
+    float d=denominator.x+denominator.y;
+    float y0=(acc0.x+acc0.y)/d,y1=(acc1.x+acc1.y)/d;
+    if(!valid || !isfinite(y0) || !isfinite(y1))atomic_fetch_or_explicit(status,1u,memory_order_relaxed);
+    out[row+lane]=y0;out[row+lane+32]=y1;
+}
+
+struct audio_norm_args { int H; float eps; };
+kernel void audio_norm(constant audio_norm_args &a [[buffer(0)]], device const float *x [[buffer(1)]],
+                       device const float *weight [[buffer(2)]], device const float *bias [[buffer(3)]],
+                       device float *out [[buffer(4)]], device atomic_uint *status [[buffer(5)]],
+                       uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]) {
+    size_t base=size_t(row)*a.H;
+    float sum=0;
+    for(int d=lane;d<a.H;d+=32)sum+=x[base+d];
+    float mean=simd_sum(sum)/float(a.H),variance=0;
+    for(int d=lane;d<a.H;d+=32){float delta=x[base+d]-mean;variance+=delta*delta;}
+    float inv=rsqrt(simd_sum(variance)/float(a.H)+a.eps);
+    for(int d=lane;d<a.H;d+=32) {
+        float value=(x[base+d]-mean)*inv*weight[d]+bias[d];
+        if(!isfinite(value))atomic_fetch_or_explicit(status,1u,memory_order_relaxed);
+        out[base+d]=value;
+    }
+}
+
+// mode 0: bias; 1: bias+exact GELU; 2: bias then residual. Separate the
+// residual addition from the matrix product to match the pinned audio layer.
+struct audio_bias_args { int H,rows,mode; };
+kernel void audio_bias(constant audio_bias_args &a [[buffer(0)]], device float *x [[buffer(1)]],
+                       device const float *bias [[buffer(2)]], device float *residual [[buffer(3)]],
+                       device atomic_uint *status [[buffer(4)]], uint index [[thread_position_in_grid]]) {
+    if(index>=uint(a.H)*uint(a.rows))return;
+    float value=x[index]+bias[index%a.H];
+    if(a.mode==1)value=0.5f*value*(1.0f+erf_f32(value*0.7071067811865476f));
+    if(a.mode==2)value+=residual[index];
+    if(!isfinite(value))atomic_fetch_or_explicit(status,1u,memory_order_relaxed);
+    if(a.mode==2)residual[index]=value;else x[index]=value;
+}
+
+// NHWC input -> rows [chunk, output frequency, output time], K=[channel,ky,kx].
+// Every element, including edge padding, is written; poison cannot leak into GEMM.
+struct audio_conv_args { int chunks,height,width,channels; };
+kernel void audio_im2col(constant audio_conv_args &a [[buffer(0)]], device const float *x [[buffer(1)]],
+                         device float *out [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    int oh=(a.height+1)/2,ow=(a.width+1)/2,K=a.channels*9;
+    if(index>=uint(a.chunks)*uint(oh*ow*K))return;
+    int k=index%K,row=index/K,channel=k/9,ky=k%9/3,kx=k%3;
+    int chunk=row/(oh*ow),y=row/ow%oh*2-1+ky,t=row%ow*2-1+kx;
+    out[index]=(y<0 || y>=a.height || t<0 || t>=a.width)?0:
+        x[((size_t(chunk)*a.height+y)*a.width+t)*a.channels+channel];
+}
+
+// Conv3 NHWC -> [chunk,time,channel,frequency], the conv_out projection order.
+kernel void audio_conv_pack(constant audio_conv_args &a [[buffer(0)]], device const float *x [[buffer(1)]],
+                            device float *out [[buffer(2)]], uint index [[thread_position_in_grid]]) {
+    if(index>=uint(a.chunks)*uint(a.height*a.width*a.channels))return;
+    int frequency=index%a.height,channel=index/a.height%a.channels;
+    int t=index/(a.height*a.channels)%a.width,chunk=index/(a.height*a.channels*a.width);
+    out[index]=x[((size_t(chunk)*a.height+frequency)*a.width+t)*a.channels+channel];
+}
+
+struct audio_gather_args { int rows,H,padded_rows; };
+kernel void audio_gather(constant audio_gather_args &a [[buffer(0)]], device const float *x [[buffer(1)]],
+                         device const int *indices [[buffer(2)]], device const float *positions [[buffer(3)]],
+                         device float *out [[buffer(4)]], device atomic_uint *status [[buffer(5)]],
+                         uint index [[thread_position_in_grid]]) {
+    if(index>=uint(a.rows)*uint(a.H))return;
+    int src=indices[index/a.H],d=index%a.H;
+    float value=x[size_t(src)*a.H+d]+positions[(src%a.padded_rows)*a.H+d];
+    if(!isfinite(value))atomic_fetch_or_explicit(status,1u,memory_order_relaxed);
+    out[index]=value;
+}
+
+struct audio_scatter_args { int rows,H; };
+kernel void audio_scatter(constant audio_scatter_args &a [[buffer(0)]], device const float *features [[buffer(1)]],
+                          device const int *indices [[buffer(2)]], device float *x [[buffer(3)]],
+                          uint index [[thread_position_in_grid]]) {
+    if(index<uint(a.rows)*uint(a.H))x[size_t(indices[index/a.H])*a.H+index%a.H]=features[index];
 }

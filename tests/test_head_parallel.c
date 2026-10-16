@@ -63,7 +63,7 @@ static float value(uint32_t x) {
     x ^= x >> 16; x *= 0x7feb352d; x ^= x >> 15; x *= 0x846ca68b; x ^= x >> 16;
     return (float)(x & 65535) / 32768 - 1;
 }
-static void check_attend(int nq, int L, int E, int heads, bool bias) {
+static void check_attend(int nq, int L, int E, int heads, bool bias, int max_workers) {
     const int ldq = 3 * E + 8, ld = 2 * E + 16, hd = E / heads;
     const size_t ny = (size_t)nq * E;
     float *q = malloc((size_t)nq * ldq * sizeof(float));
@@ -79,7 +79,7 @@ static void check_attend(int nq, int L, int E, int heads, bool bias) {
     for (int r = 0; r < L; r++) for (int j = 0; j < 2 * E; j++) kv[(size_t)r * ld + j] = value(r * 2 * E + j + 73);
     for (int j = 0; j < E; j++) bv[j] = value(j + 91) * 0.125f;
     unsplit_attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, want);
-    assert(attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, got));
+    assert(attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, max_workers, got));
     assert(memcmp(want, got, ny * sizeof(float)) == 0);
     for (size_t i = 0; i < ny; i++) assert(isfinite(got[i]));
     for (size_t i = ny; i < ny + 32; i++) assert(isnan(got[i]));
@@ -99,10 +99,10 @@ static void check_attend(int nq, int L, int E, int heads, bool bias) {
     }
     for (size_t i = 0; i < ny + 32; i++) got[i] = NAN;
     fail_score_allocation = true;
-    assert(!attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, got));
+    assert(!attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, max_workers, got));
     fail_score_allocation = false;
     for (size_t i = 0; i < ny + 32; i++) assert(isnan(got[i]));
-    assert(attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, got));
+    assert(attend(q, ldq, nq, kv, kv + E, ld, L, bias ? bv : NULL, E, heads, max_workers, got));
     assert(memcmp(want, got, ny * sizeof(float)) == 0);
     free(q); free(kv); free(bv); free(want); free(got); free(scores);
     printf("head parallel: nq=%d L=%d E=%d heads=%d bias=%d exact/f64/guards/allocation recovery PASS\n", nq, L, E, heads, bias);
@@ -111,8 +111,10 @@ int main(int argc, char **argv) {
     check_first_use();
     if (argc == 2 && !strcmp(argv[1], "--init-only")) return 0;
     const int shapes[][4] = {{3,2730,64,8}, {3,2731,64,8}, {9,3000,96,3},
-                            {3,4096,1024,8}, {9,8192,1024,8}};
+                            {3,4096,1024,8}, {9,8192,1024,8},
+                            {3,4096,1024,16}, {32,16347,1024,16}, {3,4096,96,6}};
+    for (int max_workers = 2; max_workers <= 8; max_workers *= 2)
     for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++)
-        for (int bias = 0; bias < 2; bias++) check_attend(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], bias);
+        for (int bias = 0; bias < 2; bias++) check_attend(shapes[i][0], shapes[i][1], shapes[i][2], shapes[i][3], bias, max_workers);
     return 0;
 }

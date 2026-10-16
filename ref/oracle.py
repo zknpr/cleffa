@@ -88,8 +88,12 @@ def main() -> None:
     parser.add_argument("--only", nargs="*", help="request ids to run (default: all)")
     parser.add_argument("--safe-attn", action="store_true", help="head-chunked SDPA (MPS >= 2^32 offset bug, ref/safe_attn.py)")
     parser.add_argument("--dump-last", type=int, default=0, help="dump only the last N token rows per layer")
-    parser.add_argument("--corpus", default="text", choices=["text", "vision", "video"])
+    parser.add_argument("--corpus", default="text", choices=["text", "vision", "video", "omni-vision", "omni-video", "omni-long", "audio", "omni-av"])
     args = parser.parse_args()
+    if json.loads((args.model_dir / "config.json").read_text()).get("model_type") == "qwen3_omni_moe":
+        import omni
+        omni.run(args, streamed=False)
+        return
 
     sys.path.insert(0, str(args.model_dir.resolve()))
     from joint_schema_model import collate_records, encode_record, load_release_model

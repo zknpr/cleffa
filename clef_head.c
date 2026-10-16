@@ -18,12 +18,12 @@
 
 #include "clef_engine.h"
 
-typedef struct { float *w, *b; int out, in; float *packed; int packed_ld; } linear;
+typedef struct { float *w, *b; int out, in; float *packed; int packed_ld, max_workers; } linear;
 typedef struct { float *w, *b; int n; } layernorm;
 typedef struct { linear in_q; float *in_bv; linear out; int E, heads; } mha;  /* in_q: rows [0,E) */
 
 typedef struct {
-    layernorm query_norm, memory_norm, ff_norm;
+    layernorm query_norm, ff_norm;
     mha attn;
     linear ff1, ff2;
 } evidence_layer;
@@ -38,8 +38,8 @@ typedef struct {
 
 struct clef_head {
     int H, W;
-    layernorm hidden_norm, option_summary_norm, field_norm, option_norm;
-    linear memory_projection, question_projection, option_question_projection, global_projection;
+    layernorm option_summary_norm, field_norm, option_norm;
+    linear question_projection, option_question_projection, global_projection;
     linear option_context_projection, option_lexical_projection;
     float *type_embedding;  /* [3][W] */
     evidence_layer ev[8];
@@ -57,25 +57,38 @@ static float bf16_to_f32(uint16_t b) {
     return f;
 }
 
-static float *load_f32(const gguf_file *f, const char *name, int64_t expect, char *err, size_t errlen) {
+/* Validate the complete tensor even when only its query rows are needed on the CPU,
+ * or the GPU reads it directly from the GGUF mapping without a CPU-owned copy. */
+static const gguf_tensor *f32_tensor(const gguf_file *f, const char *name, int64_t expect,
+                                   int64_t *count, char *err, size_t errlen) {
     const gguf_tensor *t = gguf_find_tensor(f, name);
     if (!t) { snprintf(err, errlen, "head: missing tensor %s", name); return NULL; }
     int64_t n = 1;
     for (uint32_t d = 0; d < t->n_dims; d++) n *= (int64_t)t->ne[d];
     if (expect >= 0 && n != expect) { snprintf(err, errlen, "head: %s has %lld elements, expected %lld", name, (long long)n, (long long)expect); return NULL; }
+    if (t->type != GGML_BF16 && t->type != GGML_F32) {
+        snprintf(err, errlen, "head: %s has unsupported type", name); return NULL;
+    }
+    if (count) *count = n;
+    return t;
+}
+
+static float *copy_f32(const gguf_tensor *t, int64_t n, char *err, size_t errlen) {
     float *out = malloc((size_t)n * sizeof(float));
     if (!out) { snprintf(err, errlen, "head: out of memory"); return NULL; }
     if (t->type == GGML_BF16) {
         const uint16_t *s = t->data;
         for (int64_t i = 0; i < n; i++) out[i] = bf16_to_f32(s[i]);
-    } else if (t->type == GGML_F32) {
-        memcpy(out, t->data, (size_t)n * sizeof(float));
     } else {
-        free(out);
-        snprintf(err, errlen, "head: %s has unsupported type", name);
-        return NULL;
+        memcpy(out, t->data, (size_t)n * sizeof(float));
     }
     return out;
+}
+
+static float *load_f32(const gguf_file *f, const char *name, int64_t expect, char *err, size_t errlen) {
+    int64_t n;
+    const gguf_tensor *t = f32_tensor(f, name, expect, &n, err, errlen);
+    return t ? copy_f32(t, n, err, errlen) : NULL;
 }
 
 #define LOAD(dst, name, n) do { if (!((dst) = load_f32(f, (name), (n), err, errlen))) return false; } while (0)
@@ -105,11 +118,20 @@ static bool pack_linear(linear *l, char *err, size_t errlen) {
     int ld = l->out + 32;
     float *packed = calloc((size_t)l->in * ld, sizeof(float));
     if (!packed) { snprintf(err, errlen, "head: out of memory packing linear weights"); return false; }
-    for (int j = 0; j < l->out; j++) for (int k = 0; k < l->in; k++)
-        packed[(size_t)k * ld + j] = l->w[(size_t)j * l->in + k];
+    /* Both dimensions are 32-aligned above; every tile is full. */
+    for (int j0 = 0; j0 < l->out; j0 += 32) for (int k0 = 0; k0 < l->in; k0 += 32)
+        for (int j = j0; j < j0 + 32; j++) for (int k = k0; k < k0 + 32; k++)
+            packed[(size_t)k * ld + j] = l->w[(size_t)j * l->in + k];
     l->packed = packed;
     l->packed_ld = ld;
     return true;
+}
+
+/* The worker policy belongs to immutable model weights. Omni retains two;
+ * only dense multi-row projections qualify for four independent column groups. */
+static bool prepare_linear(linear *l, int max_workers, char *err, size_t errlen) {
+    l->max_workers = max_workers;
+    return pack_linear(l, err, errlen);
 }
 
 static bool load_ln(const gguf_file *f, const char *prefix, int n, layernorm *l, char *err, size_t errlen) {
@@ -122,16 +144,30 @@ static bool load_ln(const gguf_file *f, const char *prefix, int n, layernorm *l,
     return true;
 }
 
-static bool load_mha(const gguf_file *f, const char *prefix, int E, int heads, mha *m, char *err, size_t errlen) {
+static bool validate_ln(const gguf_file *f, const char *prefix, int n, char *err, size_t errlen) {
     char name[160];
-    float *w, *b;
+    snprintf(name, sizeof(name), "%s.weight", prefix);
+    if (!f32_tensor(f, name, n, NULL, err, errlen)) return false;
+    snprintf(name, sizeof(name), "%s.bias", prefix);
+    return f32_tensor(f, name, n, NULL, err, errlen) != NULL;
+}
+
+static bool load_mha(const gguf_file *f, const char *prefix, int E, int heads, bool self,
+                     mha *m, char *err, size_t errlen) {
+    char name[160];
     m->E = E; m->heads = heads;
+    m->in_q.out = E; m->in_q.in = E;
     snprintf(name, sizeof(name), "%s.in_proj_weight", prefix);
-    LOAD(w, name, (int64_t)3 * E * E);
+    const gguf_tensor *t = f32_tensor(f, name, (int64_t)3 * E * E, NULL, err, errlen);
+    if (!t) return false;
+    /* Cross-attention K/V rows are projected on the GPU. Self-attention aliases
+     * the complete QKV matrix in self_in, so it must retain all three slices.
+     * Assign ownership before the next fallible load so partial loads are freed. */
+    m->in_q.w = copy_f32(t, (int64_t)(self ? 3 : 1) * E * E, err, errlen);
+    if (!m->in_q.w) return false;
     snprintf(name, sizeof(name), "%s.in_proj_bias", prefix);
-    LOAD(b, name, 3 * E);
-    m->in_q = (linear){ w, b, E, E, NULL, 0 };   /* rows [0,E): query projection; K/V rows used on the GPU */
-    m->in_bv = b + 2 * E;
+    LOAD(m->in_q.b, name, 3 * E);
+    m->in_bv = m->in_q.b + 2 * E;
     snprintf(name, sizeof(name), "%s.out_proj", prefix);
     return load_linear(f, name, E, E, true, &m->out, err, errlen);
 }
@@ -149,14 +185,15 @@ clef_head *clef_head_load(const gguf_file *f, const clef_config *cfg, char *err,
     if (!h) { snprintf(err, errlen, "head: out of memory"); return NULL; }
     const int H = cfg->H, W = cfg->W, FF = cfg->head_ff;
     h->H = H; h->W = W;
+    const int workers = cfg->model.backbone == CLEF_QWEN35 ? 4 : 2;
     h->n_ev = cfg->routing_layers;
     h->n_dec = cfg->head_layers;
     if (h->n_ev > 8 || h->n_dec > 16 || W % cfg->head_heads) { snprintf(err, errlen, "head: unsupported shape"); free(h); return NULL; }
-    bool ok = load_ln(f, "head.hidden_norm", H, &h->hidden_norm, err, errlen)
+    bool ok = validate_ln(f, "head.hidden_norm", H, err, errlen)
         && load_ln(f, "head.option_summary_norm", W, &h->option_summary_norm, err, errlen)
         && load_ln(f, "head.field_norm", W, &h->field_norm, err, errlen)
         && load_ln(f, "head.option_norm", W, &h->option_norm, err, errlen)
-        && load_linear(f, "head.memory_projection", W, H, false, &h->memory_projection, err, errlen)
+        && f32_tensor(f, "head.memory_projection.weight", (int64_t)W * H, NULL, err, errlen)
         && load_linear(f, "head.question_projection", W, H, false, &h->question_projection, err, errlen)
         && load_linear(f, "head.option_question_projection", W, H, false, &h->option_question_projection, err, errlen)
         && load_linear(f, "head.global_projection", W, H, false, &h->global_projection, err, errlen)
@@ -169,9 +206,9 @@ clef_head *clef_head_load(const gguf_file *f, const clef_config *cfg, char *err,
     for (int i = 0; ok && i < h->n_ev; i++) {
         evidence_layer *e = &h->ev[i];
         snprintf(p, sizeof(p), "head.evidence_layers.%d.query_norm", i); ok = load_ln(f, p, W, &e->query_norm, err, errlen);
-        snprintf(p, sizeof(p), "head.evidence_layers.%d.memory_norm", i); ok = ok && load_ln(f, p, W, &e->memory_norm, err, errlen);
+        snprintf(p, sizeof(p), "head.evidence_layers.%d.memory_norm", i); ok = ok && validate_ln(f, p, W, err, errlen);
         snprintf(p, sizeof(p), "head.evidence_layers.%d.feedforward_norm", i); ok = ok && load_ln(f, p, W, &e->ff_norm, err, errlen);
-        snprintf(p, sizeof(p), "head.evidence_layers.%d.attention", i); ok = ok && load_mha(f, p, W, cfg->head_heads, &e->attn, err, errlen);
+        snprintf(p, sizeof(p), "head.evidence_layers.%d.attention", i); ok = ok && load_mha(f, p, W, cfg->head_heads, false, &e->attn, err, errlen);
         snprintf(p, sizeof(p), "head.evidence_layers.%d.feedforward.0", i); ok = ok && load_linear(f, p, FF, W, true, &e->ff1, err, errlen);
         snprintf(p, sizeof(p), "head.evidence_layers.%d.feedforward.3", i); ok = ok && load_linear(f, p, W, FF, true, &e->ff2, err, errlen);
     }
@@ -180,9 +217,9 @@ clef_head *clef_head_load(const gguf_file *f, const clef_config *cfg, char *err,
         snprintf(p, sizeof(p), "head.layers.%d.norm1", i); ok = load_ln(f, p, W, &d->norm1, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.norm2", i); ok = ok && load_ln(f, p, W, &d->norm2, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.norm3", i); ok = ok && load_ln(f, p, W, &d->norm3, err, errlen);
-        snprintf(p, sizeof(p), "head.layers.%d.self_attn", i); ok = ok && load_mha(f, p, W, cfg->head_heads, &d->self_attn, err, errlen);
-        if (ok) d->self_in = (linear){ d->self_attn.in_q.w, d->self_attn.in_q.b, 3 * W, W, NULL, 0 };
-        snprintf(p, sizeof(p), "head.layers.%d.multihead_attn", i); ok = ok && load_mha(f, p, W, cfg->head_heads, &d->cross, err, errlen);
+        snprintf(p, sizeof(p), "head.layers.%d.self_attn", i); ok = ok && load_mha(f, p, W, cfg->head_heads, true, &d->self_attn, err, errlen);
+        if (ok) d->self_in = (linear){ d->self_attn.in_q.w, d->self_attn.in_q.b, 3 * W, W, NULL, 0, 0 };
+        snprintf(p, sizeof(p), "head.layers.%d.multihead_attn", i); ok = ok && load_mha(f, p, W, cfg->head_heads, false, &d->cross, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.linear1", i); ok = ok && load_linear(f, p, FF, W, true, &d->lin1, err, errlen);
         snprintf(p, sizeof(p), "head.layers.%d.linear2", i); ok = ok && load_linear(f, p, W, FF, true, &d->lin2, err, errlen);
     }
@@ -194,17 +231,17 @@ clef_head *clef_head_load(const gguf_file *f, const clef_config *cfg, char *err,
     linear *projections[] = { &h->scorer0, &h->question_projection, &h->option_question_projection,
                              &h->option_context_projection, &h->option_lexical_projection };
     for (size_t i = 0; ok && i < sizeof(projections) / sizeof(projections[0]); i++)
-        ok = pack_linear(projections[i], err, errlen);
+        ok = prepare_linear(projections[i], workers, err, errlen);
     for (int i = 0; ok && i < h->n_ev; i++) {
         evidence_layer *e = &h->ev[i];
-        ok = pack_linear(&e->attn.in_q, err, errlen) && pack_linear(&e->attn.out, err, errlen)
-            && pack_linear(&e->ff1, err, errlen) && pack_linear(&e->ff2, err, errlen);
+        ok = prepare_linear(&e->attn.in_q, workers, err, errlen) && prepare_linear(&e->attn.out, workers, err, errlen)
+            && prepare_linear(&e->ff1, workers, err, errlen) && prepare_linear(&e->ff2, workers, err, errlen);
     }
     for (int i = 0; ok && i < h->n_dec; i++) {
         decoder_layer *d = &h->dec[i];
-        ok = pack_linear(&d->self_in, err, errlen) && pack_linear(&d->self_attn.out, err, errlen)
-            && pack_linear(&d->cross.in_q, err, errlen) && pack_linear(&d->cross.out, err, errlen)
-            && pack_linear(&d->lin1, err, errlen) && pack_linear(&d->lin2, err, errlen);
+        ok = prepare_linear(&d->self_in, workers, err, errlen) && prepare_linear(&d->self_attn.out, workers, err, errlen)
+            && prepare_linear(&d->cross.in_q, workers, err, errlen) && prepare_linear(&d->cross.out, workers, err, errlen)
+            && prepare_linear(&d->lin1, workers, err, errlen) && prepare_linear(&d->lin2, workers, err, errlen);
     }
     if (!ok) { clef_head_free(h); return NULL; }
     return h;
@@ -215,15 +252,15 @@ static void free_ln(layernorm *l) { free(l->w); free(l->b); }
 
 void clef_head_free(clef_head *h) {
     if (!h) return;
-    free_ln(&h->hidden_norm); free_ln(&h->option_summary_norm); free_ln(&h->field_norm); free_ln(&h->option_norm);
-    free_linear(&h->memory_projection); free_linear(&h->question_projection);
+    free_ln(&h->option_summary_norm); free_ln(&h->field_norm); free_ln(&h->option_norm);
+    free_linear(&h->question_projection);
     free_linear(&h->option_question_projection); free_linear(&h->global_projection);
     free_linear(&h->option_context_projection); free_linear(&h->option_lexical_projection);
     free_linear(&h->scorer0); free_linear(&h->scorer3);
     free(h->type_embedding);
     for (int i = 0; i < h->n_ev; i++) {
         evidence_layer *e = &h->ev[i];
-        free_ln(&e->query_norm); free_ln(&e->memory_norm); free_ln(&e->ff_norm);
+        free_ln(&e->query_norm); free_ln(&e->ff_norm);
         free_linear(&e->attn.in_q); free_linear(&e->attn.out);
         free_linear(&e->ff1); free_linear(&e->ff2);
     }
@@ -249,9 +286,9 @@ static void lin_cols(const linear *l, const float *X, int n, float *Y, int j0, i
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, n, cnt, l->in, 1.0f, X, l->in, l->w + (size_t)j0 * l->in, l->in, 0.0f, Y + j0, l->out);
 }
 
-/* Large projections with few query rows benefit from two cores. Split output columns,
- * leaving the input reduction intact. Two 32-column-aligned halves preserve the tested
- * BLAS results; finer splits changed single-row results. Tests compare with unsplit BLAS.
+/* Split large projections by output columns, leaving each input reduction intact.
+ * Dense multi-row calls may use four 32-column-aligned groups. Keep two for single
+ * rows: finer splits changed their BLAS reduction. Tests compare with unsplit BLAS.
  * CLEF_DEBUG_HEAD_SPLIT_MIN=<elements> moves the minimum; 0 disables this split. */
 #define LIN_SPLIT_MIN (1u << 20)
 static size_t lin_split_min(void) {
@@ -269,8 +306,9 @@ static size_t lin_split_min(void) {
 /* Y[n][out] = X[n][in] . W^T + b */
 static void lin(const linear *l, const float *X, int n, float *Y) {
     if (l->out % 64 == 0 && (size_t)l->out * l->in >= lin_split_min()) {
-        const int half = l->out / 2;
-        dispatch_apply(2, DISPATCH_APPLY_AUTO, ^(size_t part) { lin_cols(l, X, n, Y, (int)part * half, half); });
+        const int parts = l->packed && l->max_workers == 4 && n > 1 && l->out % 128 == 0 ? 4 : 2;
+        const int half = l->out / parts;
+        dispatch_apply((size_t)parts, DISPATCH_APPLY_AUTO, ^(size_t part) { lin_cols(l, X, n, Y, (int)part * half, half); });
     } else {
         lin_cols(l, X, n, Y, 0, l->out);
     }
@@ -293,6 +331,24 @@ static void ln_rows(const layernorm *l, const float *X, int n, float *Y) {
 
 static float gelu(float x) { return 0.5f * x * (1.0f + erff(x * 0.70710678118654752f)); }
 
+/* Only the existing dense four-worker projections may finish their elementwise
+ * work on those same workers. Each owns the same output columns as lin(); keep
+ * bias and GELU as separate passes so the stored FP32 bias result is preserved. */
+static bool lin_gelu4(const linear *l, const float *X, int n, float *Y) {
+    if (!l->packed || l->max_workers != 4 || n <= 1 || l->out % 128 != 0 ||
+        (size_t)l->out * l->in < lin_split_min()) return false;
+    const int count = l->out / 4;
+    dispatch_apply(4, DISPATCH_APPLY_AUTO, ^(size_t part) {
+        const int first = (int)part * count;
+        lin_cols(l, X, n, Y, first, count);
+        if (l->b) for (int r = 0; r < n; r++) for (int j = first; j < first + count; j++)
+            Y[(size_t)r * l->out + j] += l->b[j];
+        for (int r = 0; r < n; r++) for (int j = first; j < first + count; j++)
+            Y[(size_t)r * l->out + j] = gelu(Y[(size_t)r * l->out + j]);
+    });
+    return true;
+}
+
 static void softmax_inplace(float *x, int n) {
     float m = -INFINITY;
     for (int i = 0; i < n; i++) if (x[i] > m) m = x[i];
@@ -304,22 +360,43 @@ static void softmax_inplace(float *x, int n) {
 
 #define ATTEND_SPLIT_MIN (1u << 16)   /* query rows x keys x heads below this are not worth a thread wake-up */
 
+/* Expanded worker counts use at most 8 MiB of total score scratch; larger
+ * cases retain the existing two-worker path. Check byte products before allocation. */
+static bool attend_plan(int nq, int L, int heads, int requested, int *parts, size_t *bytes) {
+    if (nq <= 0 || L <= 0 || heads <= 0 ||
+        (requested != 2 && requested != 4 && requested != 8) ||
+        (size_t)nq > SIZE_MAX / sizeof(float) / (size_t)L) return false;
+    const size_t cells = (size_t)nq * (size_t)L;
+    const size_t threshold = ATTEND_SPLIT_MIN / (size_t)heads +
+                             (ATTEND_SPLIT_MIN % (size_t)heads != 0);
+    int selected = heads % 2 == 0 && cells >= threshold ? 2 : 1;
+    if (selected == 2 && heads % requested == 0) selected = requested;
+    const size_t row_bytes = cells * sizeof(float);
+    while (selected > 2 && row_bytes > (8u * 1024u * 1024u) / (size_t)selected)
+        selected /= 2;
+    if (row_bytes > SIZE_MAX / (size_t)selected) return false;
+    *parts = selected;
+    *bytes = row_bytes * (size_t)selected;
+    return true;
+}
+
 /* Multi-head attention of nq query rows (already projected, bias included) over L
  * key/value rows. Q row stride ldq, K/V row stride ld; bv (may be NULL when V already carries its bias)
  * is added after the weighted sum, which is exact because the weights sum to 1. Out: [nq][E]. */
 static bool attend(const float *Qp, int ldq, int nq, const float *K, const float *V, int ld, int L,
-                   const float *bv, int E, int heads, float *out) {
-    const int hd = E / heads;
+                   const float *bv, int E, int heads, int max_workers, float *out) {
     /* Heads read shared K/V and write disjoint output columns. Each worker owns its
      * score scratch and keeps the original BLAS calls and softmax order within a head.
      * Small field self-attention stays serial to avoid a thread wake-up. */
-    const int parts = heads % 2 == 0 && (size_t)nq * L * heads >= ATTEND_SPLIT_MIN ? 2 : 1;
-    float *S = malloc((size_t)parts * nq * L * sizeof(float));
+    int selected; size_t score_bytes;
+    if (!attend_plan(nq, L, heads, max_workers, &selected, &score_bytes)) return false;
+    const int hd = E / heads;
+    float *S = malloc(score_bytes);
     if (!S) return false;
     const float scale = 1.0f / sqrtf((float)hd);
-    dispatch_apply((size_t)parts, DISPATCH_APPLY_AUTO, ^(size_t part) {
+    dispatch_apply((size_t)selected, DISPATCH_APPLY_AUTO, ^(size_t part) {
         float *Sp = S + part * (size_t)nq * L;
-        for (int h = (int)part * heads / parts; h < ((int)part + 1) * heads / parts; h++) {
+        for (int h = (int)part * heads / selected; h < ((int)part + 1) * heads / selected; h++) {
             cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nq, L, hd, scale,
                         Qp + h * hd, ldq, K + h * hd, ld, 0.0f, Sp, L);
             for (int r = 0; r < nq; r++) softmax_inplace(Sp + (size_t)r * L, L);
@@ -347,6 +424,7 @@ static void l2_normalize(const float *x, int n, float *y) {
 bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor *lm_head,
                    const clef_head_inputs *in, int base, const clef_record *rec, float **logits) {
     const int H = h->H, W = h->W, heads = cfg->head_heads, nq = rec->nq;
+    const int max_workers = cfg->model.backbone == CLEF_QWEN35 ? 8 : 2;
     const int L = (int)rec->ids.len;
     /* With a prefix cache the record's first tokens have no nh row. Everything read from nh
      * below is a schema span or the last token, and the caller keeps those past the skip. */
@@ -422,12 +500,14 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
         const float *kv = in->kv[l] + (size_t)base * 2 * W;
         ln_rows(&e->query_norm, routed, n_opt, nrm);
         lin(&e->attn.in_q, nrm, n_opt, qp);
-        if (!attend(qp, W, n_opt, kv, kv + W, 2 * W, L, e->attn.in_bv, W, heads, att)) { free(mem); return false; }
+        if (!attend(qp, W, n_opt, kv, kv + W, 2 * W, L, e->attn.in_bv, W, heads, max_workers, att)) { free(mem); return false; }
         lin(&e->attn.out, att, n_opt, tmp);
         add_rows(routed, tmp, (size_t)n_opt * W);
         ln_rows(&e->ff_norm, routed, n_opt, nrm);
-        lin(&e->ff1, nrm, n_opt, ffbuf);
-        for (size_t i = 0; i < (size_t)n_opt * cfg->head_ff; i++) ffbuf[i] = gelu(ffbuf[i]);
+        if (cfg->model.backbone != CLEF_QWEN35 || !lin_gelu4(&e->ff1, nrm, n_opt, ffbuf)) {
+            lin(&e->ff1, nrm, n_opt, ffbuf);
+            for (size_t i = 0; i < (size_t)n_opt * cfg->head_ff; i++) ffbuf[i] = gelu(ffbuf[i]);
+        }
         lin(&e->ff2, ffbuf, n_opt, tmp);
         add_rows(routed, tmp, (size_t)n_opt * W);
     }
@@ -464,20 +544,22 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
         ln_rows(&d->norm1, fields, nq, fn);
         lin(&d->self_in, fn, nq, fq);   /* [nq][3W]: q | k | v with biases */
         /* self-attention: Q, K and V rows interleave in the fused [nq][3W] projection (biases included) */
-        if (!attend(fq, 3 * W, nq, fq + W, fq + 2 * W, 3 * W, nq, NULL, W, heads, fatt)) { free(mem); return false; }
+        if (!attend(fq, 3 * W, nq, fq + W, fq + 2 * W, 3 * W, nq, NULL, W, heads, max_workers, fatt)) { free(mem); return false; }
         lin(&d->self_attn.out, fatt, nq, fn);
         add_rows(fields, fn, (size_t)nq * W);
 
         ln_rows(&d->norm2, fields, nq, fn);
         lin(&d->cross.in_q, fn, nq, fq);
         const float *kv = in->kv[h->n_ev + l] + (size_t)base * 2 * W;
-        if (!attend(fq, W, nq, kv, kv + W, 2 * W, L, d->cross.in_bv, W, heads, fatt)) { free(mem); return false; }
+        if (!attend(fq, W, nq, kv, kv + W, 2 * W, L, d->cross.in_bv, W, heads, max_workers, fatt)) { free(mem); return false; }
         lin(&d->cross.out, fatt, nq, fn);
         add_rows(fields, fn, (size_t)nq * W);
 
         ln_rows(&d->norm3, fields, nq, fn);
-        lin(&d->lin1, fn, nq, ffbuf);
-        for (size_t i = 0; i < (size_t)nq * cfg->head_ff; i++) ffbuf[i] = gelu(ffbuf[i]);
+        if (cfg->model.backbone != CLEF_QWEN35 || !lin_gelu4(&d->lin1, fn, nq, ffbuf)) {
+            lin(&d->lin1, fn, nq, ffbuf);
+            for (size_t i = 0; i < (size_t)nq * cfg->head_ff; i++) ffbuf[i] = gelu(ffbuf[i]);
+        }
         lin(&d->lin2, ffbuf, nq, fn);
         add_rows(fields, fn, (size_t)nq * W);
     }
@@ -504,8 +586,10 @@ bool clef_head_run(const clef_head *h, const clef_config *cfg, const gguf_tensor
                 row[3*W+i] = fabsf(field[i] - opt[i]);
             }
         }
-        lin(&h->scorer0, feat, n_opt, opt_q);
-        for (size_t i = 0; i < (size_t)n_opt * W; i++) opt_q[i] = gelu(opt_q[i]);
+        if (cfg->model.backbone != CLEF_QWEN35 || !lin_gelu4(&h->scorer0, feat, n_opt, opt_q)) {
+            lin(&h->scorer0, feat, n_opt, opt_q);
+            for (size_t i = 0; i < (size_t)n_opt * W; i++) opt_q[i] = gelu(opt_q[i]);
+        }
         lin(&h->scorer3, opt_q, n_opt, tmp);
     }
     o = 0;

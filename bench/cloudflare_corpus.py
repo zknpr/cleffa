@@ -11,6 +11,7 @@ Never overwrites an existing journal. Does not replace the FP32 numerical oracle
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime
 import hashlib
 import http.client
@@ -20,9 +21,12 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import socket
+import statistics
+import time
 import sys
 
-from cloudflare_checkout import ROOT, collect
+from cloudflare_checkout import ROOT, collect, response_info
 
 sys.path.insert(0, str(ROOT / "ref"))
 from corpus import build
@@ -38,6 +42,23 @@ RUN_LIMIT = 2500
 def hosted_payload(request: dict, model: str) -> dict:
     payload = json.loads(json.dumps({k: v for k, v in request.items() if k != "id"}))
     payload["model"] = model
+    # Hosted requires embedded data URIs even where Cleffa also accepts bare
+    # image base64 or typed envelopes. Change only the transport representation.
+    for key in ('images', 'videos', 'audio'):
+        if not payload.get(key):
+            continue
+        for i, value in enumerate(payload[key]):
+            if isinstance(value, dict) and set(value) == {'content_type', 'base64'}:
+                payload[key][i] = f"data:{value['content_type']};base64,{value['base64']}"
+            elif key == 'images' and isinstance(value, str) and not value.lower().startswith('data:'):
+                data = base64.b64decode(value, validate=True)
+                if data.startswith(b'\x89PNG\r\n\x1a\n'):
+                    mime = 'image/png'
+                elif data.startswith(b'\xff\xd8'):
+                    mime = 'image/jpeg'
+                else:
+                    raise ValueError('unsupported bare hosted image encoding')
+                payload[key][i] = f'data:{mime};base64,{value}'
     # The hosted validator requires instructions; the pinned encoder defaults to
     # the question ID. Make that default explicit and prove token equality below.
     for qid, question in payload["questions"].items():
@@ -157,13 +178,130 @@ def final_usage(out, account: str, token: str) -> None:
     out.flush()
 
 
+def capture_native(plan_path: Path, output: Path, model: str) -> None:
+    """Run one strict HTTP arm from the same frozen bodies used for hosted calls.
+
+    Call under the shared GPU lock and external memory guard. Media soft limits
+    are raised only to admit the corpus; strict tokenization and inference
+    defaults remain active. Request IDs/hashes bind all successful and failed rows.
+    """
+    raw = plan_path.read_bytes()
+    run_plan = json.loads(raw)
+    rows = [row for row in run_plan['requests'] if row['model'] == model]
+    if not rows or len({row['id'] for row in rows}) != len(rows):
+        raise ValueError('empty or duplicated native request plan')
+    bodies = {row['id']: json.dumps(row['request']).encode() for row in rows}
+    for row in rows:
+        if hashlib.sha256(bodies[row['id']]).hexdigest() != row['request_sha256']:
+            raise ValueError('native payload hash differs from frozen plan')
+    if output.exists():
+        raise FileExistsError(output)
+    rows.sort(key=lambda row: (row['full_input_tokens'] >= 8000, row['modality'], row['id']))
+    weights = ROOT / 'gguf' / ('clef-omni-full.gguf' if model == 'clef-omni' else model + '.gguf')
+    encoded = subprocess.run([ROOT/'clef-tool', 'encode-strict', weights],
+                             input=b''.join(bodies[row['id']] + b'\n' for row in rows),
+                             capture_output=True, check=True, timeout=600).stdout.splitlines()
+    if len(encoded) != len(rows):
+        raise ValueError('native encoder returned an incomplete inventory')
+    encodings = {}
+    for row, line in zip(rows, encoded, strict=True):
+        if not line.startswith(b'{'):
+            raise ValueError(f"native preflight {row['id']}: {line.decode()}")
+        value = json.loads(line)
+        encodings[row['id']] = dict(tokens=len(value['input_ids']),
+            input_ids_sha256=hashlib.sha256(json.dumps(value['input_ids']).encode()).hexdigest())
+    def digest(path):
+        import fcntl
+        with path.open('rb') as source:
+            # Do not fill the filesystem cache with a second 64 GB model copy.
+            fcntl.fcntl(source.fileno(), 48, 1)  # Darwin F_NOCACHE
+            return hashlib.file_digest(source, 'sha256').hexdigest()
+    with socket.socket() as sock:
+        sock.bind(('127.0.0.1', 0)); port = sock.getsockname()[1]
+    command = [str(ROOT/'clef-server'), '-m', str(weights), '--port', str(port),
+               '--no-warmup', '--no-keep-warm', '--max-images', '0', '--max-image-tokens', '0',
+               '--max-videos', '0', '--max-video-frames', '0', '--max-video-tokens', '0',
+               '--max-body', '67108864']
+    report = dict(complete=False, arm='strict native HTTP', model=model,
+        started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        plan_sha256=hashlib.sha256(raw).hexdigest(), command=command, strict=True,
+        startup_warmup=False, keep_warm=False, records=[],
+        hashes={name: digest(ROOT/name) for name in ('clef-server', 'clef-tool', 'clef-media')},
+        gguf_sha256=digest(weights),
+        metric='client JSON bytes, HTTP, media decoding, inference and typed response; model loading excluded')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    def save():
+        temporary = output.with_suffix('.tmp')
+        temporary.write_text(json.dumps(report, indent=2, allow_nan=False)+'\n')
+        temporary.replace(output)
+    save()
+    process = None
+    with output.with_suffix('.server.log').open('x') as log:
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=log)
+            deadline = time.monotonic()+90
+            while True:
+                if process.poll() is not None:
+                    raise RuntimeError('native server exited during startup; see server log')
+                try:
+                    with socket.create_connection(('127.0.0.1', port), timeout=.5): break
+                except OSError:
+                    if time.monotonic() > deadline: raise TimeoutError('native server startup')
+                    time.sleep(.1)
+            timed = set()
+            for row in rows:
+                report['active_request'] = row['id']; save()
+                expected = {**row, 'full_input_tokens': encodings[row['id']]['tokens']}
+                def send():
+                    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=600)
+                    start = time.perf_counter()
+                    try:
+                        conn.request('POST', '/v1/systemone', bodies[row['id']], {'Content-Type':'application/json'})
+                        response = conn.getresponse(); data = response.read(1048577)
+                        ms = (time.perf_counter()-start)*1000
+                        if len(data)>1048576: raise ValueError('native response exceeds 1 MiB')
+                        answer = json.loads(data)
+                        info = response_info(response.status, answer, expected)
+                        if not info['full_input_reported']: raise ValueError('native input count changed from preflight')
+                        return ms, answer
+                    finally:
+                        conn.close()
+                cold, answer = send()
+                item = dict(id=row['id'], modality=row['modality'], request_sha256=row['request_sha256'],
+                            **encodings[row['id']], cold_ms=cold, response=answer)
+                if row['modality'] not in timed:
+                    samples=[]; changes=0
+                    for _ in range(3):
+                        elapsed, again=send();samples.append(elapsed);changes+=again!=answer
+                    item['warm']=dict(samples_ms=samples,median_ms=statistics.median(samples),response_changes=changes)
+                    timed.add(row['modality'])
+                report['records'].append(item);save()
+                print(f"native {model}/{row['id']}: {cold:.2f} ms",flush=True)
+            report.update(complete=True,completed_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+            report.pop('active_request',None);save()
+        except Exception as error:
+            report['error']=f'{type(error).__name__}: {error}';save();raise
+        finally:
+            if process is not None:
+                process.terminate()
+                try:process.wait(timeout=10)
+                except subprocess.TimeoutExpired:process.kill();process.wait()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
     parser.add_argument("--run", action="store_true")
+    parser.add_argument("--native-plan", type=Path)
+    parser.add_argument("--native-model", choices=("clef-flash", "clef", "clef-omni"))
     parser.add_argument("--account", help="exact account name in the current Wrangler login")
     parser.add_argument("--passes", type=int, choices=[1, 2], default=2)
     args = parser.parse_args()
+    if args.native_plan:
+        if args.run or not args.native_model:
+            parser.error('--native-plan requires --native-model and cannot use --run')
+        capture_native(args.native_plan, args.out, args.native_model)
+        return
     if args.run and not args.account:
         parser.error("--run requires --account")
     run_plan = plan(args.passes)

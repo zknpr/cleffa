@@ -82,15 +82,35 @@ def main() -> None:
         sys.exit(f"missing requested layer reference: {layers_path}")
     if do_dump and layers_path.exists():
         ref = load_file(str(layers_path))
+        T = len(enc_g[0]["input_ids"])
+        start = 0
+        manifest_path = golden / "manifest.json"
+        if manifest_path.exists():
+            records = json.loads(manifest_path.read_text()).get("records", [])
+            matches = [r for r in records if r.get("id") == enc_g[0]["id"]]
+            if len(matches) != 1:
+                sys.exit("missing or duplicate layer manifest record")
+            record = matches[0]
+            start = record.get("dump_start")
+            if type(start) is not int or not 0 <= start < T or record.get("tokens") != T:
+                sys.exit("invalid layer suffix geometry")
+        n_layer = sum(1 for k in ref if k.startswith("layer."))
+        names = ["embed"] + [f"layer.{i:02d}" for i in range(n_layer)] + ["final_norm"]
+        if not set(names) <= ref.keys() or ref["embed"].ndim != 2:
+            sys.exit("missing or invalid decoder layer reference")
+        H = ref["embed"].shape[-1]
+        if H <= 0 or any(ref[n].shape != (T-start, H) for n in names):
+            sys.exit("layer shapes differ from explicit suffix geometry")
         dump = ROOT / "golden" / "engine_dump.bin"
         first = request_lines[0]
-        subprocess.run([ROOT / "clef", "-m", gguf, "--dump", dump], input=first, capture_output=True, text=True, check=True)
-        T = len(enc_g[0]["input_ids"])
-        n_layer = sum(1 for k in ref if k.startswith("layer."))
-        H = ref["embed"].shape[-1]
-        eng = np.fromfile(dump, dtype=np.float32).reshape(n_layer + 2, T, H)
-        names = ["embed"] + [f"layer.{i:02d}" for i in range(n_layer)] + ["final_norm"]
-        print(f"residual stream ({T} tokens):")
+        command = [ROOT / "clef", "-m", gguf, "--dump", dump]
+        if start:
+            command += ["--dump-last", str(T-start)]
+        subprocess.run(command, input=first, capture_output=True, text=True, check=True)
+        if dump.stat().st_size != (n_layer+2)*(T-start)*H*4:
+            sys.exit("native layer dump size differs from suffix geometry")
+        eng = np.memmap(dump, dtype=np.float32, mode="r", shape=(n_layer+2, T-start, H))
+        print(f"residual stream ({T-start} rows from {T} tokens):")
         prev = 0.0
         for i, n in enumerate(names):
             r, e = ref[n].astype(np.float64), eng[i].astype(np.float64)

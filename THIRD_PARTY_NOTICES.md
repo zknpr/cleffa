@@ -161,8 +161,10 @@ cleffa does not include or redistribute model weights or Cloudflare's code.
 ## FFmpeg
 
 The optional `tools/video_request.py` client tool invokes locally installed `ffmpeg` and `ffprobe`
-executables for MP4/MOV conversion. The engine does not link FFmpeg. Its source and binaries are
-not vendored here.
+executables for MP4/MOV conversion. The optional native `clef-media` worker links the installed
+libavformat, libavcodec, libswscale, libswresample and libavutil libraries. The main `clef`,
+`clef-server` and `clef-tool` executables launch that worker when needed and do not link FFmpeg.
+FFmpeg source and binaries are not vendored here.
 Its license depends on the build configuration; see the installed distribution's notices and
 [FFmpeg's license page](https://ffmpeg.org/legal.html).
 

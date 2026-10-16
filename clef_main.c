@@ -5,6 +5,7 @@
  *   --logits      print raw per-question logits instead of responses (parity testing)
  *   --dump FILE   write [n_layer+2][R][H] f32 residual dumps of the first request
  *   --dump-last N dump only the last N token rows of each layer (R = N; default all T)
+ *   --dump-routes FILE  Omni router JSONL for the first request; --dump-last bounds rows
  *   --batch N     pack up to N requests per forward pass (default 1)
  *   --prefix-cache  keep the backbone state of each request's template and state tokens and
  *                 reuse it when the next request starts with the same tokens (one request per
@@ -20,11 +21,13 @@
  *   --max-image-pixels N  reject a source image with more pixels, at its header, before decoding
  *                 (default: the decoders' 64-megapixel cap)
  *   --max-videos N, --max-video-frames N, --max-video-tokens N bound video work (0: processor/context).
+ *   --max-audio N, --max-audio-samples N bound clips and total samples (defaults 4 and 4800000).
  * Images are data URLs or {"content_type","base64"} objects (the hosted API's forms; bare base64
  * is accepted too) in the request's "images" list.
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,13 +36,35 @@
 
 #include "clef_engine.h"
 
-bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, bool raw, float *dump,
+bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, bool raw, clef_dump *dump,
                  int dump_rows, char *err, size_t errlen);
 
 static double now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static void free_dump(clef_dump *dump) {
+    if (!dump) return;
+    if (dump->file) fclose(dump->file);
+    free(dump);
+}
+
+static bool publish_dump(clef_dump *dump, const char *path) {
+    if (fseeko(dump->file, 0, SEEK_SET)) return false;
+    FILE *out = fopen(path, "wb");
+    if (!out) return false;
+    unsigned char buffer[65536];
+    size_t remaining = dump->elements * sizeof(float);
+    bool ok = true;
+    while (remaining && ok) {
+        size_t n = remaining < sizeof(buffer) ? remaining : sizeof(buffer);
+        ok = fread(buffer, 1, n, dump->file) == n && fwrite(buffer, 1, n, out) == n;
+        remaining -= n;
+    }
+    if (fclose(out)) ok = false;
+    return ok;
 }
 
 /* Each item owns its input line: the JSON DOM points into it (unescaped strings, integer
@@ -99,23 +124,39 @@ static bool parse_count(const char *s, long max, long *out) {
 }
 
 int main(int argc, char **argv) {
-    const char *model = NULL, *input = NULL, *dump_path = NULL;
+    const char *model = NULL, *input = NULL, *dump_path = NULL, *route_path = NULL;
     bool logits = false, timing = false, strict = false, no_truncate = true, prefix_cache = false, template_cache = false;
     int batch = 1;
     int dump_last = 0;
     int max_images = 0;
+    int max_length = 0;
     long max_image_tokens = 0;
     long max_image_pixels = 0;
     int max_videos = 0, max_video_frames = 0;
+    int max_audio = 4;
+    long max_audio_samples = 4800000;
     long max_video_tokens = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
+        else if (!strcmp(argv[i], "--max-length") && i + 1 < argc) {
+            long v;
+            if (!parse_count(argv[++i], INT_MAX, &v) || !v) { fprintf(stderr, "clef: --max-length must be a positive whole number\n"); return 2; }
+            max_length = (int)v;
+        }
         else if ((!strcmp(argv[i], "--max-videos") || !strcmp(argv[i], "--max-video-frames") || !strcmp(argv[i], "--max-video-tokens")) && i + 1 < argc) {
             const char *flag = argv[i]; long v;
             if (!parse_count(argv[++i], INT_MAX, &v)) { fprintf(stderr, "clef: %s must be a whole number (0 = processor/context limit)\n", flag); return 2; }
             if (!strcmp(flag, "--max-videos")) max_videos = (int)v;
             else if (!strcmp(flag, "--max-video-frames")) max_video_frames = (int)v;
             else max_video_tokens = v;
+        }
+        else if (!strcmp(argv[i],"--max-audio") && i+1<argc) {
+            long value;
+            if(!parse_count(argv[++i],INT_MAX,&value)){fprintf(stderr,"clef: --max-audio must be a whole number\n");return 2;}
+            max_audio=(int)value;
+        }
+        else if (!strcmp(argv[i],"--max-audio-samples") && i+1<argc) {
+            if(!parse_count(argv[++i],LONG_MAX,&max_audio_samples)){fprintf(stderr,"clef: --max-audio-samples must be a whole number\n");return 2;}
         }
         else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
             long v;
@@ -134,7 +175,12 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--truncate")) no_truncate = false;
         else if (!strcmp(argv[i], "--no-truncate")) no_truncate = true;
         else if (!strcmp(argv[i], "--dump") && i + 1 < argc) dump_path = argv[++i];
-        else if (!strcmp(argv[i], "--dump-last") && i + 1 < argc) dump_last = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dump-routes") && i + 1 < argc) route_path = argv[++i];
+        else if (!strcmp(argv[i], "--dump-last") && i + 1 < argc) {
+            long v;
+            if (!parse_count(argv[++i], INT_MAX, &v) || !v) { fprintf(stderr, "clef: --dump-last must be a positive whole number\n"); return 2; }
+            dump_last = (int)v;
+        }
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) batch = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--prefix-cache")) {
             if (template_cache) { fprintf(stderr, "clef: choose --prefix-cache or --template-cache\n"); return 2; }
@@ -146,10 +192,10 @@ int main(int argc, char **argv) {
             prefix_cache = template_cache = true;
         }
         else if (argv[i][0] != '-' && !input) input = argv[i];
-        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-videos N] [--max-video-frames N] [--max-video-tokens N] [--dump FILE [--dump-last N]] [requests.jsonl]\n"); return 2; }
+        else { fprintf(stderr, "usage: clef -m MODEL.gguf [--logits] [--time] [--strict] [--truncate | --no-truncate] [--batch N] [--prefix-cache | --template-cache] [--max-length N] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-videos N] [--max-video-frames N] [--max-video-tokens N] [--max-audio N] [--max-audio-samples N] [--dump FILE] [--dump-routes FILE] [--dump-last N] [requests.jsonl]\n"); return 2; }
     }
     if (!model || batch < 1) { fprintf(stderr, "clef: -m MODEL.gguf is required\n"); return 2; }
-    if (prefix_cache && (batch != 1 || dump_path)) { fprintf(stderr, "clef: %s takes one request per pass and no --dump\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
+    if (prefix_cache && (batch != 1 || dump_path || route_path)) { fprintf(stderr, "clef: %s takes one request per pass and no diagnostic dumps\n", template_cache ? "--template-cache" : "--prefix-cache"); return 2; }
     FILE *in = input ? fopen(input, "r") : stdin;
     if (!in) { fprintf(stderr, "clef: cannot open %s\n", input); return 1; }
 
@@ -157,6 +203,15 @@ int main(int argc, char **argv) {
     double t0 = now_ms();
     clef_engine *e = clef_open(model, err, sizeof(err));
     if (!e) { fprintf(stderr, "clef: %s\n", err); if (in != stdin) fclose(in); return 1; }
+    if (route_path && e->cfg.model.backbone != CLEF_OMNI) {
+        fprintf(stderr, "clef: --dump-routes requires an Omni model\n");
+        clef_close(e); if (in != stdin) fclose(in); return 2;
+    }
+    if (!max_length) max_length = e->cfg.model.context_default;
+    if (e->cfg.model.context_length && max_length > e->cfg.model.context_length) {
+        fprintf(stderr, "clef: --max-length exceeds model context limit %d\n", e->cfg.model.context_length);
+        clef_close(e); if (in != stdin) fclose(in); return 2;
+    }
     if (timing) fprintf(stderr, "clef: loaded %s in %.0f ms\n", model, now_ms() - t0);
 
     item *items = calloc((size_t)batch, sizeof(*items));
@@ -196,9 +251,16 @@ int main(int argc, char **argv) {
             }
             it->req = json_parse(it->arena, it->line, (size_t)len, it->err, sizeof(it->err));
             clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
+            opts.model = e->cfg.model;
+            opts.max_length = max_length;
             opts.strict = strict;
             opts.reject_truncation = no_truncate;
             opts.vision = e->vision;
+            opts.audio.token_id=e->audio.token_id;
+            opts.audio.start_token_id=e->audio.start_token_id;
+            opts.audio.end_token_id=e->audio.end_token_id;
+            opts.audio.max_items=max_audio;
+            opts.audio.max_samples=(size_t)max_audio_samples;
             opts.vision.max_images = max_images;
             opts.vision.max_image_tokens = max_image_tokens;
             opts.vision.max_image_pixels = max_image_pixels;
@@ -216,14 +278,28 @@ int main(int argc, char **argv) {
         int m = 0;
         for (int i = 0; i < n; i++) if (items[i].ok) { recs[m] = items[i].rec; map[m++] = i; }
         float ***probs = NULL;
-        float *dump = NULL;
+        clef_dump *dump = NULL;
         size_t dump_rows = 0;
+        const bool diagnostic = (dump_path || route_path) && !dumped && m;
+        e->capture_routes = diagnostic && route_path;
+        e->route_rows = dump_last;
         if (dump_path && !dumped && m) {
             dump_rows = recs[0].ids.len;
             if (dump_last > 0 && (size_t)dump_last < dump_rows) dump_rows = (size_t)dump_last;
-            dump = calloc((size_t)(e->cfg.n_layer + 2) * dump_rows * e->cfg.H, sizeof(float));
+            dump = calloc(1, sizeof(*dump));
             if (!dump) {
                 fprintf(stderr, "clef: cannot allocate dump\n");
+                free_items(items, n);
+                rc = 1;
+                break;
+            }
+            dump->elements = (size_t)(e->cfg.n_layer + 2) * dump_rows * e->cfg.H;
+            dump->file = tmpfile();
+            /* Avoid retaining the trace in the filesystem cache as well as on
+             * disk. The anonymous temporary file disappears on failure/exit. */
+            if (!dump->file || fcntl(fileno(dump->file), F_NOCACHE, 1) == -1) {
+                fprintf(stderr, "clef: cannot open residual dump temporary file: %s\n", strerror(errno));
+                free_dump(dump);
                 free_items(items, n);
                 rc = 1;
                 break;
@@ -235,17 +311,20 @@ int main(int argc, char **argv) {
             items[map[0]].ok = false;
             snprintf(items[map[0]].err, sizeof(items[map[0]].err), "%s", err);
             rc = 1;
-        } else if (m && !prefix_cache && !clef_run_ex(e, recs, dump ? 1 : m, &probs, logits, dump, (int)dump_rows, err, sizeof(err))) {
+        } else if (m && !prefix_cache && !clef_run_ex(e, recs, diagnostic ? 1 : m, &probs, logits, dump, (int)dump_rows, err, sizeof(err))) {
             for (int i = 0; i < m; i++) { items[map[i]].ok = false; snprintf(items[map[i]].err, sizeof(items[map[i]].err), "%s", err); }
             rc = 1;
-        } else if (dump) {
-            FILE *df = fopen(dump_path, "wb");
-            const size_t want = (size_t)(e->cfg.n_layer + 2) * dump_rows * e->cfg.H;
-            bool wrote = df && fwrite(dump, sizeof(float), want, df) == want;   /* short write = failure */
-            if (df && fclose(df) != 0) wrote = false;                           /* buffered data can fail here */
-            if (!wrote) {
-                fprintf(stderr, "clef: cannot write %s (incomplete dump)\n", dump_path);
+        } else if (diagnostic) {
+            if (route_path && !clef_dump_routes(e, route_path, err, sizeof(err))) {
+                fprintf(stderr, "clef: %s\n", err);
                 rc = 1;
+            }
+            e->capture_routes = false;
+            if (dump) {
+                if (!publish_dump(dump, dump_path)) {
+                    fprintf(stderr, "clef: cannot write %s (incomplete dump)\n", dump_path);
+                    rc = 1;
+                }
             }
             dumped = true;
             /* the dump run covered only the first record; run the rest normally */
@@ -256,7 +335,7 @@ int main(int argc, char **argv) {
                     fprintf(stderr, "clef: %s\n", all ? err : "out of memory (combined results)");
                     /* Until combined, probs owns one record, not m records. */
                     clef_free_probs(recs, 1, probs);
-                    free(all); free(dump);
+                    free(all); free_dump(dump);
                     free_items(items, n);
                     rc = 1;
                     break;
@@ -273,7 +352,7 @@ int main(int argc, char **argv) {
             if (prefix_cache) fprintf(stderr, "clef: prefix cache reused %d of %zu tokens, entry %.0f MB\n", reused, toks, clef_prefix_bytes(prefix) / 1e6);
             fprintf(stderr, "clef: batch of %d (%zu tokens) in %.1f ms\n", m, toks, now_ms() - t1);
         }
-        free(dump);
+        free_dump(dump);
         int k = 0;
         for (int i = 0; i < n; i++) {
             errno = 0;

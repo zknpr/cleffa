@@ -15,10 +15,13 @@
  */
 
 #include <stdio.h>
+#include <errno.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../clef_gguf.h"
+#include "../clef_audio.h"
 #include "../clef_image.h"
 #include "../clef_json.h"
 #include "../clef_record.h"
@@ -47,6 +50,33 @@ int main(int argc, char **argv) {
     char *line;
     size_t len;
     char err[256];
+
+    if (!strcmp(mode, "audio")) {
+        while ((line = read_line(stdin, &len))) {
+            jarena *a = jarena_new();
+            jval *v = json_parse(a, line, len, err, sizeof(err));
+            const jval *wav = v ? json_get(v, "wav") : NULL, *values = v ? json_get(v, "samples") : NULL;
+            uint8_t *bytes = NULL;
+            size_t n = 0;
+            clef_audio_samples samples = {0};
+            bool ok = false;
+            if (v && wav && wav->type == J_STRING && !values) {
+                ok = clef_base64_decode(wav->s, wav->len, &bytes, &n, err, sizeof(err)) &&
+                     clef_audio_decode(bytes, n, 4800000, &samples, err, sizeof(err));
+            } else if (v && values && !wav) {
+                ok = clef_audio_from_json(values, 4800000, &samples, err, sizeof(err));
+            } else if (v) snprintf(err, sizeof(err), "need either wav or samples");
+            if (ok) {
+                printf("{\"count\":%zu,\"hex\":\"", samples.count);
+                const uint8_t *raw = (const uint8_t *)samples.data;
+                for (size_t i = 0; i < samples.count*4; i++) printf("%02x", raw[i]);
+                puts("\"}");
+            } else printf("ERR %s\n", err);
+            clef_audio_samples_free(&samples);
+            free(bytes); jarena_free(a); free(line);
+        }
+        return 0;
+    }
 
     if (!strcmp(mode, "json")) {
         while ((line = read_line(stdin, &len))) {
@@ -177,8 +207,24 @@ int main(int argc, char **argv) {
         clef_tokenizer *t = clef_tok_load(&f, err, sizeof(err));
         if (!t) { fprintf(stderr, "%s\n", err); return 1; }
         bool respond = !strcmp(mode, "respond");
+        clef_model_info model;
+        if (!clef_model_info_load(&f, &model, err, sizeof(err))) { fprintf(stderr, "%s\n", err); return 1; }
+        int max_length = model.context_default;
+        for (int i = !strcmp(mode, "encode-patches") ? 4 : 3; i < argc; i++) {
+            if (strcmp(argv[i], "--max-length") || ++i >= argc || !*argv[i] || strspn(argv[i], "0123456789") != strlen(argv[i])) {
+                fprintf(stderr, "encode: expected --max-length N\n"); return 2;
+            }
+            errno = 0;
+            long n = strtol(argv[i], NULL, 10);
+            if (errno || n <= 0 || n > INT_MAX || (model.context_length && n > model.context_length)) {
+                fprintf(stderr, "encode: invalid --max-length for this model\n"); return 2;
+            }
+            max_length = (int)n;
+        }
         clef_vision_opts vision = {0};
         if (!clef_vision_opts_load(&f, &vision, err, sizeof(err))) { fprintf(stderr, "%s\n", err); return 1; }
+        clef_audio_opts audio = {.max_items=4,.max_samples=4800000};
+        if (!clef_audio_opts_load(&f,&audio,err,sizeof(err))) { fprintf(stderr,"%s\n",err);return 1; }
         while ((line = read_line(stdin, &len))) {
             jarena *a = jarena_new();
             jval *doc = json_parse(a, line, len, err, sizeof(err));
@@ -188,6 +234,9 @@ int main(int argc, char **argv) {
             opts.strict = !strcmp(mode, "encode-strict");
             opts.reject_truncation = !strcmp(mode, "encode-notrunc");
             opts.vision = vision;
+            opts.audio = audio;
+            opts.model = model;
+            opts.max_length = max_length;
             if (!doc) {
                 printf("ERR %s\n", err);
             } else if (!clef_encode_request(t, req, opts, &rec, err, sizeof(err))) {
@@ -208,7 +257,7 @@ int main(int argc, char **argv) {
                 clef_record_free(&rec);
             } else {
                 if (!strcmp(mode, "encode-patches")) {
-                    if (argc != 4) { fprintf(stderr, "encode-patches needs an output file\n"); return 2; }
+                    if (argc < 4) { fprintf(stderr, "encode-patches needs an output file\n"); return 2; }
                     FILE *fp = fopen(argv[3], "wb");
                     bool written = fp != NULL;
                     for (int i = 0; written && i < rec.n_images; i++) {
@@ -248,7 +297,7 @@ int main(int argc, char **argv) {
                     jbuf_puts(&b, "]}");
                 }
                 jbuf_puts(&b, "]");
-                if (rec.n_images) {
+                if (rec.n_images || rec.n_audio) {
                     /* images: token offset and merged grid of each; position_ids as the reference's
                      * get_rope_index lays them out, [3][T] */
                     jbuf_puts(&b, ",\"images\":[");
@@ -271,6 +320,17 @@ int main(int argc, char **argv) {
                     }
                     jbuf_puts(&b, "]");
                     free(pos3);
+                }
+                if(rec.n_audio) {
+                    jbuf_puts(&b,",\"audio\":[");
+                    for(int i=0;i<rec.n_audio;i++) {
+                        clef_audio_ref *a=rec.audio+i;char meta[128];
+                        snprintf(meta,sizeof(meta),"%s{\"frames\":%zu,\"padded_frames\":%zu,\"video_index\":%d,\"token_rows\":[",
+                            i?",":"",a->feat.frames,a->feat.padded_frames,a->video_index);jbuf_puts(&b,meta);
+                        for(int t=0;t<a->feat.n_tokens;t++){snprintf(num,sizeof(num),t?",%d":"%d",a->token_rows[t]);jbuf_puts(&b,num);}
+                        jbuf_puts(&b,"]}");
+                    }
+                    jbuf_puts(&b,"]");
                 }
                 jbuf_puts(&b, "}");
                 printf("%s\n", b.p);

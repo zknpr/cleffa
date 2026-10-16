@@ -8,7 +8,7 @@
 #include "../clef_engine.h"
 
 bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, bool raw,
-                 float *dump, int rows, char *err, size_t errlen);
+                 clef_dump *dump, int rows, char *err, size_t errlen);
 
 static int alloc_count, fail_at, close_count;
 static int arena_count, fail_arena_at, live_arenas, run_count, fail_run_at;
@@ -45,7 +45,7 @@ static void test_arena_free(jarena *a) {
 }
 
 static bool test_run(clef_engine *e, const clef_record *recs, int n, float ****out,
-                     bool raw, float *dump, int rows, char *err, size_t errlen) {
+                     bool raw, clef_dump *dump, int rows, char *err, size_t errlen) {
     if (++run_count == fail_run_at) {
         snprintf(err, errlen, "injected inference failure");
         return false;

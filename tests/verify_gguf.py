@@ -22,6 +22,11 @@ P = "model.language_model."
 
 def main() -> None:
     hf, path = Path(sys.argv[1]), sys.argv[2]
+    config = json.loads((hf / "config.json").read_text())
+    if config.get("model_type") == "qwen3_omni_moe":
+        from verify_omni_gguf import verify_omni
+        verify_omni(hf, Path(path))
+        return
     idx = json.loads((hf / "model.safetensors.index.json").read_text())["weight_map"]
     handles: dict = {}
 
