@@ -197,7 +197,7 @@ def capture_native(plan_path: Path, output: Path, model: str) -> None:
     if output.exists():
         raise FileExistsError(output)
     rows.sort(key=lambda row: (row['full_input_tokens'] >= 8000, row['modality'], row['id']))
-    weights = ROOT / 'gguf' / ('clef-omni-full.gguf' if model == 'clef-omni' else model + '.gguf')
+    weights = ROOT / 'gguf' / ('clef-omni.gguf' if model == 'clef-omni' else model + '.gguf')
     encoded = subprocess.run([ROOT/'clef-tool', 'encode-strict', weights],
                              input=b''.join(bodies[row['id']] + b'\n' for row in rows),
                              capture_output=True, check=True, timeout=600).stdout.splitlines()

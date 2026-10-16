@@ -16,7 +16,7 @@ from PIL import Image,ImageOps
 import test_omni_server as common
 
 ROOT=common.ROOT
-MODEL=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'gguf/clef-omni-vision.gguf'
+MODEL=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'gguf/clef-omni.gguf'
 GOLDEN=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'golden/clef-omni-vision-f32'
 sys.path.insert(0,str(ROOT/'ref'))
 import corpus_omni_video

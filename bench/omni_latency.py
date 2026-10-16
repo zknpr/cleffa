@@ -18,7 +18,7 @@ ROOT=Path(__file__).resolve().parents[1]
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('--model',type=Path,default=ROOT/'gguf/clef-omni-full.gguf')
+    ap.add_argument('--model',type=Path,default=ROOT/'gguf/clef-omni.gguf')
     ap.add_argument('--golden-root',type=Path,default=ROOT/'golden')
     ap.add_argument('--inventory',type=Path,required=True)
     ap.add_argument('--output',type=Path,required=True)

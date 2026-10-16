@@ -12,7 +12,7 @@ import unittest
 import test_omni_server as common
 
 ROOT=common.ROOT
-MODEL=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'gguf/clef-omni-full.gguf'
+MODEL=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'gguf/clef-omni.gguf'
 AUDIO=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'golden/clef-omni-audio-f32'
 AV=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'golden/clef-omni-av-f32'
 

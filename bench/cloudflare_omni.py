@@ -32,7 +32,7 @@ def plan(inventory, passes, only=None):
         originals = rows(golden / 'requests.jsonl')
         encodings = rows(golden / 'encoded.jsonl')
         payloads = [hosted_payload(request, 'clef-omni') for request in originals]
-        result = subprocess.run([ROOT / 'clef-tool', 'encode-strict', ROOT / 'gguf/clef-omni-full.gguf'],
+        result = subprocess.run([ROOT / 'clef-tool', 'encode-strict', ROOT / 'gguf/clef-omni.gguf'],
                                 input=''.join(json.dumps(p) + '\n' for p in payloads),
                                 text=True, capture_output=True, check=True)
         native = [json.loads(line) for line in io.StringIO(result.stdout)]

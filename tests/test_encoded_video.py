@@ -40,7 +40,7 @@ class EncodedVideo(unittest.TestCase):
     clip = fixture.OmniVideoRequest.clip
 
     def native(self, request, family):
-        weights = 'clef-omni-full' if family == 'qwen3_omni_moe' else 'clef-flash'
+        weights = 'clef-omni' if family == 'qwen3_omni_moe' else 'clef-flash'
         patches = Path(self.tmp.name) / 'patches'
         result = subprocess.run([TOOL, 'encode-patches',
                                  ROOT / 'gguf' / (weights + '.gguf'), patches],

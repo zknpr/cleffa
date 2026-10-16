@@ -56,7 +56,7 @@ def verify_video_transport(row, original, encoding, encoder):
         raise ValueError('video transport changed processor tensors')
 
 
-def compare(journal, inventory, model=ROOT / 'gguf/clef-omni-full.gguf'):
+def compare(journal, inventory, model=ROOT / 'gguf/clef-omni.gguf'):
     plan, calls, journal_hash = hosted_snapshot(journal)
     with Path(model).open('rb') as source:
         model_hash = hashlib.file_digest(source, 'sha256').hexdigest()
@@ -163,7 +163,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('journal', type=Path)
     parser.add_argument('--inventory', type=Path, required=True)
-    parser.add_argument('--model', type=Path, default=ROOT / 'gguf/clef-omni-full.gguf')
+    parser.add_argument('--model', type=Path, default=ROOT / 'gguf/clef-omni.gguf')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.output.exists():

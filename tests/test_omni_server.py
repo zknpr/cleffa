@@ -14,7 +14,7 @@ import unittest
 
 from test_omni_runtime import REQUEST, ROOT
 
-MODEL = ROOT/'gguf/clef-omni-text.gguf'
+MODEL = ROOT/'gguf/clef-omni.gguf'
 BASE_ENV = {k:v for k,v in os.environ.items() if not k.startswith('CLEF_')}
 
 

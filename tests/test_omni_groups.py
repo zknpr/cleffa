@@ -14,7 +14,7 @@ from corpus_video import frames,image
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('model',type=Path,nargs='?',default=ROOT/'gguf/clef-omni-full.gguf')
+    parser.add_argument('model',type=Path,nargs='?',default=ROOT/'gguf/clef-omni.gguf')
     parser.add_argument('--bf16',action='store_true',help='check invariance within the legacy 16-bit vision diagnostic mode')
     args=parser.parse_args();model=args.model
     cases=corpus_omni_vision.build()+corpus_omni_video.build()+corpus_audio.build()+corpus_omni_av.build()

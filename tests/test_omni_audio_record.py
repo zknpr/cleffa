@@ -7,7 +7,7 @@ import sys
 import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
-MODEL=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'gguf/clef-omni-full.gguf'
+MODEL=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'gguf/clef-omni.gguf'
 GOLDEN=Path(sys.argv.pop(1)) if len(sys.argv)>1 else ROOT/'golden/clef-omni-audio-f32'
 
 

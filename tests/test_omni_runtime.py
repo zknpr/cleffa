@@ -1,6 +1,6 @@
 """Real-model native Omni smoke, packing, poison and late-failure regressions.
 
-Run after producing gguf/clef-omni-text.gguf; kept out of model-free make test.
+Run after producing gguf/clef-omni.gguf; kept out of model-free make test.
 """
 
 import json
@@ -17,7 +17,7 @@ REQUEST = dict(model="clef-omni", state="The checkout is broken.",
 
 class NativeHelper:
     def run_native(self, requests, *args, env=None, returncode=0):
-        p = subprocess.run([ROOT/"clef", "-m", ROOT/"gguf/clef-omni-text.gguf", "--logits", *args],
+        p = subprocess.run([ROOT/"clef", "-m", ROOT/"gguf/clef-omni.gguf", "--logits", *args],
                            input="".join(json.dumps(r)+"\n" for r in requests),
                            capture_output=True, text=True, timeout=300,
                            env={**{k: v for k, v in os.environ.items() if not k.startswith("CLEF_")}, **(env or {})})
@@ -30,7 +30,7 @@ class NativeHelper:
 class OmniRuntime(NativeHelper, unittest.TestCase):
     def test_simd_width_guard(self):
         for name in ("omni_attn_prep", "omni_attention", "omni_route", "omni_router"):
-            p = subprocess.run([ROOT/"clef", "-m", ROOT/"gguf/clef-omni-text.gguf"],
+            p = subprocess.run([ROOT/"clef", "-m", ROOT/"gguf/clef-omni.gguf"],
                                input="", capture_output=True, text=True,
                                env={**os.environ, "CLEF_DEBUG_SIMD_WIDTH_FOR": name})
             self.assertEqual(p.returncode, 1)

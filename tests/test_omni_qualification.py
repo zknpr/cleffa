@@ -220,7 +220,7 @@ def main():
                                      artifacts/'av-tower','--native-frontend','--poison','--reference',args.reference)),
                       ('audio-server',py('tests/test_omni_server_audio.py',args.model,args.golden_root/inventory['audio']['golden'],
                                         args.golden_root/inventory['audio_video']['golden'])),
-                      ('vision-server',py('tests/test_omni_server_media.py','gguf/clef-omni-vision.gguf',args.golden_root/inventory['images']['golden'])),
+                      ('vision-server',py('tests/test_omni_server_media.py',args.model,args.golden_root/inventory['images']['golden'])),
                       ('omni-runtime',py('tests/test_omni_runtime.py')),('omni-routes',py('tests/test_omni_routes.py')),
                       ('omni-text-server',py('tests/test_omni_server.py')),
                       ('omni-groups',py('tests/test_omni_groups.py',args.model)),
