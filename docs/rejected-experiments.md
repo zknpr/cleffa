@@ -1538,6 +1538,29 @@ expert GEMMs are bound by streaming each expert's weights once per chunk, and th
 reads them again. Rejected and removed; the profile is in
 [performance history](performance-history.md#omni-category-profile-2026-10-17).
 
+**Compensated FP16 QKV and output projections, 2026-10-17.** The dense projections, unlike the
+experts, are compute-bound on FP32 operands (`bench/mixed_bench.m`: about 15 TFLOPS against 59
+for FP16 here). Splitting their operands into FP16 high/residual planes with per-token-record
+overflow flags halved the `gemm` category (45.7 → 24.5 ms at 298 tokens, 262.7 → 141.9 ms at
+2,231) but failed the FP64-bounded check on `r019` (logit error 0.0531) and `r021` (probability
+error 0.0115 against the FP32 reference's 0.0099), with 9 questions beyond the fixed limits;
+the same attention change without it passed. The 22-bit Q/K operands feed long-context scores.
+Rejected and removed.
+
+**Plain FP32 attention accumulation, 2026-10-17.** Summing every probability-value product in
+plain FP32 cut attention to 187 ms at 2,231 tokens and 3.38 s at 8,069 and passed the
+FP64-bounded check, but drifts by about n * eps / 2 on flat rows (1.56e-5 at 8,193 keys against
+2.98e-8 compensated), about 2e-3 at the 64k context where no reference checks it. The retained
+block-compensated form ([performance history](performance-history.md#omni-block-compensated-attention-2026-10-17))
+keeps most of the gain with error that does not grow with length. Evidence for both:
+`golden/omni-attention-block-20261017/`.
+
+**Expert GEMM bandwidth.** `bench/expert_bench.m` reproduces the expert GEMMs at 298 tokens: 128
+experts of about 19 rows. FP32 and FP16 operands run at 330–375 GB/s of weight traffic against a
+520–545 GB/s streaming read on this machine; 32×64 tiles and 2- or 4-way split-K do not raise it.
+The MPP expert product is bandwidth-bound below its ceiling; closing that gap needs a different
+kernel, not another operand type.
+
 ### Timing method and attribution diagnostics
 
 - **Identical-binary control** (2026-10-15). The same build under both labels on the 2,231-token

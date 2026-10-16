@@ -1563,6 +1563,28 @@ FP32 operand rate (see [rejected experiments](rejected-experiments.md#default-pa
 Attention grows quadratically: about 382 ms per layer at 16,344 tokens, against 262–294 ms for
 the dense FP32 attention kernels on the same 4,096 head-dimensions.
 
+## Omni block-compensated attention, 2026-10-17
+
+`omni_attention` compensated every 8-key probability-value product with a two-float addition.
+It now sums each 32-key block's four products in plain FP32 and folds the block into the
+compensated accumulators once (rescale and denominator unchanged). Attention time, `CLEF_PROFILE`
+in ABBA order: 322 → 262 ms at 2,231 tokens and 4.24 → 3.62 s at 8,069. Whole requests, ABBA
+over two processes per arm with the median of the last three of four warm calls, merged default
+(`9e5e982`) against the change (`5bf6ee3`):
+
+| Request | Tokens | Before | After | Ratio |
+|---|---:|---:|---:|---:|
+| `r003` | 298 | 246.3 ms | 245.2 ms | 0.996 |
+| `r018` | 586 | 378.0 ms | 373.6 ms | 0.988 |
+| `ov000` (image) | 398 | 315.7 ms | 313.4 ms | 0.993 |
+| `oa000` (audio) | 239 | 246.7 ms | 245.2 ms | 0.994 |
+| `r019` | 2,231 | 1,505.1 ms | 1,449.4 ms | 0.963 |
+| `r020` | 8,069 | 8,654.2 ms | 8,188.6 ms | 0.946 |
+| `r021` | 16,344 | 27,122.1 ms | 24,612.3 ms | 0.907 |
+
+All 43 requests with an FP64 reference still pass the FP64-bounded check ([omni.md](omni.md#against-fp64)).
+Evidence: `golden/omni-attention-block-20261017/`.
+
 ## Dense head memory, 2026-10-14
 
 Flash and 27B keep fewer CPU head weights and reuse two completed decoder buffers on the GPU

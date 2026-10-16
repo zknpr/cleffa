@@ -602,6 +602,7 @@ swiglu, head, vision and, for Omni, omni_router, omni_experts and omni_moe, with
 serializes the GPU, so not for latency),
 `CLEF_STAGE_TIME=1` (host encode, commit-to-completion wait, GPU execution and CPU head time),
 `CLEF_ATTN_TU=0` (tiled FP32 attention control; compensated tensor-unit attention defaults on),
+`CLEF_OMNI_ATTN=comp` (Omni attention compensates every 8-key product; the default compensates per 32-key block),
 `CLEF_ATTN_REF=1` (reference attention kernels for the backbone and the vision tower), `CLEF_DEBUG_POISON=1`, `CLEF_DEBUG_FAIL_MULTI=1`
 (fails every multi-record forward; exercises the server's per-record retry), `CLEF_SCAN_LPC`
 (lanes per value column in the sequential `gdn_scan`), `CLEF_DEBUG_NIL_CMDBUF=N` (the Nth Metal command-buffer

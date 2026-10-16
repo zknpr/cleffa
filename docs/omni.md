@@ -15,7 +15,7 @@ the independent FP64 reference, each question's error must be within the larger 
 limits and the FP32 PyTorch reference's own error ([policy](#numerical-verification-policy)).
 The working default (the current tree) **passes** it on every request that has an FP64
 reference: 43 requests up to 16,344 tokens, 93 questions, all decisions equal to FP64
-([results](#against-fp64)). Against the fixed limits alone it exceeds them on 6 of those
+([results](#against-fp64)). Against the fixed limits alone it exceeds them on 7 of those
 questions, the FP32 reference on 18. Nothing near the 64,000-token default context has a
 reference ([not done](#not-done)).
 
@@ -156,8 +156,11 @@ activation path is disabled for Omni), so the FP16-overflow rerun does not apply
   position; Hugging Face's FP32 `pos * inv_freq` loses about `pos * 6e-8` rad, 1e-3 rad at 16k.
   `CLEF_OMNI_ROPE=f32` restores the FP32 angles. `make test-omni-attention` checks both modes
   against FP64 RMS/RoPE oracles, including positions near 65,000 and the four temporal-only pairs.
-- `omni_attention`: tiled FP32 attention (8 queries × 32 keys) with two-float compensated
-  accumulators and record-aligned key blocks, then the output projection into the residual.
+- `omni_attention`: tiled FP32 attention (8 queries × 32 keys, record-aligned key blocks). Each
+  32-key block's probability-value products are summed in plain FP32 and folded into two-float
+  accumulators once; the rescale and the denominator are compensated too, so long rows do not
+  drift (flat-row error 7.45e-8 at both 2,049 and 8,193 keys). `CLEF_OMNI_ATTN=comp` compensates
+  every 8-key product instead. Then the output projection into the residual.
 - Router: `omni_router` keeps each of the 128 logits as a high/low FP32 pair, compensating
   products and sums, because expert boundaries can be closer than a plain FP32 dot product's
   error. `omni_route` ranks the pairs before the FP32 softmax, takes eight, breaks exact ties by
@@ -309,27 +312,28 @@ requests after model load.
 
 ### Against FP64
 
-Acceptance run of 2026-10-17 on the working default (engine commit `64ea114`), with
-`tests/test_parity.py --bound-by` per FP64 reference and the matching FP32 blocked-attention
-reference as the bound. Maxima are the script's four-decimal summaries. Evidence:
-`golden/omni-fp64-bounded-20261016/` (`rope/` for this run).
+Acceptance run of 2026-10-17 on the working default (block-compensated attention, engine commit
+`5bf6ee3`), with `tests/test_parity.py --bound-by` per FP64 reference and the matching FP32
+blocked-attention reference as the bound. Maxima are the script's four-decimal summaries.
+Evidence: `golden/omni-fp64-bounded-20261016/block/`; the exact-rotary run before it is in
+`rope/` (6 of 93 questions beyond the fixed limits).
 
 | FP64 reference | Requests / questions | Max logit / probability error vs FP64 | Beyond fixed limits: native / FP32 reference | FP64-bounded |
 |---|---:|---:|---:|---|
 | Text up to 1,024 tokens | 19 / 40 | 0.0081 / 0.0004 | 0 / 3 | Pass |
-| `r019`, 2,231 tokens | 1 / 2 | 0.0436 / 0.0019 | 0 / 1 | Pass |
-| `r020`, 8,069 tokens | 1 / 2 | 0.0096 / 0.0008 | 0 / 1 | Pass |
-| `r021`, 16,344 tokens | 1 / 2 | 0.0417 / 0.0025 | 1 / 1 | Pass |
-| Images | 5 / 15 | 0.0061 / 0.0004 | 0 / 1 | Pass |
+| `r019`, 2,231 tokens | 1 / 2 | 0.0445 / 0.0019 | 0 / 1 | Pass |
+| `r020`, 8,069 tokens | 1 / 2 | 0.0560 / 0.0097 | 1 / 1 | Pass |
+| `r021`, 16,344 tokens | 1 / 2 | 0.0743 / 0.0073 | 1 / 1 | Pass |
+| Images | 5 / 15 | 0.0062 / 0.0004 | 0 / 1 | Pass |
 | Video | 5 / 10 | 0.0430 / 0.0061 | 3 / 4 | Pass |
-| Audio | 6 / 12 | 0.0084 / 0.0002 | 0 / 1 | Pass |
+| Audio | 6 / 12 | 0.0003 / below 0.0001 | 0 / 1 | Pass |
 | Audio/video | 5 / 10 | 0.0868 / 0.0065 | 2 / 6 | Pass |
-| All | 43 / 93 | | 6 / 18 | Pass |
+| All | 43 / 93 | | 7 / 18 | Pass |
 
-Every decision equals FP64's. The six native questions beyond the fixed limits are
-`r021/service`, `ot002/moving`, `ot003/moving`, `ot003/direction`, `oav000/sound` and
-`oav000/audible`; on each, the FP32 reference's error on the exceeded measure is at least as
-large.
+Every decision equals FP64's. The seven native questions beyond the fixed limits are
+`r020/service`, `r021/service`, `ot002/moving`, `ot003/moving`, `ot003/direction`,
+`oav000/sound` and `oav000/audible`; on each, the FP32 reference's error on the exceeded measure
+is at least as large.
 
 Exact rotary angles made the difference at long positions. With Hugging Face's FP32 angles, the
 2026-10-16 run on engine `32b5ef8` passed the 42 requests up to 8,069 tokens (8 questions beyond
