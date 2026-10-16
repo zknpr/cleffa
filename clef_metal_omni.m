@@ -227,7 +227,7 @@ bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCommand
     [enc dispatchThreadgroups:MTLSizeMake(T, c->nh+c->nkv, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
     OPROF(P_ATTNPREP);
     omni_attention_args aa = {c->nh, c->nkv, c->hd, T, 1.f/sqrtf((float)c->hd)};
-    [enc setComputePipelineState:g->ps[@"omni_attention"]];
+    [enc setComputePipelineState:g->ps[g->omni_attn_comp ? @"omni_attention_comp" : @"omni_attention"]];
     [enc setBytes:&aa length:sizeof(aa) atIndex:0];
     [enc setBuffer:g->Q offset:0 atIndex:1]; [enc setBuffer:g->K offset:0 atIndex:2];
     [enc setBuffer:g->V offset:0 atIndex:3]; [enc setBuffer:g->seq_start offset:0 atIndex:4];

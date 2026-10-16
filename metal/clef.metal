@@ -2153,6 +2153,13 @@ inline void omni_rescale_fragment(thread simdgroup_float8x8 &hi,
 // The established FP32 tiled attention reduction, specialized to hd=128 and
 // ungated FP32 output. Record-aligned key blocks preserve packed-batch parity.
 constant constexpr int OMNI_FA_BQ = 8, OMNI_FA_BK = 32, OMNI_FA_HD = 128, OMNI_FA_DT = OMNI_FA_HD / 8;
+// MODE 1 (default) sums each 32-key block's four 8-key products in plain FP32 and folds the block
+// into two-float accumulators once, with the compensated rescale and denominator: rows still
+// accumulate across blocks without drift (error does not grow with length), at a quarter of the
+// compensated additions. MODE 2 (CLEF_OMNI_ATTN=comp) compensates every 8-key product. Plain FP32
+// accumulation throughout was faster but drifts by about n * eps / 2 over n keys in flat rows,
+// about 2e-3 at 64k, where no reference checks it (docs/rejected-experiments.md).
+template <int MODE>
 kernel void omni_attention(constant attn_args &a [[buffer(0)]],
                          device const float *Q [[buffer(1)]],
                          device const float *K [[buffer(2)]],
@@ -2242,11 +2249,20 @@ kernel void omni_attention(constant attn_args &a [[buffer(0)]],
         #pragma clang loop unroll(full)
         for (int d = 0; d < OMNI_FA_DT; d++) {
             omni_rescale_fragment(acc[d],low[d],dm);
-            for (int j = 0; j < 4; j++) {
-                simdgroup_float8x8 vt, t;
-                simdgroup_load(vt, Vh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD);
-                simdgroup_multiply(t, p[j], vt);
-                omni_accumulate_fragment(acc[d],low[d],t);
+            if (MODE == 1) {
+                simdgroup_float8x8 vt, block = simdgroup_float8x8(0.0f);
+                for (int j = 0; j < 4; j++) {
+                    simdgroup_load(vt, Vh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD);
+                    simdgroup_multiply_accumulate(block, p[j], vt, block);
+                }
+                omni_accumulate_fragment(acc[d],low[d],block);
+            } else {
+                for (int j = 0; j < 4; j++) {
+                    simdgroup_float8x8 vt, t;
+                    simdgroup_load(vt, Vh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD);
+                    simdgroup_multiply(t, p[j], vt);
+                    omni_accumulate_fragment(acc[d],low[d],t);
+                }
             }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
@@ -2284,6 +2300,10 @@ kernel void omni_attention(constant attn_args &a [[buffer(0)]],
         simdgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+
+template [[host_name("omni_attention")]] kernel void omni_attention<1>(constant attn_args &, device const float *, device const float *, device const float *, device const int *, device float *, threadgroup float *, uint2, uint, uint);
+template [[host_name("omni_attention_comp")]] kernel void omni_attention<2>(constant attn_args &, device const float *, device const float *, device const float *, device const int *, device float *, threadgroup float *, uint2, uint, uint);
 
 // ---------------------------------------------------------------- Omni routed experts
 // A chunk belongs to one record. Keeping its chunk origin relative to that
