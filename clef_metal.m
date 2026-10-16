@@ -100,7 +100,7 @@ static id<MTLComputePipelineState> pipeline(clef_gpu *g, id<MTLLibrary> lib, con
     // each 32-lane SIMDgroup into four-thread rows, so it requires the same width.
     if ((!strcmp(name, "attention_reuse_4") || !strcmp(name, "attention_prefetch_64") || !strcmp(name, "attention_prefix_64") ||
          !strcmp(name, "vis_attention_mpp") || !strcmp(name, "omni_attn_prep") ||
-         !strcmp(name, "omni_attention") || !strcmp(name, "omni_attention_comp") || !strcmp(name, "omni_route") || !strcmp(name, "omni_router") ||
+         !strcmp(name, "omni_attention") || !strcmp(name, "omni_route") || !strcmp(name, "omni_router") ||
          !strcmp(name, "audio_attention") || !strcmp(name, "audio_norm")) &&
         width != 32) {
         snprintf(err, errlen, "metal: %s requires a 32-lane SIMDgroup", name);
@@ -156,7 +156,7 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         if (e->cfg.model.backbone == CLEF_OMNI) {
             const char *omni_names[] = { "omni_attn_prep", "omni_attention", "omni_router", "omni_route",
                                          "omni_assign_count", "omni_assign_offsets", "omni_assign_scatter",
-                                         "omni_gather", "omni_expert_gemm", "omni_swiglu", "omni_combine", "omni_trace", "omni_attention_comp",
+                                         "omni_gather", "omni_expert_gemm", "omni_swiglu", "omni_combine", "omni_trace",
                                          "omni_vision_merger_norm", "omni_vision_inject", "omni_vision_residual" };
             for (size_t i = 0; i < sizeof(omni_names)/sizeof(omni_names[0]); i++) {
                 if (!pipeline(g, lib, omni_names[i], err, errlen)) { free(g); return NULL; }
@@ -228,10 +228,6 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         // the DeltaNet prefix-cache eligibility check select the plain fallback.
         if (c->model.backbone == CLEF_OMNI) g->act_f16 = 0;
         // Omni rotary angles to about 1e-7 rad (omni_rope_cs); CLEF_OMNI_ROPE=f32 keeps HF's FP32 angles.
-        // Omni attention folds plain-FP32 32-key block sums into compensated accumulators;
-        // CLEF_OMNI_ATTN=comp compensates every 8-key product (omni_attention<2>).
-        const char *oat = getenv("CLEF_OMNI_ATTN");
-        g->omni_attn_comp = c->model.backbone == CLEF_OMNI && oat && !strcmp(oat, "comp");
         const char *orp = getenv("CLEF_OMNI_ROPE");
         g->omni_rope_exact = !orp || strcmp(orp, "f32") != 0;
         g->head_f32 = getenv("CLEF_HEAD_BF16") == NULL;

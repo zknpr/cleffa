@@ -29,7 +29,7 @@ class NativeHelper:
 
 class OmniRuntime(NativeHelper, unittest.TestCase):
     def test_simd_width_guard(self):
-        for name in ("omni_attn_prep", "omni_attention", "omni_attention_comp", "omni_route", "omni_router"):
+        for name in ("omni_attn_prep", "omni_attention", "omni_route", "omni_router"):
             p = subprocess.run([ROOT/"clef", "-m", ROOT/"gguf/clef-omni.gguf"],
                                input="", capture_output=True, text=True,
                                env={**os.environ, "CLEF_DEBUG_SIMD_WIDTH_FOR": name})

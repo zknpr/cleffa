@@ -129,8 +129,7 @@ tests/test-omni-attention: tests/test_omni_attention.m
 	$(CC) $(OBJCFLAGS) -o $@ $< $(LDFLAGS) -framework Metal -framework Foundation
 
 test-omni-attention: tests/test-omni-attention
-	./tests/test-omni-attention omni_attention
-	./tests/test-omni-attention omni_attention_comp
+	./tests/test-omni-attention
 
 tests/test-omni-assign: tests/test_omni_assign.m
 	$(CC) $(OBJCFLAGS) -o $@ $< $(LDFLAGS) -framework Metal -framework Foundation

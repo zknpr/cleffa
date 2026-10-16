@@ -11,10 +11,6 @@ typedef struct { int nh, nkv, T; float eps; int rope_exact; } prep_args;
 // 0 is CLEF_OMNI_ROPE=f32, checked against HF's FP32 angle product. pos_base shifts every position,
 // up to the Omni context limit, where FP32 angles are off by about 4e-3 rad.
 static int rope_exact = 1, pos_base = 0;
-// Flat rows (exact-zero scores, constant values) must reproduce the constant. omni_attention_comp
-// compensates every product (6e-8, 4 ulp); omni_attention sums each 32-key block in plain FP32 and
-// compensates across blocks, so its error is bounded per block and must not grow with length.
-static double flat_limit = 6e-8, flat_worst = 0;
 typedef struct { int nh, nkv, hd, T; float scale; } attention_args;
 static void require(bool ok, const char *why) {
     if (!ok) { fprintf(stderr, "Omni attention: %s\n", why); exit(1); }
@@ -102,8 +98,7 @@ static float *run(id<MTLDevice> dev, id<MTLCommandQueue> queue,
             if(delta>worst) worst=delta;
         }
         printf("long flat %d: max %.9g\n",length,worst);
-        require(worst < flat_limit,"long attention accumulation lost constant values");
-        flat_worst = worst;
+        require(worst < 6e-8,"long attention accumulation lost constant values");
         float *copy=malloc((size_t)length*nh*hd*4); require(copy!=NULL,"long copy");
         memcpy(copy,(float *)out.contents+(size_t)before*nh*hd,(size_t)length*nh*hd*4);
         return copy;
@@ -167,11 +162,7 @@ int main(int argc, char **argv) {
         MTLCompileOptions *opts = [MTLCompileOptions new]; opts.mathMode = MTLMathModeSafe;
         id<MTLLibrary> lib = [dev newLibraryWithSource:source options:opts error:&error];
         require(lib != nil, error.localizedDescription.UTF8String);
-        // argv[1] selects the attention variant: omni_attention (default, block-compensated) or
-        // omni_attention_comp (every 8-key product compensated).
-        NSString *variant = argc == 2 && strcmp(argv[1], "--compile-only") ? @(argv[1]) : @"omni_attention";
-        flat_limit = [variant isEqualToString:@"omni_attention_comp"] ? 6e-8 : 1.5e-7;
-        id<MTLFunction> pfn = [lib newFunctionWithName:@"omni_attn_prep"], afn = [lib newFunctionWithName:variant];
+        id<MTLFunction> pfn = [lib newFunctionWithName:@"omni_attn_prep"], afn = [lib newFunctionWithName:@"omni_attention"];
         require(pfn && afn, "missing Omni attention kernels");
         id<MTLComputePipelineState> prep = [dev newComputePipelineStateWithFunction:pfn error:&error];
         id<MTLComputePipelineState> attn = [dev newComputePipelineStateWithFunction:afn error:&error];
@@ -201,14 +192,11 @@ int main(int argc, char **argv) {
         free(run(dev, queue, prep, attn, 33, false, 0));
         free(run(dev, queue, prep, attn, 33, true, 1));
         rope_exact = 1;
-        free(run(dev,queue,prep,attn,2049,false,6));
-        const double flat_2049 = flat_worst;
         float *long_single=run(dev,queue,prep,attn,8193,false,6);
-        require(flat_worst <= 1.5*flat_2049 + 1.5e-8, "flat-row error grows with length");
         float *long_packed=run(dev,queue,prep,attn,8193,true,6);
         require(!memcmp(long_single,long_packed,(size_t)8193*8*128*4),"long packing changed bytes");
         free(long_single);free(long_packed);
-        printf("Omni attention (%s): FP64, packed equality, poison and output guards passed\n", variant.UTF8String);
+        puts("Omni attention: FP64, packed equality, poison and output guards passed");
     }
     return 0;
 }
