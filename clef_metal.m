@@ -170,10 +170,15 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
 
         const clef_config *c = &e->cfg;
         g->flash_gemm = c->H == 4096;
-        float inv[64];
+        // [0, 64): HF's 1 / base ** (arange(0, dim, 2).float() / dim), all f32, for the dense
+        // models and CLEF_OMNI_ROPE=f32. [64, 192): the FP64 frequency base ** (-2j / dim) as an
+        // FP32 hi/lo pair, for Omni's exact rotary angles (omni_rope_cs).
+        float inv[192] = {0};
         for (int j = 0; j < c->n_rot / 2; j++) {
-            // HF: 1 / base ** (arange(0, dim, 2).float() / dim), all f32
             inv[j] = 1.0f / powf(c->rope_theta, (float)(2 * j) / (float)c->n_rot);
+            const double f = pow((double)c->rope_theta, -(double)(2 * j) / (double)c->n_rot);
+            inv[64 + j] = (float)f;
+            inv[128 + j] = (float)(f - (double)inv[64 + j]);
         }
         g->inv_freq = [g->dev newBufferWithBytes:inv length:sizeof(inv) options:MTLResourceStorageModeShared];
         if (!g->inv_freq) { gerr(err, errlen, "cannot allocate rope table"); free(g); return NULL; }
@@ -222,6 +227,9 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         // Omni begins with FP32 operands through routing/experts. This also makes
         // the DeltaNet prefix-cache eligibility check select the plain fallback.
         if (c->model.backbone == CLEF_OMNI) g->act_f16 = 0;
+        // Omni rotary angles to about 1e-7 rad (omni_rope_cs); CLEF_OMNI_ROPE=f32 keeps HF's FP32 angles.
+        const char *orp = getenv("CLEF_OMNI_ROPE");
+        g->omni_rope_exact = !orp || strcmp(orp, "f32") != 0;
         g->head_f32 = getenv("CLEF_HEAD_BF16") == NULL;
         g->nil_cb_at = getenv("CLEF_DEBUG_NIL_CMDBUF") ? atoi(getenv("CLEF_DEBUG_NIL_CMDBUF")) : 0;
         g->ck_fail_at = getenv("CLEF_DEBUG_PREFIX_CKPT_FAIL") ? atoi(getenv("CLEF_DEBUG_PREFIX_CKPT_FAIL")) : 0;

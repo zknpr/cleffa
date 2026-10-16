@@ -9,7 +9,7 @@
 // changing a token's reduction order. The arena remains independent of context.
 enum { OMNI_CHUNK = 1024, OMNI_EXPERTS = 128, OMNI_TOP = 8, OMNI_PAD = OMNI_CHUNK*OMNI_TOP+OMNI_EXPERTS*31 };
 typedef struct { int rows, H, F, padded; } omni_moe_args;
-typedef struct { int nh, nkv, T; float eps; } omni_prep_args;
+typedef struct { int nh, nkv, T; float eps; int rope_exact; } omni_prep_args;
 typedef struct { int nh, nkv, hd, T; float scale; } omni_attention_args;
 typedef struct { int T, N, K; } omni_gemm_args;
 typedef struct { float logits[OMNI_EXPERTS], low[OMNI_EXPERTS]; int32_t ids[OMNI_TOP]; float weights[OMNI_TOP]; } omni_route_row;
@@ -212,7 +212,7 @@ bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCommand
     clef_metal_gemm(g, enc, X_F32, false, g->xn, 0, w->attn_qkv->offset,
                     (c->nh+2*c->nkv)*c->hd, c->H, g->P, 0, T);
     OPROF(P_GEMM);
-    omni_prep_args pa = {c->nh, c->nkv, T, c->eps};
+    omni_prep_args pa = {c->nh, c->nkv, T, c->eps, g->omni_rope_exact};
     [enc setComputePipelineState:g->ps[@"omni_attn_prep"]];
     [enc setBytes:&pa length:sizeof(pa) atIndex:0];
     [enc setBuffer:g->P offset:0 atIndex:1];

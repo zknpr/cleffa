@@ -6,7 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-typedef struct { int nh, nkv, T; float eps; } prep_args;
+typedef struct { int nh, nkv, T; float eps; int rope_exact; } prep_args;
+// rope_exact selects omni_rope_cs (FP64 frequencies, reduced angles) against an FP64-angle oracle;
+// 0 is CLEF_OMNI_ROPE=f32, checked against HF's FP32 angle product. pos_base shifts every position,
+// up to the Omni context limit, where FP32 angles are off by about 4e-3 rad.
+static int rope_exact = 1, pos_base = 0;
 typedef struct { int nh, nkv, hd, T; float scale; } attention_args;
 static void require(bool ok, const char *why) {
     if (!ok) { fprintf(stderr, "Omni attention: %s\n", why); exit(1); }
@@ -26,7 +30,7 @@ static float *run(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     const int nh = 8, nkv = 1, hd = 128, before = packed ? 7 : 0, after = packed ? 3 : 0;
     const int T = before+length+after, row = (nh+2*nkv)*hd;
     id<MTLBuffer> qkv = buffer(dev, (size_t)T*row*4), norm = buffer(dev, 256*4);
-    id<MTLBuffer> pos = buffer(dev, (size_t)T*3*4), freq = buffer(dev, 64*4), starts = buffer(dev, (size_t)T*4);
+    id<MTLBuffer> pos = buffer(dev, (size_t)T*3*4), freq = buffer(dev, 192*4), starts = buffer(dev, (size_t)T*4);
     id<MTLBuffer> q = buffer(dev, ((size_t)T*nh+32)*hd*4);
     id<MTLBuffer> k = buffer(dev, ((size_t)T*nkv+32)*hd*4), v = buffer(dev, ((size_t)T*nkv+32)*hd*4);
     id<MTLBuffer> out = buffer(dev, ((size_t)T*nh*hd+32)*4);
@@ -35,18 +39,22 @@ static float *run(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     float *source = qkv.contents, *norms = norm.contents, *iv = freq.contents;
     int32_t *positions = pos.contents, *ss = starts.contents;
     for (int i = 0; i < 256; i++) norms[i] = (sharp ? 8.f : 1.f)+sample(i+3)*.2f;
-    for (int i = 0; i < 64; i++) iv[i] = 1.f/powf(1e6f, 2.f*i/128.f);
+    for (int i = 0; i < 64; i++) {
+        iv[i] = 1.f/powf(1e6f, 2.f*i/128.f);
+        const double f = pow(1e6, -2.0*i/128.0);
+        iv[64+i] = (float)f; iv[128+i] = (float)(f-(double)iv[64+i]);
+    }
     for (int t = 0; t < T; t++) {
         int start = t < before ? 0 : t < before+length ? before : before+length;
         int local = t-start;
         ss[t] = start;
-        positions[3*t] = local+5; positions[3*t+1] = 2*local+1; positions[3*t+2] = 3*local+2;
+        positions[3*t] = pos_base+local+5; positions[3*t+1] = pos_base+2*local+1; positions[3*t+2] = pos_base+3*local+2;
         for (int i = 0; i < row; i++) source[(size_t)t*row+i] = sample(local*row+i);
         if (mode == 2 || mode == 6) memset(source+(size_t)t*row, 0, (nh+nkv)*hd*4); // exactly flat scores
         if (mode == 6) for (int d=0; d<hd; d++) source[(size_t)t*row+(nh+nkv)*hd+d] = .1234567f+(float)d*.0001f;
     }
     if (mode >= 3 && mode <= 5) source[(size_t)(before+length-1)*row] = mode == 3 ? NAN : mode == 4 ? INFINITY : -INFINITY;
-    prep_args pa = {nh, nkv, T, 1e-6f};
+    prep_args pa = {nh, nkv, T, 1e-6f, rope_exact};
     attention_args aa = {nh, nkv, hd, T, 1.f/sqrtf(128.f)};
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -106,8 +114,9 @@ static float *run(id<MTLDevice> dev, id<MTLCommandQueue> queue,
         float *gpu = (h < nh ? (float *)q.contents+(size_t)h*T*hd : (float *)k.contents+(size_t)(h-nh)*T*hd)+t*hd;
         for (int d = 0; d < 64; d++) {
             int axis = d < 60 ? d%3 : 0;
-            // The product feeding GPU sin/cos is float, just as the HF rotary op.
-            double angle = (float)(positions[3*t+axis]*iv[d]);
+            // FP32 mode: the product feeding GPU sin/cos is float, just as the HF rotary op.
+            double angle = rope_exact ? (double)positions[3*t+axis]*pow(1e6, -2.0*d/128.0)
+                                      : (float)(positions[3*t+axis]*iv[d]);
             dst[d] = x[d]*cos(angle)-x[d+64]*sin(angle);
             dst[d+64] = x[d+64]*cos(angle)+x[d]*sin(angle);
             require(isfinite(gpu[d]) && fabs(gpu[d]-dst[d]) < (sharp ? 1e-5 : 2e-6), "RMS/RoPE low-half mismatch");
@@ -136,7 +145,7 @@ static float *run(id<MTLDevice> dev, id<MTLCommandQueue> queue,
         }
     }
     for (int d = 0; d < 32; d++) require(isnan(got[(size_t)T*nh*hd+d]), "output guard overwritten");
-    printf("length %d packed=%d mode=%d: FP64 max %.3g\n", length, packed, mode, worst);
+    printf("length %d packed=%d mode=%d rope_exact=%d base=%d: FP64 max %.3g\n", length, packed, mode, rope_exact, pos_base, worst);
     float *copy = malloc((size_t)length*nh*hd*4);
     require(copy != NULL, "output allocation");
     memcpy(copy, got+(size_t)before*nh*hd, (size_t)length*nh*hd*4);
@@ -171,6 +180,18 @@ int main(int argc, char **argv) {
             run(dev, queue, prep, attn, 1, false, mode);
             run(dev, queue, prep, attn, 33, true, mode);
         }
+        // Large positions exercise the angle reduction; FP32 angles would miss the FP64 oracle there.
+        pos_base = 65000;
+        for (int mode = 0; mode < 2; mode++) for (int length = 1; length <= 129; length += 64) {
+            float *single = run(dev, queue, prep, attn, length, false, mode);
+            float *packed = run(dev, queue, prep, attn, length, true, mode);
+            require(!memcmp(single, packed, (size_t)length*8*128*4), "packing changed output bytes at large positions");
+            free(single); free(packed);
+        }
+        pos_base = 0; rope_exact = 0;
+        free(run(dev, queue, prep, attn, 33, false, 0));
+        free(run(dev, queue, prep, attn, 33, true, 1));
+        rope_exact = 1;
         float *long_single=run(dev,queue,prep,attn,8193,false,6);
         float *long_packed=run(dev,queue,prep,attn,8193,true,6);
         require(!memcmp(long_single,long_packed,(size_t)8193*8*128*4),"long packing changed bytes");

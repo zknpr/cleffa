@@ -41,6 +41,7 @@ struct clef_gpu {
     bool attn_tu;                     // attention_tu in FP16 passes; false = FP32 kernels everywhere (CLEF_ATTN_TU=0)
     bool vis_mpp;                     // CLEF_VIS_MPP=0 keeps simdgroup vision attention
     bool vis_comp;                    // CLEF_VIS_COMP=0 keeps direct FP32 vision GEMMs
+    bool omni_rope_exact;             // Omni rotary angles from FP64 frequencies; CLEF_OMNI_ROPE=f32 keeps FP32
     bool vis_group;                   // combine equal-grid GEMMs within one record
     bool vis_f32;                     // retain FP32 vision operands; non-residual GEMMs may compensate (vis_comp)
     bool debug_poison;                // CLEF_DEBUG_POISON=1 (tests): fill every activation buffer with NaN before each forward

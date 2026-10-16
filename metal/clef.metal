@@ -2042,7 +2042,25 @@ kernel void vis_bias_gelu(constant bias_act_args &a [[buffer(0)]],
 // ---------------------------------------------------------------- Omni attention
 // Plain RMS weights and ungated [q|k|v]. Rotary pairs 60..63 use temporal
 // positions: the [24,20,20] layout has only 20 complete interleaved triplets.
-struct omni_prep_args { int nh, nkv, T; float eps; };
+struct omni_prep_args { int nh, nkv, T; float eps; int rope_exact; };
+// Rotary angle pos * freq to about 1e-7 rad at any position up to 2^24. freq is the FP64
+// frequency as an FP32 hi/lo pair (host), the product is kept as a double-float (FMA residual),
+// and the reduction modulo 2*pi uses a three-part constant, so precise::cos/sin see a small,
+// accurate argument. Plain FP32 (pos * inv_freq, then cos/sin of a large angle) loses about
+// pos * 6e-8 rad, 1e-3 rad near 16k tokens: both FP32 implementations share that error, which
+// dominated their early-layer distance from the FP64 reference on long inputs.
+static inline float2 omni_rope_cs(int position, float fhi, float flo) {
+    const float p = (float)position;
+    const float ahi = p*fhi, alo = fma(p, fhi, -ahi) + p*flo;
+    const float C1 = 6.28318548202514648f, C2 = -1.74845553146951715e-7f, C3 = -6.86049804e-15f;
+    const float k = rint(ahi * 0.159154943091895336f);
+    float r = fma(-k, C1, ahi);
+    r = fma(-k, C2, r);
+    r = fma(-k, C3, r);
+    r += alo;
+    return float2(precise::cos(r), precise::sin(r));
+}
+
 kernel void omni_attn_prep(constant omni_prep_args &a [[buffer(0)]],
                            device const float *qkv [[buffer(1)]],
                            device const float *qw [[buffer(2)]],
@@ -2067,8 +2085,15 @@ kernel void omni_attn_prep(constant omni_prep_args &a [[buffer(0)]],
     for (int j = 0; j < 4; j++) x[j] = x[j]*inv*w[lane+32*j];
     for (int j = 0; j < 2; j++) {
         const int pair = lane+32*j, axis = pair < 60 ? pair%3 : 0;
-        const float angle = (float)pos[3*t+axis]*inv_freq[pair];
-        const float c = precise::cos(angle), s = precise::sin(angle), lo = x[j], hi = x[j+2];
+        float c, s;
+        if (a.rope_exact) {
+            const float2 cs = omni_rope_cs(pos[3*t+axis], inv_freq[64+pair], inv_freq[128+pair]);
+            c = cs.x; s = cs.y;
+        } else {
+            const float angle = (float)pos[3*t+axis]*inv_freq[pair];
+            c = precise::cos(angle); s = precise::sin(angle);
+        }
+        const float lo = x[j], hi = x[j+2];
         x[j] = lo*c-hi*s; x[j+2] = hi*c+lo*s;
     }
     for (int j = 0; j < 4; j++) {
