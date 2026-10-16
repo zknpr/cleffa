@@ -28,12 +28,13 @@ struct clef_gpu_prefix {
     id<MTLBuffer> kv[16];                                 // the head's memory K|V rows [cap][2W]
 };
 
-enum { P_GEMM, P_ATTN, P_SCAN, P_NORM, P_ATTNPREP, P_CONV, P_GDNOUT, P_SWIGLU, P_HEAD, P_VISION, P_N };
 // GEMM input classes, by the kernel that produces them; ACT_VIS covers every vision-tower operand
 
 // norm includes the embedding; conv_prep is ssm_conv + gdn_prep; head is the final norm and the GPU half of the head;
-// vision is the whole tower, every image
-static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "norm", "attn_prep", "conv_prep", "gdn_out", "swiglu", "head", "vision" };
+// vision is the whole tower, every image; omni_router is the router and top-8 selection, omni_experts the
+// two expert GEMMs, omni_moe the assignment, gather, SwiGLU and combine around them
+static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "norm", "attn_prep", "conv_prep", "gdn_out", "swiglu", "head", "vision",
+                                      "omni_router", "omni_experts", "omni_moe" };
 
 // Command buffers and encoders are nullable (device loss, resource exhaustion). Messages to nil
 // are no-ops and a nil buffer has no .error, so a missing one let the pass "succeed" without
@@ -64,6 +65,13 @@ static bool prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCo
         return false;
     }
     return true;
+}
+
+_Static_assert(P_N <= sizeof(((clef_gpu *)0)->prof_ms) / sizeof(double), "profile categories exceed prof_ms");
+
+bool clef_metal_prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc,
+                     int cat, char *err, size_t errlen) {
+    return prof(g, cb, enc, cat, err, errlen);
 }
 
 static double wall_ms(void) {
@@ -1291,8 +1299,7 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
 
         for (int l = 0; l < c->n_layer; l++) {
             if (c->model.backbone == CLEF_OMNI) {
-                if (!clef_omni_encode_layer(g, e, enc, l, T, n_seq, bf16_only, err, errlen)) return false;
-                if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
+                if (!clef_omni_encode_layer(g, e, &cb, &enc, l, T, n_seq, bf16_only, err, errlen)) return false;
             } else {
             const clef_layer_w *lw = &e->w.layer[l];
             norm_args na = { H, c->eps };

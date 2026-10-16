@@ -194,8 +194,12 @@ static void expert_gemm(clef_gpu *g, id<MTLComputeCommandEncoder> enc, id<MTLBuf
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 }
 
-bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLComputeCommandEncoder> enc,
-                               int layer, int T, char *err, size_t errlen) {
+// Profile boundary: books the preceding dispatches to `cat` and continues on a new encoder.
+#define OPROF(cat) do { if (!clef_metal_prof(g, cb, encp, (cat), err, errlen)) return false; enc = *encp; } while (0)
+
+bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer> __strong *cb,
+                               id<MTLComputeCommandEncoder> __strong *encp, int layer, int T, char *err, size_t errlen) {
+    id<MTLComputeCommandEncoder> enc = encp ? *encp : nil;
     if (!enc || !g->omni || layer < 0 || layer >= e->cfg.n_layer) {
         snprintf(err, errlen, "metal: invalid Omni layer dispatch");
         return false;
@@ -204,8 +208,10 @@ bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCompute
     const clef_layer_w *w = &e->w.layer[layer];
     clef_omni_gpu *s = g->omni;
     norm(g, enc, c, w->attn_norm, T);
+    OPROF(P_NORM);
     clef_metal_gemm(g, enc, X_F32, false, g->xn, 0, w->attn_qkv->offset,
                     (c->nh+2*c->nkv)*c->hd, c->H, g->P, 0, T);
+    OPROF(P_GEMM);
     omni_prep_args pa = {c->nh, c->nkv, T, c->eps};
     [enc setComputePipelineState:g->ps[@"omni_attn_prep"]];
     [enc setBytes:&pa length:sizeof(pa) atIndex:0];
@@ -219,6 +225,7 @@ bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCompute
     [enc setBuffer:g->V offset:0 atIndex:8];
     [enc setBuffer:s->status offset:0 atIndex:9];
     [enc dispatchThreadgroups:MTLSizeMake(T, c->nh+c->nkv, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    OPROF(P_ATTNPREP);
     omni_attention_args aa = {c->nh, c->nkv, c->hd, T, 1.f/sqrtf((float)c->hd)};
     [enc setComputePipelineState:g->ps[@"omni_attention"]];
     [enc setBytes:&aa length:sizeof(aa) atIndex:0];
@@ -229,14 +236,19 @@ bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCompute
     [enc setThreadgroupMemoryLength:(c->nh/c->nkv)*(8*32+64)*4 atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((T+7)/8, c->nkv, 1)
         threadsPerThreadgroup:MTLSizeMake(32*(c->nh/c->nkv), 1, 1)];
+    OPROF(P_ATTN);
     clef_metal_gemm(g, enc, X_F32, true, g->G, 0, w->attn_output->offset, c->H, c->nh*c->hd, g->x, 0, T);
+    OPROF(P_GEMM);
     norm(g, enc, c, w->ffn_norm, T);
+    OPROF(P_NORM);
     return true;
 }
 
-bool clef_omni_encode_layer(clef_gpu *g, const clef_engine *e, id<MTLComputeCommandEncoder> enc,
-                            int layer, int T, int n_seq, bool bf16_only, char *err, size_t errlen) {
-    if (!clef_omni_encode_attention(g, e, enc, layer, T, err, errlen)) return false;
+bool clef_omni_encode_layer(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer> __strong *cb,
+                            id<MTLComputeCommandEncoder> __strong *encp, int layer, int T, int n_seq, bool bf16_only,
+                            char *err, size_t errlen) {
+    if (!clef_omni_encode_attention(g, e, cb, encp, layer, T, err, errlen)) return false;
+    id<MTLComputeCommandEncoder> enc = *encp;
     const clef_config *c = &e->cfg;
     const clef_layer_w *w = &e->w.layer[layer];
     clef_omni_gpu *s = g->omni;
@@ -270,6 +282,7 @@ bool clef_omni_encode_layer(clef_gpu *g, const clef_engine *e, id<MTLComputeComm
                 [enc setBuffer:s->scores_low offset:0 atIndex:5];
                 [enc dispatchThreads:MTLSizeMake(OMNI_EXPERTS, rows, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
             }
+            OPROF(P_OMNI_ROUTER);
             // Each live assignment contributes one row; each occupied expert
             // adds at most 31 padding rows. Avoid clearing the full arena for
             // short requests or the final partial chunk.
@@ -293,19 +306,24 @@ bool clef_omni_encode_layer(clef_gpu *g, const clef_engine *e, id<MTLComputeComm
             [enc setBuffer:g->xn offset:input_offset atIndex:1]; [enc setBuffer:s->rowmap offset:0 atIndex:2];
             [enc setBuffer:s->gathered offset:0 atIndex:3];
             [enc dispatchThreads:MTLSizeMake(c->H, padded, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            OPROF(P_OMNI_MOE);
             expert_gemm(g, enc, s->gathered, w->ffn_gate_up_exps, s->gate_up, rows, padded, 2*c->ffn, c->H);
+            OPROF(P_OMNI_EXPERTS);
             [enc setComputePipelineState:g->ps[@"omni_swiglu"]];
             [enc setBytes:&ma length:sizeof(ma) atIndex:0];
             [enc setBuffer:s->gate_up offset:0 atIndex:1]; [enc setBuffer:s->activated offset:0 atIndex:2];
             [enc setBuffer:s->rowmap offset:0 atIndex:3];
             [enc dispatchThreads:MTLSizeMake(c->ffn, padded, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            OPROF(P_OMNI_MOE);
             expert_gemm(g, enc, s->activated, w->ffn_down_exps, s->down, rows, padded, c->H, c->ffn);
+            OPROF(P_OMNI_EXPERTS);
             [enc setComputePipelineState:g->ps[@"omni_combine"]];
             [enc setBytes:&ma length:sizeof(ma) atIndex:0];
             [enc setBuffer:s->down offset:0 atIndex:1]; [enc setBuffer:s->ids offset:0 atIndex:2];
             [enc setBuffer:s->weights offset:0 atIndex:3]; [enc setBuffer:s->slots offset:0 atIndex:4];
             [enc setBuffer:g->x offset:input_offset atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            OPROF(P_OMNI_MOE);
         }
     }
     return true;

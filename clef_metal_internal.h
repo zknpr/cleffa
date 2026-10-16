@@ -67,10 +67,17 @@ void clef_omni_begin(clef_gpu *g);
 bool clef_omni_trace_reserve(clef_gpu *g, int T, int layers, int rows, bool enabled, char *err, size_t errlen);
 void clef_omni_keepalive(clef_gpu *g, id<MTLComputeCommandEncoder> enc);
 bool clef_omni_complete(clef_gpu *g, char *err, size_t errlen);
-bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLComputeCommandEncoder> enc,
-                               int layer, int T, char *err, size_t errlen);
-bool clef_omni_encode_layer(clef_gpu *g, const clef_engine *e, id<MTLComputeCommandEncoder> enc,
-                            int layer, int T, int n_seq, bool bf16_only, char *err, size_t errlen);
+// CLEF_PROFILE categories. With profiling on, clef_metal_prof ends the command buffer, books its
+// GPU time to the category and starts another (*cb/*enc change); otherwise it does nothing.
+enum { P_GEMM, P_ATTN, P_SCAN, P_NORM, P_ATTNPREP, P_CONV, P_GDNOUT, P_SWIGLU, P_HEAD, P_VISION,
+       P_OMNI_ROUTER, P_OMNI_EXPERTS, P_OMNI_MOE, P_N };
+bool clef_metal_prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc,
+                     int cat, char *err, size_t errlen);
+bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer> __strong *cb,
+                               id<MTLComputeCommandEncoder> __strong *encp, int layer, int T, char *err, size_t errlen);
+bool clef_omni_encode_layer(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer> __strong *cb,
+                            id<MTLComputeCommandEncoder> __strong *encp, int layer, int T, int n_seq, bool bf16_only,
+                            char *err, size_t errlen);
 
 // Optional stage consumer is used by offline tower verification. It sees only
 // completed buffers and must report I/O/allocation errors through its return.

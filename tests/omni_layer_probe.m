@@ -94,7 +94,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         norm(g, enc, &e->cfg, e->w.layer[layer].attn_norm, T);
         if (!probe_finish(cb, enc) || !probe_save(argv[4], "input_norm", g->xn, (size_t)T*2048)) goto done;
         cb = [g->queue commandBuffer]; enc = [cb computeCommandEncoder];
-        if (!clef_omni_encode_attention(g, e, enc, layer, T, err, sizeof(err))) goto done;
+        if (!clef_omni_encode_attention(g, e, &cb, &enc, layer, T, err, sizeof(err))) goto done;
         if (!probe_finish(cb, enc) || !clef_omni_complete(g, err, sizeof(err))) goto done;
     }
     ok = probe_save(argv[4], "qkv", g->P, (size_t)T*5120) &&
@@ -116,7 +116,7 @@ int main(int argc, char **argv) { @autoreleasepool {
         clef_omni_begin(g);
         id<MTLCommandBuffer> cb = [g->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        if (!clef_omni_encode_layer(g, e, enc, layer, T, 1, false, err, sizeof(err)) ||
+        if (!clef_omni_encode_layer(g, e, &cb, &enc, layer, T, 1, false, err, sizeof(err)) ||
             !probe_finish(cb, enc) || !clef_omni_complete(g, err, sizeof(err))) goto done;
         clef_omni_gpu *s = g->omni;
         const int32_t *slots = (const int32_t *)s->slots.contents+local*OMNI_TOP;
