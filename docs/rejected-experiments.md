@@ -1045,9 +1045,9 @@ results. The numerical inputs are synthetic; only article lengths were used.
 
 ### Interval-decay reuse in chunk preparation, 2026-10-15
 
-Status: the candidate passed its isolated kernel screen, but its whole-engine screen stopped
-before any candidate inference, so it is not adopted. Production `gdn_chunk_prep` in
-`metal/clef.metal` still evaluates `gdn_interval_decay` for each element.
+Status: adopted 2026-10-17 after a whole-engine requalification
+([performance history](performance-history.md#interval-decay-reuse-2026-10-17)). The record
+below is the 2026-10-15 attempt, which stopped before any candidate inference.
 
 The candidate caches the inclusive interval-decay triangle once per full 32-token block in
 `gdn_chunk_prep`; KE, U and A reuse those identical values. The table lives in the existing

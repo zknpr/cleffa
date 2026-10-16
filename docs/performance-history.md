@@ -444,6 +444,26 @@ These HTTP measurements are a fresh absolute snapshot, not an A/B speedup calcul
 against older runs under different thermal conditions. They use synthetic filler, not the
 unavailable external chart payloads.
 
+### Interval-decay reuse, 2026-10-17
+
+`gdn_chunk_prep` evaluated the same interval decays three times per full 32-token block (for KE,
+U and A). It now evaluates the triangle once into the ragged-tail scratch, which full blocks never
+otherwise use, and reads it back; partial blocks keep the direct expressions. The values are the
+same function calls with the same arguments, so outputs are bitwise unchanged.
+The kernel screen ([rejected experiments](rejected-experiments.md#interval-decay-reuse-in-chunk-preparation-2026-10-15))
+measured 17–32% faster preparation in isolation.
+
+Whole-engine checks on the 27B (the only model on the chunked path): `make test-gdn`; logits for
+all 22 core-corpus records byte-identical to the previous build with FP16 and with BF16
+activations; `tests/test_batch.sh` and `tests/test_poison.sh` pass. Under `CLEF_PROFILE=1` on
+`r021` (16,347 tokens), three ABBA quartets put the DeltaNet stage (`gdn_scan`, which includes
+preparation) at a median 1,101.8 ms against 1,169.7 ms, with every quartet favoring the
+candidate (ratios 0.949, 0.964, 0.991). That is about 0.3% of the request, which full-request
+ABBA timing on a heat-soaked GPU cannot resolve: five quartets gave median ratios 1.0037 at
+8,072 tokens and 1.0019 at 16,347, with quartets spanning 0.96–1.13. Flash and Omni do not run
+this kernel. Prefix-cache resumes use the same preparation kernel and were not rerun.
+Evidence: `golden/dense-gdn-decay-reuse-20261015/requalification-20261017/`.
+
 ## CPU head: packed weights, scorer batching and two workers, 2026-10-04
 
 The CPU decision head prepares padded, transposed copies of its multi-row projection weights

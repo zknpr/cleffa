@@ -1282,6 +1282,15 @@ kernel void gdn_chunk_prep(constant gdn_args &a [[buffer(0)]],
         E[block * B + tid] = exp(sum);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // For the sole B=32 instantiation, full blocks never use the ragged operand
+    // scratch. The post-Gram barrier publishes this inclusive decay triangle.
+    static_assert(B * B <= 8 * 128, "decay triangle must fit the ragged operand scratch");
+    if (valid == B) {
+        for (int i = tid; i < B * B; i += 128) {
+            const int r = i / B, c = i % B;
+            if (c <= r) tail[i] = gdn_interval_decay(log_gate, c + 1, r + 1);
+        }
+    }
     auto xt = tensor<device float, dextents<int, 2>, tensor_inline>(X + (long)t0 * a.C, dextents<int, 2>(a.C, valid));
     auto kv = xt.slice<128, dynamic_extent>(a.Hk * 128 + kh * 128, 0);
     auto qv = xt.slice<128, dynamic_extent>(kh * 128, 0);
@@ -1315,7 +1324,7 @@ kernel void gdn_chunk_prep(constant gdn_args &a [[buffer(0)]],
     for (int i = tid; i < B * 128; i += 128) {
         int r = i / 128, c = i % 128;
         float k = r < valid ? X[(long)(t0 + r) * a.C + a.Hk * 128 + kh * 128 + c] : 0.0f;
-        KE[block * B * 128 + i] = k * gdn_interval_decay(log_gate, r + 1, B);
+        KE[block * B * 128 + i] = k * (valid == B ? tail[(B - 1) * B + r] : gdn_interval_decay(log_gate, r + 1, B));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
     auto wv = tensor<device float, extents<int, 128, B>, tensor_inline>(W + block * B * 128, extents<int, 128, B>());
@@ -1332,7 +1341,7 @@ kernel void gdn_chunk_prep(constant gdn_args &a [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = tid; i < B * B; i += 128) {
         int r = i / B, c = i % B;
-        inverse[i] = c <= r ? A[block * B * B + i] * betas[c] * gdn_interval_decay(log_gate, c + 1, r + 1) : 0.0f;
+        inverse[i] = c <= r ? A[block * B * B + i] * betas[c] * (valid == B ? tail[r * B + c] : gdn_interval_decay(log_gate, c + 1, r + 1)) : 0.0f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (valid < 8) {
@@ -1348,7 +1357,7 @@ kernel void gdn_chunk_prep(constant gdn_args &a [[buffer(0)]],
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int i = tid; i < B * B; i += 128) {
         int r = i / B, c = i % B;
-        A[block * B * B + i] = r < valid && c <= r ? inverse[i] * gdn_interval_decay(log_gate, c + 1, r + 1) : 0.0f;
+        A[block * B * B + i] = r < valid && c <= r ? inverse[i] * (valid == B ? tail[r * B + c] : gdn_interval_decay(log_gate, c + 1, r + 1)) : 0.0f;
     }
 }
 #define DELTA_PREP(B) template [[host_name("gdn_chunk_prep_" #B)]] kernel void gdn_chunk_prep<B>(constant gdn_args &, device float *, device const float *, device const float *, device float *, device float *, device float *, device float *, device float *, constant int &, uint2, uint);

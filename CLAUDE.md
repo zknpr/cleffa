@@ -530,6 +530,8 @@ split only. See `docs/performance-history.md` for timing and qualification limit
   records are batched. Scratch is sized to the longest selected record, allocated atomically,
   poisoned by the existing debug hook, and reused only across serial dispatches. Sum each decay
   interval directly: subtracting large prefix sums loses small later decays and can yield NaN.
+  Full blocks evaluate that interval-decay triangle once into the ragged-tail scratch and
+  reuse it for KE, U and A; the values, and so the logits, are bitwise unchanged.
   `make test-gdn` checks both value tiles, all 32 row offsets/tails, float64, strong/overflowing
   decays, output guards and allocation-failure recovery. Arithmetic differs from the old scan;
   assess final logits against FP32, then require exact standalone/packed and poison invariance.
