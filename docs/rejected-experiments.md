@@ -1525,6 +1525,19 @@ gaps. Ratios are candidate/parent; "paired" values are the two ABBA pairs.
 | Native expert tiles compacted to skip empty and tiny-expert tiles | Operator exact | Dense pooled device ratios 1.028551–1.125057 | Rejected at the operator screen | `omni-native-expert-compact-20261016/` |
 | Native 32×256 expert tile | Operator exact | Up-dense128 1.090327; down 1.433477 and 1.522702 | Rejected at the operator screen | `omni-native-expert-wide256-20261016/` |
 
+### Default-path speed candidates
+
+**Compensated FP16 expert operands, 2026-10-17.** FP32-operand tensor-op GEMMs run at about a
+quarter of the FP16 rate, so the expert gather and SwiGLU wrote each operand as FP16 high and
+residual (scaled by 2048) planes in the existing scratch, and the expert GEMM ran two
+FP32-accumulating products against the same BF16 weights, with per-record overflow flags and an
+FP32 rerun. Logits moved by at most 4.5e-6 on `r003`. Expert time rose from 164.4 to 245.1 ms at
+298 tokens (wall 245 → 335 ms), 218.7 → 290.1 ms at 586 and 736.3 → 822.9 ms at 2,231; it fell
+only at 8,069 (2,437.8 → 2,385.1 ms) and 16,344 (5,127.8 → 4,756.5 ms). At short lengths the
+expert GEMMs are bound by streaming each expert's weights once per chunk, and the second product
+reads them again. Rejected and removed; the profile is in
+[performance history](performance-history.md#omni-category-profile-2026-10-17).
+
 ### Timing method and attribution diagnostics
 
 - **Identical-binary control** (2026-10-15). The same build under both labels on the 2,231-token

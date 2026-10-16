@@ -11,7 +11,7 @@ It returns typed decisions (the Jev/SystemOne request and response format) from 
 on Apple Silicon. BF16 weights, never quantized.
 
 Clef and Clef-Flash take text, images and video. Clef-Omni adds audio and video soundtracks; it
-passes its accuracy check up to 8,069 tokens, while longer inputs and its speed are still being
+passes its accuracy check up to 16,344 tokens, while longer inputs and its speed are still being
 worked on ([status](docs/omni.md)).
 
 cleffa is built after [ds4](https://github.com/antirez/ds4) by antirez and the ds4.c authors, and
@@ -133,7 +133,7 @@ synthetic video corpus 16/16 (0.0002 and 0.0007). Tokenizer, JSON, request encod
 text and image/video preprocessing match Python byte for byte. Clef-Omni is accepted differently: its
 near-tied expert routing makes fixed FP32 gates unattainable for any FP32 implementation, so it is
 checked against an FP64 reference, allowing each question the FP32 reference's own error. It
-passes on all 42 requests up to 8,069 tokens with a reference, every decision equal to FP64
+passes on all 43 requests with a reference, up to 16,344 tokens, every decision equal to FP64
 ([status](docs/omni.md)). Methodology, precision choices and the
 PyTorch reference defects found along the way are in [docs/accuracy.md](docs/accuracy.md).
 
@@ -231,8 +231,8 @@ list are in [docs/security.md](docs/security.md).
 
 ## Not done yet
 
-- Clef-Omni accuracy references beyond 8,069 tokens (16k is in progress, 64k has none)
-  ([docs/omni.md](docs/omni.md)).
+- Clef-Omni accuracy references beyond 16,344 tokens (64k has none), and its long-context speed:
+  27.6 s at 16,344 tokens, mostly attention ([docs/omni.md](docs/omni.md)).
 - WebP ([docs/vision.md](docs/vision.md)).
 - Live or unknown-length clips, and video codecs beyond H.264, HEVC, ProRes and MJPEG
   ([docs/video.md](docs/video.md)).

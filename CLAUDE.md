@@ -14,8 +14,10 @@ pieces fit, the parity contract, and the traps.
 
 Clef-Omni is implemented under a separate `clef.backbone` discriminator; consult `docs/omni.md`
 before making support or parity claims. The working default passes the FP64-bounded acceptance
-check (below) on every request with an FP64 reference, up to 8,069 tokens; longer contexts are
-uncovered. It fails fixed FP32 gates through near-tied expert routing; FP32-compatible builds that
+check (below) on every request with an FP64 reference, up to 16,344 tokens; longer contexts are
+uncovered. Its rotary angles are computed exactly (`omni_rope_cs`, FP64 frequencies as FP32
+hi/lo pairs); `CLEF_OMNI_ROPE=f32` restores Hugging Face's FP32 angles, which were the dominant
+shared error of both FP32 implementations at long positions. It fails fixed FP32 gates through near-tied expert routing; FP32-compatible builds that
 pass them by reproducing PyTorch MPS arithmetic, at 1.13-2.08x the latency, live on the unmerged
 branches `omni-fp32-compatible-20261014` and `omni-fp32-fused-20261016` and are not needed.
 `clef_model.c` validates exact metadata, `clef_metal_omni.m` owns the full-attention/MoE
@@ -596,7 +598,7 @@ zero-initialized, the server sets it only with `--allow-encoded-video`, the CLI 
 bitwise),
 `CLEF_DEBUG_F16_LIMIT` (lower the FP16 overflow limit to exercise the rerun),
 `CLEF_PROFILE=1` (GPU ms for gemm, attention, gdn_scan, norm, attn_prep, conv_prep, gdn_out,
-swiglu, head and vision, with the tower's GEMMs and attention counted under gemm and attention;
+swiglu, head, vision and, for Omni, omni_router, omni_experts and omni_moe, with the tower's GEMMs and attention counted under gemm and attention;
 serializes the GPU, so not for latency),
 `CLEF_STAGE_TIME=1` (host encode, commit-to-completion wait, GPU execution and CPU head time),
 `CLEF_ATTN_TU=0` (tiled FP32 attention control; compensated tensor-unit attention defaults on),

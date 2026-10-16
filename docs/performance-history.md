@@ -1537,6 +1537,32 @@ Metal source include from authored source. Evidence:
 `golden/decision-index-suite/omni-performance/summary.json`, with the final timing samples in
 `final/chunk-benchmark.json` and the complete comparison in `validation.json`.
 
+## Omni category profile, 2026-10-17
+
+`CLEF_PROFILE=1` now splits the Omni decoder into dense GEMMs (QKV and output), attention, its
+preparation, norms, the router with top-8 selection, the two expert GEMMs and the remaining MoE
+work. Profiled categories serialize the GPU, so they overstate wall time; the second of two runs
+per request in one process, engine `64ea114`'s FP32 arithmetic (profiled before exact rotary,
+which leaves timing unchanged):
+
+| Tokens | Expert GEMMs | Attention | Dense GEMMs | Router | Other MoE | Warm wall time |
+|---:|---:|---:|---:|---:|---:|---:|
+| 298 (`r003`) | 164.4 ms | 9.7 ms | 48.3 ms | 12.6 ms | 10.4 ms | 245.4 ms |
+| 586 (`r018`) | 218.7 ms | 28.7 ms | 76.0 ms | 23.0 ms | 16.7 ms | 376.7 ms |
+| 2,231 (`r019`) | 736.3 ms | 320.2 ms | 264.2 ms | 86.6 ms | 61.5 ms | 1,504.3 ms |
+| 8,069 (`r020`) | 2,437.8 ms | 4,241.0 ms | 984.7 ms | 331.3 ms | 221.3 ms | 8,940.4 ms |
+| 16,344 (`r021`) | 5,127.8 ms | 18,339.5 ms | 2,057.2 ms | 687.2 ms | 445.1 ms | 27,608.9 ms |
+| 398 (`ov000`, image) | 184.1 ms | 16.5 ms | 73.4 ms | 15.7 ms | 12.5 ms | 314.3 ms |
+| 239 (`oa000`, audio) | 149.2 ms | 7.0 ms | 36.7 ms | 9.7 ms | 8.7 ms | 242.8 ms |
+
+Wall times are medians of the last three of four warm calls on the merged `64ea114` binary,
+with `--time`, on an otherwise idle machine. Expert GEMMs dominate up to about 2k tokens and
+attention beyond. At 298 tokens the expert GEMMs stream about 58 GB of BF16 weights (all 128
+experts of 48 layers are touched), about 354 GB/s; their floor is the memory bandwidth, not the
+FP32 operand rate (see [rejected experiments](rejected-experiments.md#default-path-speed-candidates)).
+Attention grows quadratically: about 382 ms per layer at 16,344 tokens, against 262–294 ms for
+the dense FP32 attention kernels on the same 4,096 head-dimensions.
+
 ## Dense head memory, 2026-10-14
 
 Flash and 27B keep fewer CPU head weights and reuse two completed decoder buffers on the GPU

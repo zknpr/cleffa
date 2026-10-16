@@ -14,10 +14,10 @@ resource-limit checks. Since 2026-10-16 Omni's numerical acceptance is **FP64-bo
 the independent FP64 reference, each question's error must be within the larger of the fixed
 limits and the FP32 PyTorch reference's own error ([policy](#numerical-verification-policy)).
 The working default (the current tree) **passes** it on every request that has an FP64
-reference: 42 requests, 91 questions, all decisions equal to FP64 ([results](#against-fp64)).
-Against the fixed limits alone it exceeds them on 8 of those questions, the FP32 reference on 17.
-Coverage stops at 8,069 tokens: the 16,344-token `r021` reference is being generated, and nothing
-near the 64,000-token default context has a reference ([not done](#not-done)).
+reference: 43 requests up to 16,344 tokens, 93 questions, all decisions equal to FP64
+([results](#against-fp64)). Against the fixed limits alone it exceeds them on 6 of those
+questions, the FP32 reference on 18. Nothing near the 64,000-token default context has a
+reference ([not done](#not-done)).
 
 Under the earlier FP32-only gates, which no longer qualify Omni, the default reproduces all 43
 token sequences and 93 decisions of the short corpora but fails 207 of 2,150 residual checks and
@@ -151,8 +151,11 @@ activation path is disabled for Omni), so the FP16-overflow rerun does not apply
 - RMSNorm, then the fused QKV GEMM on FP32 activations against BF16 weights.
 - `omni_attn_prep`: Q/K RMS normalization and interleaved M-RoPE. Rotary pair `i` uses position
   axis `i % 3` for `i < 60`; pairs 60–63 use the temporal axis, because the `[24, 20, 20]` layout
-  has only 20 complete triplets. Text cannot expose this; `make test-omni-attention` checks it
-  against an FP64 RMS/RoPE oracle that includes the four temporal-only pairs.
+  has only 20 complete triplets. Angles use the FP64 frequency (stored as an FP32 hi/lo pair), a
+  double-float product and an exact reduction modulo 2π, accurate to about 1e-7 rad at any
+  position; Hugging Face's FP32 `pos * inv_freq` loses about `pos * 6e-8` rad, 1e-3 rad at 16k.
+  `CLEF_OMNI_ROPE=f32` restores the FP32 angles. `make test-omni-attention` checks both modes
+  against FP64 RMS/RoPE oracles, including positions near 65,000 and the four temporal-only pairs.
 - `omni_attention`: tiled FP32 attention (8 queries × 32 keys) with two-float compensated
   accumulators and record-aligned key blocks, then the output projection into the residual.
 - Router: `omni_router` keeps each of the 128 logits as a high/low FP32 pair, compensating
@@ -306,26 +309,36 @@ requests after model load.
 
 ### Against FP64
 
-Acceptance run of 2026-10-16 on the working default (engine commit `32b5ef8`), with
+Acceptance run of 2026-10-17 on the working default (engine commit `64ea114`), with
 `tests/test_parity.py --bound-by` per FP64 reference and the matching FP32 blocked-attention
 reference as the bound. Maxima are the script's four-decimal summaries. Evidence:
-`golden/omni-fp64-bounded-20261016/`.
+`golden/omni-fp64-bounded-20261016/` (`rope/` for this run).
 
 | FP64 reference | Requests / questions | Max logit / probability error vs FP64 | Beyond fixed limits: native / FP32 reference | FP64-bounded |
 |---|---:|---:|---:|---|
-| Text up to 1,024 tokens | 19 / 40 | 0.0082 / 0.0004 | 0 / 3 | Pass |
-| `r019`, 2,231 tokens | 1 / 2 | 0.0146 / 0.0037 | 1 / 1 | Pass |
-| `r020`, 8,069 tokens | 1 / 2 | 0.0345 / 0.0038 | 1 / 1 | Pass |
-| Images | 5 / 15 | 0.1291 / 0.0019 | 1 / 1 | Pass |
+| Text up to 1,024 tokens | 19 / 40 | 0.0081 / 0.0004 | 0 / 3 | Pass |
+| `r019`, 2,231 tokens | 1 / 2 | 0.0436 / 0.0019 | 0 / 1 | Pass |
+| `r020`, 8,069 tokens | 1 / 2 | 0.0096 / 0.0008 | 0 / 1 | Pass |
+| `r021`, 16,344 tokens | 1 / 2 | 0.0417 / 0.0025 | 1 / 1 | Pass |
+| Images | 5 / 15 | 0.0061 / 0.0004 | 0 / 1 | Pass |
 | Video | 5 / 10 | 0.0430 / 0.0061 | 3 / 4 | Pass |
-| Audio | 6 / 12 | below 0.0001 / below 0.0001 | 0 / 1 | Pass |
+| Audio | 6 / 12 | 0.0084 / 0.0002 | 0 / 1 | Pass |
 | Audio/video | 5 / 10 | 0.0868 / 0.0065 | 2 / 6 | Pass |
-| All | 42 / 91 | | 8 / 17 | Pass |
+| All | 43 / 93 | | 6 / 18 | Pass |
 
-Every decision equals FP64's. The eight native questions beyond the fixed limits are
-`r019/service`, `r020/service`, `ov001/brightness`, `ot002/moving`, `ot003/moving`,
-`ot003/direction`, `oav000/sound` and `oav000/audible`; on each, the FP32 reference's error on the
-exceeded measure is at least as large.
+Every decision equals FP64's. The six native questions beyond the fixed limits are
+`r021/service`, `ot002/moving`, `ot003/moving`, `ot003/direction`, `oav000/sound` and
+`oav000/audible`; on each, the FP32 reference's error on the exceeded measure is at least as
+large.
+
+Exact rotary angles made the difference at long positions. With Hugging Face's FP32 angles, the
+2026-10-16 run on engine `32b5ef8` passed the 42 requests up to 8,069 tokens (8 questions beyond
+the fixed limits) but failed both `r021` questions (`r021/service` logit error 0.139 against the
+FP32 reference's 0.120). There, native and the FP32 reference drifted from FP64 identically
+through layer 9 (4.858e-4 relative L2 at layer 3), the signature of a shared FP32 artifact; exact
+angles cut native's layer-3 distance to 3.716e-6 and layer 11's from 2.096e-3 to 6.040e-5, and
+`r019`, `r020` and `ov001` also moved inside the fixed limits. Later layers still drift through
+near-tied routing (`r021` final norm 0.0989 against the FP32 reference's 0.110).
 
 ### Working default against FP32 (diagnostic)
 
@@ -561,9 +574,8 @@ accuracy estimate, and no faulty native operation was isolated. Evidence:
 
 ## Not done
 
-- **Long context.** Acceptance covers inputs up to 8,069 tokens. The FP64 reference for `r021`
-  (16,344 tokens) is being generated; nothing near the 64,000-token default context has an FP64
-  or FP32 reference (the 64k FP32 run was stopped after layer 14). Long text references keep only
+- **Long context.** Acceptance covers inputs up to 16,344 tokens; nothing near the 64,000-token
+  default context has an FP64 or FP32 reference (the 64k FP32 run was stopped after layer 14). Long text references keep only
   their last 512 rows, so earlier rows of the four long records are not compared.
 - **FP32-compatible branches.** Unmerged and no longer needed for acceptance. Merging one would
   also mean accepting C++ PocketFFT and SLEEF-derived code, absent from `THIRD_PARTY_NOTICES.md`.

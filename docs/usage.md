@@ -291,4 +291,5 @@ default uses compensated tensor-unit attention with FP32 accumulation. The visio
 FP32 residual GEMMs and compensates non-residual projections; `CLEF_VIS_COMP=0` restores direct
 FP32 products throughout. `CLEF_VIS_F32=0` selects plain 16-bit vision operands ([accuracy](accuracy.md#images)).
 `CLEF_VIS_GROUP=0` gives every image or video frame pair its own tower dispatches instead of
-sharing projections within a record.
+sharing projections within a record. For Omni, `CLEF_OMNI_ROPE=f32` computes rotary angles in FP32 as
+Hugging Face does instead of exactly ([omni.md](omni.md#decoder-and-experts)).
