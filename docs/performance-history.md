@@ -50,6 +50,44 @@ Requirements the work was held to, with the evidence and its limits:
 | Evaluate both article workflows | Both the seven-field rewrite and three-field warning path were tested on 66 existing operator labels with unchanged article state. | Neither passed the frozen no-regression criterion; neither was adopted. |
 | Avoid paid testing | This audit uses saved hosted responses and makes zero API calls. | The hosted evidence describes its capture date, not a current deployment guarantee. |
 
+## PyTorch comparison at the baseline, 2026-10-03
+
+Measured on 2026-10-03 with the `db38cfc` baseline build and BF16 activations, as the median
+of three warm back-to-back passes per side in the same sitting. The engine column predates
+every optimization in this history; the comparison is kept because it is the only like-for-like
+PyTorch measurement.
+
+### clef-flash, single request
+
+| tokens | engine | PyTorch MPS (BF16) | Jev (Cloudflare README) |
+|---|---|---|---|
+| 146 | 73 ms | 143 ms | |
+| ~300 | 99–119 ms | 191–200 ms | |
+| 594 | 215 ms | 359 ms | |
+| 2,235 | 0.86 s | 1.30 s | |
+| 8,072 | 4.1 s | 7.0 s | |
+| 16,347 | 12.6 s | 19.1 s | |
+| **median (corpus)** | **116 ms** | 199 ms | 524 ms |
+
+### Clef 27B, single request
+
+| tokens | engine | PyTorch MPS (BF16) |
+|---|---|---|
+| 146 | 229 ms | 362 ms |
+| 260 | 362 ms | 585 ms |
+| 594 | 829 ms | 1.10 s |
+| 2,235 | 3.16 s | 4.17 s |
+| 8,072 | 15.1 s | 19.0 s |
+| 16,347 | 41.3 s | 51.8 s |
+| **median (corpus)** | **389 ms** | 579 ms |
+
+The Jev figure is Cloudflare's published median for its own corpus and hardware, so it is a
+target, not a like-for-like comparison. On the 27B the engine was 1.3–1.6× faster than
+PyTorch up to ~360 tokens and 1.25–1.3× faster from 594 tokens up. FP16 activations, the
+default since, measured the same as BF16 within noise: `bench/mixed_bench.m` runs FP16 at
+the BF16 rate, and a 260-token 27B request measured 308 ms in FP16 against 311 ms in BF16 as
+best times from alternating runs.
+
 ## Attention kernel unrolling, 2026-10-03
 
 Unrolling the three loops that access the `attention_fa` accumulator makes each fragment
@@ -451,7 +489,10 @@ Large CPU head projections and attention calls now use two workers. On paired me
 from 346 to 16,347 input tokens, head time falls by 28–39%, saving roughly 2–18 ms. The
 backbone dominates complete-request time: Flash improves modestly in these samples; a
 whole-request 27B improvement is not established. See the [head measurements and
-checks](#cpu-head-packed-weights-scorer-batching-and-two-workers-2026-10-04).
+checks](#cpu-head-packed-weights-scorer-batching-and-two-workers-2026-10-04). Omni keeps this
+policy; Flash and 27B later moved to four projection workers and up to eight attention workers
+(see [attention workers](#dense-cpu-attention-workers-2026-10-14) and
+[projection workers](#dense-cpu-projection-workers-2026-10-14)).
 
 ### Host processing and residual-scorer batching
 
@@ -564,8 +605,9 @@ are recorded in `production-validation.json`.
 ### Two workers
 
 The CPU head now splits large linear projections across two workers by output columns, and
-splits larger attention calls by independent heads. It processes every input token, keeps
-FP32 arithmetic, and leaves the GPU backbone unchanged.
+splits larger attention calls by independent heads (Omni's current policy; Flash and 27B later
+widened both splits, see [Dense CPU attention workers](#dense-cpu-attention-workers-2026-10-14)).
+It processes every input token, keeps FP32 arithmetic, and leaves the GPU backbone unchanged.
 
 This is a small part of complete-request latency. It does not resolve the backbone's context
 scaling or establish Cloudflare-equivalent full-input latency.
@@ -1006,6 +1048,14 @@ not ruled out. Full evidence: [prefix cache](prefix-cache.md).
 
 ## Profiles and GPU activity
 
+GEMMs dominate at every length. Serialized profiles (`CLEF_PROFILE=1`, which changes
+scheduling and is not a latency measurement) put them at about 84% of GPU time for a
+1,382-token 27B request, 70% for a 13,876-token Flash request (attention 18%, recurrent scan
+6%), and 87.5% for a batch of eight ~1.3K-token 27B records. On the FP32 attention path,
+attention's share grows from 4–8% near 1–2K tokens to 28–32% near 16K. Instruments counters
+show 97–98% median neural-accelerator utilization on the large expansion GEMM, and a
+full-request trace finds less than 0.8% scheduling gaps inside the GPU span.
+
 ### Component time by context length
 
 The production CLI before CPU head parallelization was profiled on both models at 1,382,
@@ -1261,3 +1311,456 @@ Application-level alternatives for this workload (a shorter rubric, a warning-on
 cached warning-then-confirm cascade, and placing the schema before the state) were all
 tested and rejected on quality; see
 [rejected experiments](rejected-experiments.md#workload-level-changes).
+
+## Stock PyTorch controls, 2026-10-10
+
+The stock control loads the pinned snapshot through its own `load_release_model` with
+`device="mps"` and `dtype=torch.bfloat16`, on PyTorch 2.11.0 and Transformers 5.10.2. It keeps
+Transformers defaults: no attention patch, staged or paged loader, expert override or allocator
+cap. `bench/omni_pytorch_latency.py --stock` records those flags, the implementations actually
+selected and the hardware. A memory supervisor kept a 32 GiB system reserve and a 96 GiB
+process-tree ceiling on the 128 GiB machine.
+
+The 2026-10-11 attention audit found incorrect output from this PyTorch version's implicit
+FP16/BF16 MPS SDPA path (see the [corrected
+comparison](hosted-comparison.md#corrected-bf16-comparison-2026-10-11)). The stock timings below
+measure that affected implementation; they are not a baseline for correctly masked BF16.
+
+| Model | Stock result | Sampled process-tree peak | Lowest available system memory |
+|---|---|---:|---:|
+| Flash | 38 text/image requests completed; all 8 encoded-video requests failed in the stock processor | 77.69 GiB across successful continuations | 40.17 GiB |
+| Clef 27B | Guard stopped loading before inference | 48.78 GiB | 31.90 GiB |
+| Omni | Guard stopped loading before inference | 49.07 GiB | 31.71 GiB |
+
+Both loading failures crossed the system reserve, not the 96 GiB ceiling. They are supervisor
+stops, not OS out-of-memory kills or estimates of the loader's requirement, so stock 27B and
+Omni latency and correctness are unmeasured under this constraint. The stock Flash video
+processor calls `torchvision.io.read_video`, which the installed torchvision no longer provides
+(`AttributeError`). That failure concerns the encoded-clip route needed for identical HTTP
+bodies, not the vision tower: an earlier stock control on frame arrays, the model card's
+documented form, completed `vd000` (276 tokens) in 726 ms on its first call and 225 ms as the
+warm median of three. Its body differs from the final encoded-MOV request, so it is not paired
+with the HTTP arm.
+
+| Stock Flash fixture | Input tokens | First call | Warm median of 3 |
+|---|---:|---:|---:|
+| Text `r000` | 300 | 249 ms | 184 ms |
+| Image `v000`, canonical data URI | 309 | 703 ms | 248 ms |
+| Text `r020` | 8,072 | 5,248 ms | Not measured |
+| Text `r021` | 16,347 | 14,659 ms | Not measured |
+
+Times include JSON parsing, stock processing, inference and typed-response serialization in
+process, excluding model loading. A first call is cold for that fixture, not necessarily the
+first after loading. Runs are sequential, not interleaved. Flash runs stock SDPA with eager
+experts, the dense snapshot's default. The earlier 9–17x Omni ratios were measured against a
+custom resident/eager BF16 implementation, not stock PyTorch.
+
+Evidence is in `golden/evaluation-standard-2026-10-10/`: `stock-flash.json`,
+`stock-flash-rest-v2.json`, `stock-flash-wire-media.json`, `stock-clef.json`, `stock-omni.json`
+and their memory reports. The first Flash capture stopped on an adapter issue before its last
+five fixtures; continuations ran the same stock model, and only records whose payload matches
+`wire-plan.json` enter the control.
+
+### Current native and hosted timings
+
+All arms use the final, identical HTTP bodies. Native values include localhost HTTP, encoding,
+media decoding, inference and response formatting; stock includes the analogous work in process;
+hosted includes network time. Native and stock warm values are medians of three calls. Hosted
+has only two observations, shown individually rather than as a latency estimate. Runs are
+sequential and exclude model loading; a fixture's first call can include page faults and runtime
+initialization.
+
+| Model / fixture | Tokens | Native first / warm, ms | Hosted H1 / H2, ms | Stock BF16 warm, ms |
+|---|---:|---:|---:|---:|
+| Flash text `r000` | 300 | 102 / 102 | 1,881 / 501 | 184 |
+| Flash image `v000` | 309 | 1,502 / 125 | 530 / 384 | 248 |
+| Flash encoded video `vd000` | 276 | 234 / 232 | Rejected | Processor error |
+| 27B text `r000` | 300 | 348 / 347 | 237 / 169 | Load guard |
+| 27B image `v000` | 309 | 740 / 333 | 332 / 542 | Load guard |
+| 27B encoded video `vd000` | 276 | 456 / 450 | Rejected | Load guard |
+| Omni text `r000` | 295 | 373 / 374 | 133 / 194 | Load guard |
+| Omni image `ov000` | 398 | 459 / 459 | 238 / 172 | Load guard |
+| Omni audio `oa000` | 239 | 5,948 / 272 | 194 / 159 | Load guard |
+| Omni encoded video `ot000` | 372 | 608 / 601 | 255 / 825 | Load guard |
+| Omni encoded audio/video `oav000` | 675 | 1,011 / 1,002 | 458 / 294 | Load guard |
+
+Native Flash is faster than the stock BF16 control on the text and image fixtures. Hosted is
+faster than native Omni on both observations of text, images, short audio and audio/video; the
+video observations straddle the native median. This does not support a general claim that local
+Omni is faster than hosted. The audio fixture here is `oa000`, shorter than the `oa005` of the
+historical custom-loader benchmark.
+
+Single native long-text calls took 2,623/6,152 ms for Flash at 8,072/16,347 tokens,
+10,073/23,362 ms for 27B at those lengths and 11,049/32,561 ms for Omni at 8,069/16,344 tokens;
+stock Flash took 5,248/14,659 ms. Each is one observation, not a warm median.
+`core-timings.json` in the evaluation directory binds the timing sources to the exact bodies.
+
+### Paired labeled Flash workloads
+
+Native strict HTTP and stock BF16 answered the same 838 labeled requests, with identical body
+bytes and token counts. Each request was measured once, so the table gives medians across
+distinct requests, not a warm-repeat benchmark. The arms ran sequentially; hosted times are not
+included.
+
+| Dataset | Requests | Native median, ms | Stock BF16 median, ms | Ratio B/C |
+|---|---:|---:|---:|---:|
+| BANKING77 | 385 | 579 | 1,035 | 1.79x |
+| CLINC150+OOS | 453 | 1,065 | 1,945 | 1.83x |
+
+Three warm repeats of the first BANKING77 request give native 529 ms and stock 982 ms, with no
+response changes. Stock reached a sampled process-tree peak of 79.54 GiB. On accuracy, the
+affected stock path answers 276/453 CLINC requests correctly against native's 247/453; the
+corrected eager BF16 control answers 250/453, with no significant paired difference (see the
+[labeled evaluation](hosted-comparison.md#labeled-evaluation-coverage-2026-10-10)). Evidence is
+in `golden/evaluation-standard-2026-10-10/labeled/`: `native-flash.json`, `stock-flash.json`,
+their exports and scores, and `timings.json`.
+
+The later full 5,500-request CLINC150+OOS run (released engine and affected stock BF16, in 11
+chunks) and the corrected eager BF16 captures (385 BANKING77 and 453 CLINC requests, 403.33 and
+882.52 seconds) were timed only as totals that include model loading, so they give no
+per-request latency. Sampled process-tree peaks were 66.62 GiB for stock on the full CLINC run
+and 26.58/33.95 GiB for the eager captures. Their accuracy is in the hosted comparison.
+
+## Omni parallel expert assignment, 2026-10-13
+
+Expert assignment counts routes in parallel, computes padded bucket offsets, then scatters
+assignments with an ordered integer scan, one SIMD group per expert. The original token/top-eight
+order within each bucket, 32-row padding, row map and slot indices are unchanged. This replaces
+the serial single-thread assignment without changing any floating-point kernel or adding buffers;
+the fixed expert arena remains 298.02 MiB.
+
+On a captured 430-token layer, assignment falls from about 0.548 ms to 0.063 ms; that isolated
+result is not a request-speed estimate. Initial timings in separate resident processes were mixed,
+with 3–5% improvements on five fixtures and no clear gain on three. The final benchmark therefore
+alternates the serial and parallel paths in one process with one loaded model, using the adopted
+dispatch and kernels and adding the old serial path only to the private benchmark. It checks every
+raw logit against the previous result. Each fixture has four warmups followed by four ABBA
+quartets, eight measured calls per arm. Times cover inference and the CPU head, excluding request
+encoding, model loading and JSON serialization. The percentage is the median of the four paired
+reductions, not the ratio of the displayed medians.
+
+| Fixture | Tokens | Serial median, ms | Parallel median, ms | Paired reduction |
+|---|---:|---:|---:|---:|
+| `r003` | 298 | 277.91 | 257.95 | 6.88% |
+| `r013` | 273 | 272.91 | 256.37 | 6.26% |
+| `oav004` | 602 | 616.01 | 572.61 | 6.55% |
+| `ov001` | 430 | 383.79 | 357.77 | 6.69% |
+| `ot003` | 585 | 570.41 | 535.32 | 6.89% |
+| `ov003` | 473 | 419.32 | 392.25 | 6.36% |
+| `ot002` | 652 | 626.47 | 591.57 | 5.68% |
+| `r019` | 2,231 | 1779.31 | 1675.29 | 6.15% |
+
+All eight fixture medians improve. Of the 32 individual quartets, 31 improve; one `ot003` quartet
+is 1.8% slower. A preceding paired run measured 5.7–7.1% median reductions. This is bounded fixture
+evidence, not full-suite throughput.
+
+The rebuilt CLI preserves every raw logit on the 43 core requests in single, four-record packed,
+poisoned single and poisoned packed modes, and all 50 decoder residual stages and raw logits on
+nine independently referenced controls; their existing numerical failures are preserved too, so
+this establishes no accuracy change. `make test-omni-assign` checks 210 cases against a CPU oracle,
+covering every count, offset, row-map entry, slot, input and guard word. The existing tests pass
+72 FP64 MoE cases, nine nonfinite-input cases and all 13 allocation failure/recovery checks.
+Evidence: `golden/omni-compensated-performance-20261013/`, particularly
+`production-paired/analysis.json`, `production-validation.json`, `production-targeted.json` and
+`summary.json`. The compensated-arithmetic prototype measured in the same work was not retained;
+see [rejected experiments](rejected-experiments.md#fp64-precision-prototypes).
+
+## Omni expert tile dispatch, 2026-10-12
+
+Expert GEMMs visit the padded expert runs in one grid. Each tile locates its expert with an
+upper-bound search over the existing offsets, so repeated offsets from empty experts are skipped.
+Previously, every expert launched enough row tiles for the entire chunk, then discarded excess
+groups. At 1,024 rows, the per-column grid bound drops from 4,096 to 380 groups. Matrix shapes,
+tile origins within each expert and floating-point reductions are unchanged, and no buffers are
+added beyond the chunk change below.
+
+The final CLI was compared directly with the original 256-row engine in three sequential resident
+processes (original, optimized, original), with two warmups and three timed responses per fixture.
+Times include JSON pipe input, encoding, inference and logit serialization, excluding model
+loading. This is not an interleaved in-process comparison; both baseline medians are shown because
+their spread matters, particularly on the 256-token fixture.
+
+| Tokens | Original first, ms | Original last, ms | Optimized, ms | Reduction from mean baseline |
+|---|---:|---:|---:|---:|
+| 143 | 206.9 | 206.0 | 199.5 | 3.4% |
+| 256 | 296.4 | 256.8 | 242.6 | 12.3%; baseline varies |
+| 295 | 408.1 | 391.2 | 265.5 | 33.6% |
+| 2,231 | 2,475.3 | 2,457.3 | 1,828.3 | 25.9% |
+
+An earlier separate comparison against the 1,024-row engine measured a further 5.3%, 6.1% and
+8.2% reduction at 256, 295 and 2,231 tokens, and 1.4% at 143 tokens. Neither comparison estimates
+full-suite throughput. The combined changes retain the 298.02 MiB arena, 150.84 MiB above the
+original.
+
+All 43 core requests and 93 question logits remain byte-identical in single-request, four-record
+packed and NaN-poisoned packed runs, and the complete responses on the five original benchmark
+failures, including probabilities, are unchanged. The model-free test passes 72 FP64 comparisons,
+including routes clustered at the first, middle and final experts, chunk-size invariance, padding
+guards and nine nonfinite-input cases. The new dispatch test first failed against the old kernel,
+then passed. All 13 allocation failure/recovery checks still pass. Evidence:
+`golden/decision-index-suite/omni-performance/compact-dispatch/summary.json`,
+`final/chunk-benchmark.json` and `validation.json`. These changes preserve outputs; Omni's
+numerical qualification is unchanged by them.
+
+## Omni expert chunks, 2026-10-12
+
+The native Omni decoder groups up to 1,024 tokens per expert chunk instead of 256, starting each
+chunk relative to its own record so batch neighbors cannot change the GEMM shapes. Larger groups
+improve expert tile occupancy and reduce repeated dispatches and weight reads. Assignment, gather
+and activation cover only the current chunk's padding bound: one row per assignment plus at most
+31 rows per occupied expert, so short requests do not clear the larger arena in full. Routing,
+weight precision, expert arithmetic and residual summation order are unchanged.
+
+The final CLI was measured in three sequential resident processes (baseline, optimized,
+baseline), with two warmups and three timed responses per request. Times include JSON pipe input,
+encoding, inference and logit serialization, excluding model loading. The baseline column averages
+the two baseline medians; this is not an interleaved in-process test.
+
+| Text fixture | Tokens | Baseline, ms | Optimized, ms | Latency reduction |
+|---|---:|---:|---:|---:|
+| r007 | 143 | 204.0 | 202.3 | Within 1% |
+| r001 | 256 | 255.3 | 255.2 | Within 1% |
+| r000 | 295 | 377.0 | 282.5 | 25.1% |
+| r019 | 2,231 | 2,295.6 | 1,773.8 | 22.7% |
+
+All measured response bytes match. The expert arena grows from 147.17 to 298.02 MiB per engine,
+independent of context length; model weights and other buffers are unchanged. No claim is made
+about full-suite throughput or sparse-traffic latency from these four fixtures.
+
+The rebuilt engine reproduces all 93 question logits across the 43 text, image, video, audio and
+audiovisual requests, including text up to 16,344 tokens, in single-request, four-record packed
+and NaN-poisoned packed runs. A separate targeted run preserves the complete responses, including
+probabilities, of the five original benchmark failures. The expert test passes 44 independent FP64
+checks, nine nonfinite-input cases, chunk-size invariance at 256/512/1,024 rows, tail guards and
+poisoned padding, and all 13 arena allocation-failure/recovery checks. `make` regenerated the
+Metal source include from authored source. Evidence:
+`golden/decision-index-suite/omni-performance/summary.json`, with the final timing samples in
+`final/chunk-benchmark.json` and the complete comparison in `validation.json`.
+
+## Dense head memory, 2026-10-14
+
+Flash and 27B keep fewer CPU head weights and reuse two completed decoder buffers on the GPU
+during the head. Inference arithmetic is unchanged.
+
+The CPU loader validates the GPU-only hidden/memory normalization and memory-projection tensors
+without copying them into unused FP32 arrays (`validate_ln` and `f32_tensor` in `clef_head.c`).
+Evidence and decoder cross-attention keep only their Q rows on the CPU; decoder self-attention
+keeps the full QKV matrix it shares with `self_in`. Full biases, size/type checks and packed
+layouts remain. The loader now takes ownership before the next fallible load, which fixes a
+partial-load leak.
+
+On the GPU (`ensure_capacity` in `clef_metal.m`), final RMSNorm reads the residual `x` into
+projection scratch `P` (bound as `hfin`), then hidden LayerNorm reads `P` into `x` (bound as
+`nh32`). The two dispatches are serial with distinct inputs and outputs, residual dumps finish
+before the reuse, and the final-normalization dump stays intact. A geometry with `maxN < H`
+keeps a separate `hfin`; Omni keeps independent buffers.
+
+| Model | CPU head allocations removed | GPU allocations removed at 16,384-token capacity | Combined reduction per engine |
+|---|---:|---:|---:|
+| Flash | 64.047 MiB | 512 MiB | 576.047 MiB |
+| 27B | 68.055 MiB | 640 MiB | 708.055 MiB |
+
+Tracked CPU allocations fall from 898,888,084 to 831,729,812 bytes on Flash and from 941,363,604
+to 870,002,836 on 27B; the GPU saving is exactly two FP32 `[capacity][H]` buffers. These are
+allocation counts, not RSS, and exclude prefix-cache entries. Warm CPU head loading measured
+74.467 → 72.398 ms on Flash and 83.356 → 83.614 ms on 27B, which supports no loading-speed
+claim.
+
+A resident-engine comparison alternated independent and reused buffers in four ABBA quartets
+after two warm calls per arm, checking exact logits. Both buffer sets stayed resident, so it
+measures binding and execution cost, not memory:
+
+| Model / tokens | Independent buffers, median ms | Reused buffers, median ms |
+|---|---:|---:|
+| Flash / 146 | 69.918 | 70.187 |
+| Flash / 300 | 115.831 | 114.964 |
+| Flash / 2,235 | 673.366 | 668.001 |
+| 27B / 146 | 220.546 | 220.004 |
+| 27B / 300 | 391.943 | 392.428 |
+| 27B / 2,235 | 2,512.257 | 2,515.777 |
+
+Median differences are below 1% in either direction and quartet signs vary: the benefit is
+memory, not latency.
+
+All 339 logits on the 46-request text/image/video corpus are preserved per model, singly and
+packed eight at a time with NaN poisoning. All 103 decisions per model match FP32, and the
+maximum absolute logit/probability errors remain 0.017221 / 0.00089442 for Flash and 0.007023 /
+0.00113586 for 27B. Every residual stage and the final-normalization dump for `r000` are
+byte-identical to the baseline. Eleven further state checks preserve 786 logits across poisoned
+prefix transitions in both attention modes, the BF16 head and forced overflow; mixed fallback
+batches use limits 1,250 for Flash and 3,000 for 27B. `make test-dense-buffers` passes eight
+layouts and 218 allocation failures under ASan/UBSan, and `tests/test_head_load.c` passes 105
+allocation failures and 258 malformed tensors per BF16/F32 format. No shader changed. Evidence:
+`golden/dense-perf-20261014/final/`.
+
+## Dense CPU attention workers, 2026-10-14
+
+Flash and 27B split larger CPU head attention calls across up to eight workers instead of two
+(`attend_plan` in `clef_head.c`). Each worker still computes whole heads with the same BLAS
+calls, softmax order and output columns. Omni keeps two workers. The choice is made per call,
+with no global scheduling state, and small calls stay serial. Expanded worker counts use at most
+8 MiB of total score scratch, falling back from eight to four to the original two-worker path,
+which can itself exceed 8 MiB; the increase over that path is at most 6 MiB, released after each
+call. Sizes are checked before multiplication and allocation.
+
+A resident engine alternated two and eight workers in six ABBA quartets after two warm calls per
+arm. Both arms used matching-prefix cache hits, reusing 7,808 and 16,064 tokens of the 8,072-
+and 16,347-token requests, and every logit was checked against a full uncached pass. These are
+cache-hit latencies, not fresh-input latencies. Times include GPU inference and the CPU head,
+excluding loading, encoding and HTTP.
+
+| Model / full tokens | Two workers, median ms | Up to eight workers, median ms | Reduction | Improving quartets |
+|---|---:|---:|---:|---:|
+| Flash / 8,072 | 137.967 | 132.916 | 3.66% | 6/6 |
+| Flash / 16,347 | 173.916 | 162.837 | 6.37% | 6/6 |
+| 27B / 8,072 | 441.904 | 434.802 | 1.61% | 5/6 |
+| 27B / 16,347 | 561.487 | 553.882 | 1.35% | 6/6 |
+
+CPU-head medians fall from 19.990 to 14.791 ms and from 35.000 to 24.715 ms on Flash, and from
+19.741 to 15.161 ms and from 36.132 to 24.765 ms on 27B; all 24 head quartets improve. The
+smaller 27B request-level effects are not precise gains. An initial screen on fresh 146-, 300-
+and 2,235-token inputs established no fresh-request speedup; it also contains a large cache-hit
+outlier and is not pooled with the repeat above.
+
+All 339 logits and 103 FP32 decisions per model are preserved in poisoned batches of eight, and
+BF16-head and mixed FP16-overflow checks preserve another 62 logits on ten requests per mode and
+model. Head tests cover the worker and scratch boundaries, checked allocation sizes and failure
+recovery: under ASan/UBSan, 14 planner/allocation cases and 48 attention cases with exact
+unsplit and sampled float64 checks. Evidence: `golden/dense-head-workers-20261014/`
+(`repeat-analysis.json` for timing, `validation-summary.json` for qualification).
+
+## Dense CPU projection workers, 2026-10-14
+
+Eligible packed multi-row head projections on Flash and 27B use four CPU workers instead of two
+when the output width is divisible by 128, so each worker gets 32-column-aligned columns (`lin`
+and `prepare_linear` in `clef_head.c`). The matrix-size threshold is unchanged. Single rows,
+unpacked weights, other widths and Omni keep the two-worker or serial path. The policy is stored
+with the immutable loaded weights; there is no environment switch.
+
+Profiling on saved FP32 final-normalization tensors attributed 72–79% of head time to linear
+projections. Allocations took only 0.016–0.023 ms, so scratch pooling was not pursued. Head-only
+replay on three requests per model saved 0.374–0.437 ms on Flash and 0.301–0.365 ms on 27B
+(5.2–8.4%), with 47 of 48 quartets faster and all 1,368 raw-logit comparisons exact. The replay
+reconstructs head inputs on the CPU and excludes GPU inference.
+
+Complete requests show a smaller benefit. Each row has two warm calls and six ABBA quartets per
+arm in one loaded engine, and every call matches its own uncached reference. Times include GPU
+inference and the CPU head, excluding loading, encoding and HTTP. Cached rows are
+matching-prefix hits on the full 8,072- and 16,347-token requests, with separate entries per
+arm. Negative changes are faster.
+
+| Model | Mode | Full tokens | Two workers, median ms | Four workers, median ms | Latency change | Faster quartets |
+|---|---|---:|---:|---:|---:|---:|
+| Flash | Fresh | 146 | 70.402 | 70.304 | −0.14% | 4/6 |
+| Flash | Fresh | 300 | 101.558 | 100.974 | −0.58% | 6/6 |
+| 27B | Fresh | 146 | 202.490 | 202.300 | −0.09% | 2/6 |
+| 27B | Fresh | 300 | 368.683 | 374.377 | +1.54% | 3/6 |
+| Flash | Cached | 8072 | 145.514 | 145.031 | −0.33% | 4/6 |
+| Flash | Cached | 16347 | 170.576 | 168.142 | −1.43% | 6/6 |
+| 27B | Cached | 8072 | 460.857 | 459.833 | −0.22% | 5/6 |
+| 27B | Cached | 16347 | 556.087 | 550.101 | −1.08% | 4/6 |
+| 27B | Fresh repeat | 146 | 221.689 | 221.197 | −0.22% | 4/6 |
+| 27B | Fresh repeat | 300 | 395.800 | 394.063 | −0.44% | 5/6 |
+
+The 27B repeat did not reproduce the initial 300-token slowdown. The results support a modest
+CPU improvement, with the clearest request-level evidence on the 300-token fresh and 16K cached
+Flash cases, and no broad 27B request-latency gain.
+
+All 339 logits and 103 FP32 decisions per model are preserved; BF16-head and mixed-overflow
+cases each preserve 62 logits on ten requests per model. Across the six strict, untruncated,
+poisoned batch-of-eight captures that is 926 exact logit comparisons. The 160 linear tests
+compare both policies with unsplit BLAS and check the actual dispatch counts, covering single
+rows, poisoned packed padding, ragged inputs and widths divisible by 64 but not 128; the
+ragged-input case first exposed a missing packed-buffer guard. Loader checks cover the
+dense/Omni policy assignment in BF16 and F32. Evidence: `golden/dense-linear-workers-20261014/`
+(`timing-summary.json`, `canonical/reports/`).
+
+## Dense CPU projection epilogues, 2026-10-15
+
+Eligible dense projections followed by GELU (the evidence and decoder feed-forward input
+projections and the batched scorer) now apply their bias and GELU on the same four workers that
+compute their output columns (`lin_gelu4` in `clef_head.c`). Bias results are stored as FP32
+before the separate, unchanged scalar GELU pass. Workers own disjoint columns and join before
+the next projection reads them. Dimensions, packed strides, reductions and worker counts are
+unchanged; Omni, single rows, unpacked weights, other widths and small projections keep their
+paths. No allocation, dispatch or switch was added.
+
+CPU head replay on three saved FP32 inputs per model reduced the equally weighted request
+medians from 5.136118 to 4.852045 ms on Flash (5.53%) and from 5.354639 to 4.987080 ms on 27B
+(6.86%), with 23/24 and 21/24 quartets faster. The verification build checked 22,044,672
+post-GELU values exactly. The replay reconstructs head inputs on the CPU and excludes the GPU.
+
+The full-engine screen ran on the retained GPU host, without the decoder-scratch reuse for head
+memory that was rejected separately (see [rejected
+experiments](rejected-experiments.md#decoder-scratch-reuse-for-head-memory)). Each case has two
+warmups per arm and six ABBA quartets; the table gives the median of the six per-quartet
+candidate/baseline ratios. The frozen limit was at most 1% extra latency, and every case passed.
+Negative changes are faster.
+
+| Model | Mode | Full tokens | Median paired latency change | Faster quartets |
+|---|---|---:|---:|---:|
+| Flash | Fresh | 146 | +0.097% | 3/6 |
+| Flash | Fresh | 300 | −0.319% | 4/6 |
+| Flash | Fresh | 2235 | +0.436% | 3/6 |
+| Flash | Cached | 8072 | −4.274% | 6/6 |
+| Flash | Cached | 16347 | −0.027% | 3/6 |
+| 27B | Fresh | 146 | −0.730% | 5/6 |
+| 27B | Fresh | 300 | −0.987% | 5/6 |
+| 27B | Fresh | 2235 | −0.439% | 3/6 |
+| 27B | Cached | 8072 | −0.804% | 4/6 |
+| 27B | Cached | 16347 | −0.077% | 4/6 |
+
+Times are complete synchronous resident inference including GPU work and the CPU head, excluding
+loading, encoding and cache fill. Cached cases reuse 7,808 or 16,064 tokens, with separate
+entries per arm, and every call had finite, exact logits. The Flash cached 8K result includes a
+baseline quartet mean of 349.244 ms against 140.1025 ms for the candidate; that stall stays in
+the calculation, so it is not a speedup estimate. Most effects are below 1% with mixed quartet
+directions. The CPU replay supports the head-performance claim; this ten-case screen does not
+establish universal latency nonregression.
+
+Normal and ASan/UBSan head-linear tests pass 192 new epilogue cases, a separate bias-rounding
+fixture and the 160 existing cases. Full-engine qualification preserves 926 primary logits
+across canonical text/image/video, BF16-head and mixed-overflow cases, plus 352 logits in paired
+TU/FP32 prefix checks; both models keep all 103 FP32 decisions. Evidence:
+`golden/dense-head-epilogue-20261014/` (`full-qualification-no-alias/`,
+`full-timing-no-alias/runs/first/result.json`).
+
+## Dense head-loader blocked packing, 2026-10-15
+
+Loading copies each packed CPU head weight into its padded, transposed layout. A startup
+attribution, measuring six load/check/free cycles per model after two warm loads, found that
+this transpose dominates head loading:
+
+| Model | Median transpose | Median complete head load | Ratio of medians |
+|---|---:|---:|---:|
+| Flash | 67.9035 ms | 73.9205 ms | 91.86% |
+| 27B | 72.3345 ms | 83.1570 ms | 86.99% |
+
+Both exceeded the prospective materiality minimum of 20 ms and 25% of complete head-load time.
+The transpose interval includes calloc first-touch and page faults: 11,496 minor faults per
+Flash load and 7,368 per 27B load.
+
+Flash and 27B now copy in one fixed 32×32 tiled traversal (`pack_linear` in `clef_head.c`).
+Every value, padding byte, bound check, allocation, error path and ownership rule is preserved,
+as are inference arithmetic and worker selection. The shared helper also changes Omni's loading
+traversal; synthetic Omni byte checks pass, but no Omni loading speed was measured.
+
+| Model | Baseline median load | Blocked median load | Median paired reduction | Median paired saving |
+|---|---:|---:|---:|---:|
+| Flash | 71.6545 ms | 44.7820 ms | 37.34549% | 26.81875 ms |
+| 27B | 85.5950 ms | 48.6845 ms | 43.21842% | 36.89725 ms |
+
+Reduction and saving are medians across six ABBA quartets of each arm's mean of two complete
+loads, not derived from the individual-call medians in the first two columns. All twelve
+quartets favored the candidate; the smallest paired savings were 26.2470 ms and 36.3655 ms,
+against fixed requirements of 10 ms, 10% and five of six faster quartets. Transpose medians fell
+from 65.6310 to 38.7565 ms on Flash and from 74.6660 to 37.7235 ms on 27B, with unchanged
+minor-fault counts. The interval excludes GGUF mapping, tokenizer and Metal setup and the rest
+of engine opening, and is not a disk-cold measurement: this is a head-load gain only, with no
+inference, whole-engine startup or accuracy change.
+
+Normal and ASan/UBSan packing and loader tests cover special FP32 bit patterns, source/output
+guards, ragged and invalid shapes, allocation failure and dense/Omni BF16/F32 fixtures. The
+permanent oracle compares integer bytes through `memcpy`, so signaling NaN payloads cannot be
+normalized by test arithmetic. Evidence: `golden/dense-head-pack-20261015/` (`attribution/`,
+`paired-run/`, `root-adoption-decision.json`).

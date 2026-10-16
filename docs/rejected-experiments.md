@@ -735,6 +735,39 @@ long 27B expansions was retained. Full column-major traversal was slower on ever
 shape and larger groups severely regressed long down-projections; see
 [grouped expansion tile order](performance-history.md#grouped-27b-expansion-tile-order-2026-10-05).
 
+### 16-row FP16 projection tiles, 2026-10-14
+
+A private probe reduced FP16 projection tiles from 32 to 16 rows to cut padding on short Flash
+requests. At the tested 146x4096x24576 shape, 16x128 and 16x256 tiles kept exact tile/packed
+output, sampled FP64 error bounds and NaN guards, but showed no clear isolated win. Forcing
+16x128 tiles in complete Flash inference (one resident engine, two warm and eight measured calls
+per arm in four ABBA quartets) kept every logit exact and regressed every quartet:
+
+| Flash tokens | Existing dispatch, median ms | 16x128, median ms | Latency increase |
+|---|---:|---:|---:|
+| 146 | 70.048 | 80.797 | 15.3% |
+| 300 | 100.606 | 123.750 | 23.0% |
+| 594 | 185.326 | 246.290 | 32.9% |
+
+Rejected; no tile or shader change was retained. 27B was not run through the full-request probe.
+Evidence: `golden/dense-perf-20261014/tile16/`.
+
+### Static outer extents for FP32 interior tiles, 2026-10-14
+
+A private shader specialization gave only complete interior tiles of the FP32 32x128 multiply
+and accumulate kernels static outer tensor extents. K stayed dynamic; edge tiles, the FP16/BF16
+paths, FP32 16-row tiles, arithmetic and dispatch geometry were unchanged. All 1,452 paired
+cases were bit-identical across 93,880,122 output elements, covering both dense geometries,
+every packed row shift, ragged K, cancellation, nonzero residuals and poisoned tails.
+
+Five of six frozen single-GEMM gates failed. Median candidate/baseline ratios for T146/300/2235
+were 1.002078/0.993634/1.068260 at K4096,N4096 and 1.022428/1.001913/1.002906 at K6144,N5120,
+each from two warmups and six ABBA quartets per arm. Advancement required at least 3%
+improvement and five faster quartets at both longer lengths for each geometry, with at most 2%
+extra at T146. Flash T2235 varied substantially, so the screen does not establish a precise
+slowdown. No complete-request test followed. Evidence:
+`golden/dense-fp32-static-slice-20261014/`.
+
 ## FFN
 
 ### Fused gate/up projection with SwiGLU
@@ -1010,6 +1043,49 @@ short-record arithmetic make this an unsuitable production change.
 generated shader, build hashes, frozen criteria, twelve raw timing records and aggregate
 results. The numerical inputs are synthetic; only article lengths were used.
 
+### Interval-decay reuse in chunk preparation, 2026-10-15
+
+Status: the candidate passed its isolated kernel screen, but its whole-engine screen stopped
+before any candidate inference, so it is not adopted. Production `gdn_chunk_prep` in
+`metal/clef.metal` still evaluates `gdn_interval_decay` for each element.
+
+The candidate caches the inclusive interval-decay triangle once per full 32-token block in
+`gdn_chunk_prep`; KE, U and A reuse those identical values. The table lives in the existing
+short-tail scratch, and partial blocks keep the original expressions. Interval summation,
+gamma/E, reductions, allocations, dispatches and barriers are unchanged.
+
+The synthetic discriminator passed all 133 cases: Hv32/48, every partial tail after a full
+block, all 32 placement offsets at T63 and three long Hv48 lengths. It compared every padded
+W/U/KE/A/E byte and both VC16/VC32 scan outputs across arms under two poison patterns, with
+input/output guards and finite checks. All 9,576 sampled float64 checkpoints passed; the worst
+absolute error was `5.6718843e-8`. Six timing series of one warm and six measured ABBA quartets
+favored the candidate in every measured quartet. Reductions are medians of the six
+within-quartet mean ratios:
+
+| Tokens / value heads | Preparation reduction | Preparation + scan reduction | Combined median paired saving |
+|---|---:|---:|---:|
+| 4,096 / 48 | 32.15% | 7.64% | 0.9516 ms |
+| 8,072 / 48 | 16.91% | 5.20% | 0.9254 ms |
+| 16,347 / 48 | 17.09% | 12.82% | 3.4581 ms |
+
+All series passed the frozen advancement gate: a preparation median ratio of at most 0.90 with
+at least five faster quartets, and a combined ratio of at most 1.00. Each interval is one
+command buffer and excludes compilation, allocation and checks. Static threadgroup memory is
+unchanged (8,704 bytes for preparation, 12,288/24,576 bytes for the two scans); register
+occupancy was not measured. Multiplying the combined savings by 48 layers gives conditional
+estimates of 44.4 ms at 8K and 166.0 ms at 16K, about 0.48% and 0.79% of historical 27B
+full-call medians; synthetic kernel timings do not establish request gains. Production Flash
+does not use the chunked route, so the Hv32 cases are coverage, not a Flash gain.
+
+The whole-engine screen stopped in its fresh Flash baseline. The private builds omitted the
+`clef-media` helper, which the decoder resolves beside the real CLI executable, so encoded-video
+records `vd005` and `vd006` returned explicit errors and the qualifier correctly rejected
+incomplete coverage despite exit status zero. The other 44 baseline records (99 questions, 329
+logits) were byte-exact to the retained build. No candidate, 27B or timing run followed, and the
+screen was closed rather than repaired and continued. A further attempt needs a package that
+includes `clef-media`. Evidence: `golden/dense-gdn-decay-reuse-20261015/`
+(`runs/local-score.json`, `engine-stage-decision.json`).
+
 ## Workload-level changes
 
 For the batched classification workload (seven-question rubrics on the 27B, see the
@@ -1059,3 +1135,435 @@ not earn a production dispatch change:
 Desktop activity caused substantial absolute timing variation. These are screening results,
 not hardware limits. The experiments remain reproducible in the evidence directory; none
 justifies claiming that every possible kernel optimization has been exhausted.
+
+## Dense precision controls, 2026-10-14 and 2026-10-15
+
+These private candidates changed one local rounding or operator-grouping step at a time in Flash
+and 27B, to test whether the complete model moves closer to the FP32 reference. Candidates that
+reached a model screen used the canonical 46-request text/image/video corpus (103 questions and
+339 logits per model) unless the entry says otherwise. The frozen rule was to keep every FP32
+decision and the 0.05 logit / 0.002 probability ceilings, and to lower both the mean
+question-maximum logit error and the mean question-maximum probability error on both models. The
+user approved at most 2% extra full-request latency for a demonstrated accuracy gain. No
+candidate was integrated, and none established a labeled task-accuracy gain. Repeatedly, better
+local arithmetic did not carry through to final scores.
+
+### FP32 attention output, 2026-10-14
+
+The compensated attention kernel kept its gated output in FP32 instead of rounding it to FP16,
+reusing the gate buffer after its final read, and the existing FP32 residual GEMM projected it.
+This changes both storage precision and the projection implementation. It passed 422 kernel
+comparisons (separate and in-place outputs, packed records, prefix suffixes, poison guards,
+overflow and direct BF16 calls), and rounding its output to FP16 reproduced baseline bits.
+
+On the canonical corpus both models kept all 103 decisions and the ceilings. Mean
+question-maximum probability error fell 19.01% on Flash and 5.94% on 27B, but individual errors
+were mixed: 27B's maximum rose from 0.001136 to 0.001796, and Flash's `r000` final-norm relative
+L2 worsened. On a separate 24-request numerical fixture (all 96 decisions per model kept),
+Flash's request-mean probability error fell 38.73% with a negative paired bootstrap interval and
+a lower maximum. 27B's fell 6.22%, but its 95% interval crossed zero and its maximum rose 5.47%
+(0.00024736 to 0.00026089), failing the predeclared improvement criterion. That fixture had
+informed earlier choices and is not untouched validation.
+
+Paired fresh-request timings, with two warmups and six ABBA quartets per fixture in one loaded
+engine, exceeded the 2% limit everywhere; 35 of 36 quartets were slower:
+
+| Model | Tokens | Baseline median ms | FP32 median ms | Latency increase |
+|---|---:|---:|---:|---:|
+| Flash | 146 | 75.020 | 78.544 | 4.70% |
+| Flash | 300 | 124.194 | 131.173 | 5.62% |
+| Flash | 2235 | 708.976 | 748.521 | 5.58% |
+| 27B | 146 | 194.930 | 204.387 | 4.85% |
+| 27B | 300 | 341.857 | 360.827 | 5.55% |
+| 27B | 2235 | 2327.556 | 2444.859 | 5.04% |
+
+Evidence: `golden/dense-attn-output-20261014/` and `golden/dense-attn-output-f32-20261014/`.
+
+### Two-plane attention output, 2026-10-14
+
+The follow-up stored the gated output as two FP16 planes, `hi = half(value)` and `lo =
+half((value - float(hi)) * 2048)`, combined two FP32 projection products as `product(hi, W) +
+product(lo, W) / 2048`, then added the FP32 residual once, in every full-attention layer of both
+dense models. It reused dead scratch and kept overflow flags and finite saturation; Omni and
+BF16 fallback were unchanged. It passed the 422 kernel comparisons and its attention error fell
+on 1,420 FP64 samples. On six real captures its sampled squared and maximum projection errors
+were below both FP16 and direct FP32 projection.
+
+Both models kept all 103 decisions, the ceilings and the `r000` layer checks, and control mode
+reproduced all 339 baseline logits. The final-score rule still rejected it:
+
+| Model | Mean max logit error, baseline → candidate | Change | Mean max probability error, baseline → candidate | Change |
+|---|---:|---:|---:|---:|
+| Flash | 0.00129242 → 0.000866845 | −32.93% | 0.0000714094 → 0.0000748107 | +4.76% |
+| 27B | 0.00134961 → 0.00151639 | +12.36% | 0.000154015 → 0.000161028 | +4.55% |
+
+Flash had 60 improved and 43 worse probability errors; 27B had 49 improved and 54 worse. Both
+`r000` final-norm relative L2 values improved, but that single trace does not describe the other
+requests. No latency was measured. Evidence: `golden/dense-attn-output-comp-20261014/`
+(`decision.json`).
+
+### FP32 attention output at the final block, 2026-10-14
+
+The same FP32 output kernel ran only in the final decoder block, layer 31 on Flash and 63 on
+27B, positions chosen from the architectures before evaluation. Kernel checks passed, control
+mode reproduced all 339 retained logits per model, and every stage through the final-block input
+stayed byte-exact. Flash's mean question-maximum logit/probability errors rose 0.865%/0.212% and
+its maximum probability error 0.898%; 27B's means fell only 0.145%/0.112%. Rejected; no latency
+was measured. Evidence: `golden/dense-final-attn-20261014/`.
+
+A matched-input diagnostic then fed one unchanged native final block either its own input or the
+exact FP32 reference input, for one 300-token request per model, with control outputs and all
+seven logits byte-exact to the baseline. Final-block output RMS error fell from 0.007916 to
+0.001442 on Flash and from 0.036555 to 0.001939 on 27B; on the union of question and option
+spans it fell from 0.005059 to 0.001419 and from 0.014898 to 0.001728. The large final-block
+discrepancy on this request therefore depends strongly on upstream error. This is not an
+additive decomposition and does not justify a final-MLP precision change. One token accounted
+for 79.0% of 27B's control squared error. Evidence:
+`golden/dense-final-block-diagnostic-20261014/`.
+
+### FP32 attention output at the earliest two blocks, 2026-10-14
+
+Following that diagnostic, a fixed policy kept FP32 output only at blocks 3 and 7, the earliest
+full-attention blocks in both dense topologies, selected before any outputs were seen. All
+captures passed coverage, ceilings and decisions; mode 0 reproduced every retained logit, and
+`r000` stages through block 2 stayed byte-exact. Flash's mean logit/probability errors fell
+23.976%/1.781% while its worst logit/probability errors rose 5.924%/18.889%. On 27B mean logit
+error fell 5.606%, but mean probability error rose 5.834% and worst probability error 35.361%.
+Probability error worsened on 47 Flash and 56 27B questions. Rejected; no latency was measured.
+Evidence: `golden/dense-early-attn-20261014/`.
+
+### DeltaNet query normalization boundary, 2026-10-14
+
+A control materialized the normalized FP32 query before applying the existing dk scale, matching
+the pinned reference's operator grouping; norm reduction, epsilon, key normalization, beta,
+gates, buffers and dispatch geometry were unchanged. A staged GPU control confirmed every query
+bit across 823,296 elements, 235,296 of which differ from production, and other outputs and
+eight packed-record comparisons stayed exact. Synthetic query SSE against FP64 nevertheless rose
+11.56%: matching the reference's grouping is not more accurate mathematics.
+
+The canonical screen passed ceilings and decisions on both models. Flash's mean question-maximum
+logit/probability errors fell 11.04%/0.50%, but 27B's rose 7.96%/6.79%, and its maximum
+probability error rose 27.05% while staying below 0.002. Rejected. Evidence:
+`golden/dense-arithmetic-controls-20261014/`.
+
+### Vision attention scale rounded once, 2026-10-14
+
+A host-only mode computed the vision scale as `(float)(1.0 / sqrt((double)head_dim))` instead of
+`1.0f / sqrtf((float)head_dim)`. At head dimension 72 this changes one bit, is about 17 times
+closer to the exact scalar and matches the pinned reference, yet local synthetic
+attention-output SSE against FP64 rose 9.02%.
+
+The canonical screen first passed: mean question-maximum probability error fell 6.79% on Flash
+and 0.04% on 27B, with all bootstrap intervals crossing zero. A fresh prospective screen
+therefore used 16 synthetic image/video requests (four each of small and large images and
+videos; 40 questions, 120 logits and 12,924 tokens per model), with token IDs, positions, media
+grids and processed FP32 patches checked exact against the reference first. It rejected the
+change: Flash's mean question-maximum logit and probability errors rose 15.21% and 22.04%, and
+its maximum probability error 9.14%; 27B's logit mean improved 4.92% but its probability mean
+worsened 3.94%. Both versions kept every ceiling and all 40 decisions per model. Evidence:
+`golden/dense-arithmetic-controls-20261014/media16/`.
+
+### DeltaNet output precision, 2026-10-15
+
+**Attribution.** A matched-input CPU oracle held native normalized q/k/v, beta, log gate and
+weights fixed and separated recurrence/state rounding, producer FP32 arithmetic, final FP16
+conversion, decay sensitivity and output-GEMM/residual rounding, projected into common
+residual-boundary units. The cells were `r000` and `v000` at layers 0/16 on Flash and 0/32 on
+27B: eight cells sharing four trajectories, all on the sequential `gdn_scan_8`. Long chunked 27B
+records, video, prefixes, overflow fallback and other depths are outside this result. Final FP16
+operand storage dominated every cell: its RMS was 360.94–2369.59 times the recurrence RMS and
+2608.67–3057.52 times the producer-arithmetic RMS, and it exceeded both nuisance terms, meeting
+the prospectively fixed factor-two separation rule. Its relative L2 error against the
+double-precision projected operand was 0.0190–0.0296%, so a large component ratio alone does not
+establish task relevance. The first shadow replay failed its bit-exact scan check because the
+appended shadow kernels inherited a later file-scope `#pragma clang fp contract(off)`; restoring
+`contract(on)` before them fixed it, and the attribution is conditional on that corrected
+instrument. Evidence: `golden/dense-upstream-attribution-20261015/`
+(`revision-2/reports/result.json`).
+
+**Candidate.** Keeping the FP32 producer values in the dead scan O buffer and projecting them
+with the existing accumulating FP32-input GEMM (`gemm_f32_acc_32x128`) preserved the producer
+expression, contraction context, `act16` overflow flags, finite saturation, allocations and
+checkpoint layout. The route was selected uniformly for dense DeltaNet blocks when the engine
+opened; default, BF16-retry and Omni routes were unchanged. It passed 914 local GPU dispatches,
+where the eight real cells matched both the original FP16 operands and the FP32 replay bits
+exactly, and 30 public API calls per model across eleven engine configurations. Those covered
+packed records with nonzero offsets, prefix reuse, the 27B chunk16/chunk32 routes, checkpoint
+plans, prefix invalidation and forced prefix-to-plain-to-BF16 fallback. All 39 selected default
+logits changed in each model, so the route was not a no-op.
+
+**Cost.** The fourteen-case latency screen rejected it before any accuracy campaign. Changes are
+medians of six ABBA quartet ratios, each comparing the mean of two candidate calls with the mean
+of two baseline calls. Calls include GPU inference, readback and the CPU head, excluding model
+load, encoding and cache fill; cached cases use separate entries per arm.
+
+| Request | Flash latency change | 27B latency change |
+|---|---:|---:|
+| Fresh, 146 tokens | +10.22% | +14.27% |
+| Fresh, 300 tokens | +13.67% | +15.83% |
+| Fresh, 2,235 tokens | +12.57% | +13.52% |
+| Fresh, 8,072 tokens | +11.04% | +12.34% |
+| Fresh, 16,347 tokens | +9.40% | +10.91% |
+| Cached, 8,072 tokens, 7,808 reused | +10.55% | +11.17% |
+| Cached, 16,347 tokens, 16,064 reused | +9.35% | +10.34% |
+
+All 84 quartets were slower and every case exceeded the 2% limit; all 400 non-reference calls
+matched their own-arm uncached logits. Dispatch counters show the FP16 projection route replaced
+by `gemm_f32_acc_32x128`: FP32 doubles activation operand width, gives up the larger half-only
+tiles some baseline cases use, and the producer writes FP32 in place. These are plausible
+causes, not a measured attribution; profiling was off. The DeltaNet output projection in
+`clef_metal.m` still reads the 16-bit operand `g->A`. Evidence:
+`golden/dense-gdn-f32-feasibility-20261015/` (`cost-result-revision-2.json`,
+`root-cost-rejection-revision-2.json`).
+
+### CPU head pooling and MLP residual controls, 2026-10-14
+
+On six saved head inputs (38 logits, 16 questions), FP64 span and lexical means increased
+downstream logit RMS error against the pinned FP64 head graph: Flash 3.303e-7 to 3.787e-7 and
+27B 2.123e-7 to 2.295e-7. FP64 weighted option summaries changed no logits. This holds native
+normalized hidden states and memory K/V fixed, so it isolates CPU head arithmetic, not
+whole-model error. Evidence: `golden/dense-pooling-audit-20261014/`.
+
+An unchanged-kernel control compared MPP `multiply_accumulate` with `multiply` followed by one
+CPU FP32 residual add. All 7,299,072 outputs matched across 48 synthetic down-projection cases,
+including cancellation and large residuals, and 4,608 sampled FP64 checks on identical rounded
+operands gave identical errors. This is observed equality on those inputs, not a property of MPP
+or a test of lost FP32 activation precision. No candidate followed. Evidence:
+`golden/dense-mlp-residual-control-20261014/`.
+
+### CPU head GELU tail conditioning, 2026-10-15
+
+A model-free screen compared the retained `0.5f*x*(1.0f+erff(x*c))` with `0.5f*x*erfcf(-(x*c))`,
+keeping the FP32 argument and multiplication boundaries. The alternative recovers small
+negative-tail values lost when `erff` rounds to minus one (the largest omitted real value on the
+synthetic grid was `8.25e-8`), but some positive inputs became less accurate. Four fixed scalar
+CPU workloads had median candidate/baseline time ratios of 2.22–3.56, with none of 24 ABBA
+quartets faster. These are scalar loop costs, not head or request latency. Actual head
+activations and downstream benefit were not established, no model ran, and the GELU helper is
+unchanged. Evidence: `golden/dense-head-gelu-screen-20261015/` (`CORRECTED-ANALYSIS.md`).
+
+## Dense RMSNorm and head-memory buffers, 2026-10-14
+
+### Virtual lanes for RMSNorm
+
+A private probe replaced a 1,024-thread row reduction with 512 threads, each computing two
+logical lane sums, to keep the per-lane and SIMD-group reduction order while reducing
+synchronization. Under production safe math it changed one BF16 output out of 598,016 at 146
+rows by 4,096 columns, failing the exact-output condition before timing. This does not show
+worse accuracy, which was not measured. Evidence: `golden/dense-norm-20261014/decision.json`.
+
+### Decoder scratch reuse for head memory
+
+A host-only change reused the dead decoder `O` and `Xc` allocations for the dense head's memory
+projection and FP32 normalized memory, with independent capacity checks and allocation
+fallbacks; arithmetic, shaders and Omni were unchanged. For the released models at capacity
+16,384 the logical reduction is 128 MiB with the FP32 head or 64 MiB with the BF16 head, not a
+measured RSS saving. All 26 correctness and recovery jobs passed, as did the ASan/UBSan
+allocation test (32 layouts, 862 initial plus 862 growth failure points).
+
+The frozen latency gate, a median ABBA candidate/baseline ratio of at most 1.01, failed at
+27B/2,235 tokens (1.011211). A prospectively fixed repeat of all six model/length cases,
+requiring every repeat median and every median pooled over the twelve original and repeat
+quartets to stay within 1.01, failed at Flash/2,235: 1.028103 in the repeat and 1.011232 pooled.
+Every call had exact outputs. Both allocation sets stayed resident, so allocator cost and RSS
+were not measured, and no precise general slowdown is inferred. Rejected: `mem` and `mn32`
+remain separate allocations in `clef_metal.m`. Evidence:
+`golden/dense-head-scratch-reuse-20261014/runtime-audit/`.
+
+## Omni
+
+Clef-Omni experiments from 2026-10-12 to 2026-10-16. None of them is in the working default.
+Gates are those of the [Omni verification policy](omni.md#numerical-verification-policy): exact
+tokens and argmax, residual relative L2 at most 0.01 at every captured stage, logit error at most
+0.05 and probability error at most 0.002. "FP32 screen" means the 43 requests and 93 questions of
+the short corpora against the FP32 reference (blocked attention); the working default fails 12
+of those questions, with a mean absolute probability error of 0.000708464 per question.
+Components marked "Kept" are part of the unapplied FP32-compatible build
+([status](omni.md#status)); its retained speed steps and their timings are in
+[the lineage table](omni.md#fp32-compatible-build). Evidence directories are under `golden/`.
+
+### FP64 precision prototypes
+
+From 2026-10-12 to 2026-10-13 the work tried to make native arithmetic more accurate, measured
+against independent CPU FP64 references ([FP64 controls](omni.md#fp64-controls)), while the FP32
+screen remained the acceptance gate. Unless the table says otherwise, each change passed its own
+local operator tests (precision bounds, packing, poison, nonfinite inputs); the columns give the
+whole-model results. Row 1 stands alone. Rows 2–8 are variants of one full-compensation prototype
+(row 8 builds on row 6); rows 10–15 change one operator family at a time on the row-8 prototype,
+cumulatively from row 11. `r020` is the 8,069-token text control.
+
+| # | Change | Independent FP64 result | FP32 screen, failed of 93 | Latency | Decision | Evidence |
+|---:|---|---|---:|---|---|---|
+| 1 | Vision GEMMs as 32-element FP32×BF16 products with two-component sums (2026-10-12; alone) | `oav004` 12/50 → 0/50 failed stages; `ot003` 13/50 → 26/50 (worst 0.0520371 → 0.148930); `ov001` 9/50 unchanged | 17 | 1.5–2.5% slower on three fixtures | Rejected, removed | `omni-vision-accuracy-20261012/` |
+| 2 | Full compensation: dense/expert products, decoder attention, small-grid vision attention, precise vision rotary | Seven selected controls pass | — | +37.8–53.5% | Not adopted | `omni-decoder-accuracy-20261012/rotary/` |
+| 3 | The same restricted to Omni vision kernels | Fresh two-image `ov003`: 7 failed stages (0.0310381); the default passes | 18 | +2.2–6.9% on media fixtures | Rejected | `omni-decoder-accuracy-20261012/vision-precise/` |
+| 4 | Full compensation with unrolled sums and 16×128 expert/dense tiles | Nine selected controls pass | 19 | 13–20% faster than full compensation; still +11–26% | Not adopted; a 32×64 expert tile was stopped at 29–39% slower expert products | `omni-compensated-performance-20261013/` |
+| 5 | Scoped to Omni entry points; complete audio corpus | `oa002` fails 3 stages (0.0207346); the default passes all 300 | — | — | Regression found | `omni-reference-agreement-20261013/` |
+| 6 | Decoder rotary coefficients from CPU FP64, stored as FP32 high/low pairs (1 KiB per packed token) | 17 controls and the complete video corpus pass; audio/video `oav003` fails 7 stages (0.0367556) | 18 | +9.0% to +21.3% on six fixtures | Not adopted | `omni-decoder-rounding-20261013/rotary-v2/`, `omni-av-qualification-20261013/` |
+| 7 | FP64 learned-position coefficients with compensated addition | `oav002` gains 7 failed stages (0.0433678) | — | — | Rejected | `omni-vision-position-20261013/precise/` |
+| 8 | Vision tanh-GELU in an exponential-sigmoid form, on row 6 | All 23, then 41, controls pass; `r020` fails `final_norm` (0.0201982) | 18 | 9.97–22.62% slower | Not adopted; kept as the diagnostic prototype | `omni-vision-gelu-20261013/`, `omni-8k-text-qualification-20261013/` |
+| 9 | That GELU alone on default arithmetic | `ov003` and `ot004` gain 7 failed stages each | 17 | — | Rejected | `omni-production-gelu-20261013/` |
+| 10 | Q/K normalization with compensated squares, refined reciprocal root, low bits through rotary | `r020` 1 → 16 failed stages (0.0471469); changed expert sets 799 → 5,988 | — | — | Rejected | `omni-qk-norm-20261013/` |
+| 11 | QKV with 16-term partial sums; QKV with FMA-compensated products and sums | 16-term misses the local `3e-8` bound; compensated: `r020` 1 → 16 (0.0403813) | — | — | Rejected | `omni-router-normalization-20261013/` |
+| 12 | Compensated QKV with a separate FP32 Q/K store; then accurate decoder RMS | 16 failed stages (0.0431581); with RMS, 1 (0.0201982309) | — | — | Not qualified | `omni-qk-store-20261013/` |
+| 13 | Attention: low components kept through the final division; compensated probability–value products | Division fails the local exact-constant test; products: `r020` 16 failed (0.0433346) | — | — | Rejected | `omni-prefix-attention-20261013/` |
+| 14 | Attention: compensated scores, exponential and online softmax | Local error 8.8-fold lower; `r020` 16 failed (0.0404776) | — | — | Rejected | `omni-attention-scores-20261013/` |
+| 15 | Compensated selected-expert weight normalization | On the combined precision profile, `r020` 16 → 17 failed (0.0418617) | 15 on default arithmetic; 18 on the combined profile | — | Rejected | `omni-route-weights-20261013/` |
+| 16 | GPU-written indirect dispatch grids for expert tiles (arithmetic unchanged) | Captures unchanged | Unchanged | Prototype: 0.40–3.02% lower on five fixtures, `r019` +1.06% and +0.34%; default: 0.96–3.17% lower | Not kept for the prototype; the default variant deferred | `omni-precision-performance-20261013/` |
+
+What this established:
+
+- **Local accuracy does not predict the whole request.** On `r020`, replacing only the QKV
+  projection with its correctly rounded result restores the reference expert at the first flip
+  (layer 22, token 5,145). Yet the native Q/K, QKV, attention and routing-weight corrections each
+  moved the first flip earlier, to near-ties such as layer 12/token 5,606 (reference score gap
+  `3.31363e-8`), and raised the failed stages from 1 to 16 or 17; accurate RMS left the single
+  failure in place. Exact layer arithmetic cannot undo state drift that is already sufficient for
+  the flip, and the row-8 prototype's native arithmetic partly cancels earlier error at that tie.
+- **FP32 storage is not the obstacle.** From the embedding, ideal FP64 arithmetic with FP32 stores
+  at the native kernel boundaries (Q/K normalization stored separately) passes all 50 `r020`
+  residual checks, worst relative L2 `0.000168495`. Fusing the Q/K normalization store flips layer
+  12 again, so fewer rounding boundaries do not guarantee the reference path.
+- **FP64 agreement moves away from the FP32 gate.** The combined precision prototype passes all 91
+  shared final checks against FP64 but fails against FP32 on exactly the 17 questions where the FP32
+  reference itself exceeds the limits against FP64. The FP32 gate was reaffirmed as the acceptance
+  target, and the work turned to reproducing the reference's arithmetic.
+- Do not retry compensated vision GEMMs on GEMM error or `oav004` alone, selected-weight
+  compensation on its local rounding result, or any single-operator precision change without a
+  whole-request FP64 and FP32 check.
+
+### FP32 compatibility components
+
+2026-10-13. Each change reproduces a pinned PyTorch 2.11 MPS operation and was first shown
+byte-exact on identical captured inputs, with offsets, poisoned scratch, guards and explicit error
+cases. Rows are cumulative in order; "alone" means applied to the working default.
+
+| Component | Change | Same-input check | FP32 screen: failed of 93 (mean absolute probability error) | Decision | Evidence |
+|---|---|---|---|---|---|
+| Router projection | `MPSNDArrayMatrixMultiplication` once per complete record on cached FP32 expansions of the BF16 router weights | 38,144 saved scores exact | 14 (0.00113228) alone | Kept with later rows | `omni-reference-divergence-20261013/` |
+| Vision patch embedding | Contraction in spatial-then-channel (DHWC) order | 1,290,240 convolution outputs exact; the original order differs on 1,161,174 | 16 (0.000882867) alone; 15 (0.00147004) with the router | Kept | `omni-fp32-vision-stages-20261013/` |
+| Learned-position interpolation | MPS coordinate formation and separately rounded weighted products | 63,286,272 values exact | 16 (0.000832705) alone | Kept | `omni-fp32-vision-position-20261013/` |
+| Vision LayerNorm | MPS reduction: four contiguous elements per thread, sum and squared sum, variance clamp, precise reciprocal root, local `contract(on)` | 46,517,760 values exact | 17 (0.000848623) alone; the four rows together 12 (0.000794738) | Kept | `omni-fp32-vision-normalization-20261013/` |
+| Vision rotary and attention | Separately rounded rotary products; MPSGraph QK product, FP32 scale, softmax, 1,024-key value blocks and block sum | Exact through attention, residual, norm2 and first MLP projection | 10 (0.000741431) | Kept | `omni-fp32-vision-attention-20261013/` |
+| Vision GELU | MPSGraph tanh and erf GELU in the pinned operation order | All 44 compared `ot001` vision stages exact | 7 (0.000542382) | Kept | `omni-fp32-vision-gelu-20261013/` |
+| Decoder Q/K preparation | Materialized squares, MPSGraph mean, `1 / precise::sqrt`, separate stores; rotary table from the pinned FP32 initialization (it differs from `powf` at one of 64 frequencies) | 86,615,040 values exact | 7 (0.000427291) | Kept | `omni-fp32-r019-decoder-20261013/` |
+| Decoder RMS | The same recipe at input, post-attention and final norms; or post-attention only | 71,804,928 values exact | 11 (0.000543154); post-attention only 7 (0.000371090) | All-boundary form kept with the next row; post-attention-only dropped | `omni-fp32-r019-layer5-20261013/` |
+| Decoder causal attention | Blocked FP32 as in the reference: whole eight-head GQA groups, 64-million-element score budget, 1,024-key value blocks, the reference's sorted-stride views for query slices | 192,552,960 values exact | 7 (0.000453197) | Kept | `omni-fp32-decoder-attention-20261013/` |
+| Router weights | Materialized softmax, top 8 by sort, sum and division | 183,816 weights and IDs exact | 7 (0.000395057) | Kept | `omni-fp32-router-weights-20261013/` |
+| Per-record reduction shapes | RMS and key normalization reduced at each record's own shape | Packing `r003` with `r019` had moved `r003`'s logits by up to 0.1150105; all six packing checks now exact | 7; unbatched outputs unchanged | Kept; required for batch invariance | `omni-fp32-router-weights-20261013/` |
+| Small-expert products and SiLU | FP32 graph products for experts with fewer than 16 assignments in the complete record (chunk-local counts would select the wrong groups); SiLU as the reference's graph operations | 57,481,216 values exact | 3 (0.000259015); all 1,600 text, image and video stages exact | Kept; this graph profile ran at 25.00x and 4.73x default latency | `omni-fp32-expert-block-20261013/` |
+| Audio CNN and positions | NCHW/OIHW convolution graph with bias and separate GELU; sinusoid table regenerated from the CPU FP32 formula (1,530 of 16,640 values had differed) | 290,856,960 values exact | Audio records: 0 of 22 questions, 13 of 550 stages (11 new on `oav003`) | Kept | `omni-fp32-audio-isolation-20261013/` |
+| Audio LayerNorm | MPS kernel arithmetic with 320 threads at width 1,280 | 12,990,720 values exact | Audio: 1 of 550 stages (`oav000/final_norm` 0.0139364) | Kept | `omni-fp32-audio-norm-20261013/` |
+| Short audio projections | MPSNDArray products when the complete matrix has fewer than 16 rows | 15,089,664 values exact | Audio: 4 of 550 (three new on `oa003`) | Rejected as this profile; included in the final composition with the next two rows | `omni-fp32-oav000-isolation-20261013/` |
+| Audio attention and GELU | Interleaved Q/K views, separate scale and softmax, 1,024-element padded value reduction; separately materialized GELU | 3,244,800 and 3,686,400 values exact | With the frontend: 0 of 550 stages, 0 of 22 questions | Kept | `omni-fp32-audio-attention-20261013/` |
+| Audio frontend | PocketFFT with contraction on, through a C ABI bridge; dense FP32 mel product; SLEEF-derived `log10` with explicit FMA | 6,447,654 stage values exact over 22 cases | As above | Kept | `omni-fp32-audio-boundary-20261013/` |
+
+Notes:
+
+- **Why a locally exact router regressed.** On `ot001`, the MPS router first changes an expert at
+  layer 4/token 99 and fails 22 stages, although its same-input scores match the reference
+  exactly. Native visual embeddings and DeepStack features together were sufficient for that
+  flip under an FP32 decoder; either alone was not. Each component helped only once the inputs
+  reaching it matched as well.
+- **Audio boundary.** Supplying the FP32 tower's output on canonical features made all 50
+  `oav000` decoder stages byte-exact, while the FP32 tower on native features and the native tower
+  on canonical features each still failed. The remaining error was in both the frontend and the
+  tower; the substitution itself was a diagnostic and never part of inference.
+- **Cost.** The composition is graph-based and was slow before the speed work: the vision/decoder
+  profile ran at 25.00x the default's latency on 298 tokens, and the complete composition with
+  audio took 6,506.796 ms against the default's 246.702 ms. Its first full 43-request pass came
+  with the first retained speed step, which left every output unchanged.
+
+### FP32-compatible speed candidates
+
+Candidates for the FP32-compatible profile that were not retained, 2026-10-14 to 2026-10-16.
+Every candidate kept its parent's arithmetic or reproduced it bit for bit, and every timed response
+was checked byte for byte. "Model screen" means poisoned captures of `r003` (298 tokens) and
+`r019` (2,231 tokens, final 512 rows): 100 saved stages and five questions against the FP32
+reference, plus four packed responses.
+
+The 2026-10-14 candidates were timed in production-bracketed resident processes (two warmups,
+three measured requests) and judged on whether both paired blocks favored them. From 2026-10-15,
+criteria were frozen before each run and a failed screen was not repeated. Early 2026-10-15 jobs
+used ABBA with the same counts and required both paired ratios below 1 and the pooled ratio below 0.99 on each
+request. After an identical-binary control proved unstable (see diagnostics below), jobs used four
+resident processes with five warmups and five measured requests each: the target request needed
+both paired ratios below 0.97 and the pooled ratio below 0.95, and the other request was a
+regression control with paired and pooled ratios below 1.03. Operator-only screens applied 5%
+pooled and 3% paired benefit thresholds to GPU device spans, which include internal submission
+gaps. Ratios are candidate/parent; "paired" values are the two ABBA pairs.
+
+| Candidate | Numerical result | Speed against its criterion | Decision | Evidence |
+|---|---|---|---|---|
+| Q/K helper's three callback commands combined into one MPS wrapper | 125,460,480 local values exact; whole-model outputs checked on `r003` and `r019` only | 298 tokens 1.92% lower; 2,231 tokens 0.69% higher, then 1.12% lower in a repeat | Not promoted | `omni-fp32-qk-async-20261014/` |
+| Empty Q/K-to-attention submission removed | Local checks exact | −0.03% and +0.91% | Not promoted | `omni-fp32-qk-handoff-20261014/` |
+| Unused expert activation rows trimmed | Model screen exact | No short gain; 2,231 tokens 14.8% slower, both pairs regress | Rejected | `omni-activation-extent-20261014/` |
+| Activation appended to the tiny-expert projection command | Two text screens and packing pass | Short 2.5% lower; long mixed; the fixed follow-up aborted before any pair | Not accepted | `omni-expert-projection-activation-20261014/` |
+| Four-value tiny-expert weight scanner | Operator controls pass | Four of six shapes have a slower pair | Rejected at the operator screen | `omni-tiny-scan4-20261015/` |
+| Router helper preparation overlapped with the incoming command | Model screen exact | Short 1.54% faster; long 0.41% slower, both pairs regress | Rejected | `omni-router-input-timing-20261015/` |
+| Tiny-expert output validation grouped into one dispatch per batch | Operator exact | Three of six shapes fail; down-8 pooled 8.10% higher | Rejected at the operator screen | `omni-tiny-output-batch-20261015/` |
+| First record's RMS square appended to its producer command | Model screen exact | 298: 0.997153 / 1.002500; 2,231: 1.006217 / 0.961494 | Rejected | `omni-rms-producer-transfer-timing-20261015/` |
+| Native RMS mean with fixed reduction trees for 298 and 2,231 rows | Model screen exact | 298: 1.179361 / 1.010239; 2,231: 1.003119 / 0.939316 | Rejected | `omni-rms-native-timing-20261015/` |
+| Square, native mean and normalization fused into the caller's encoder | Model screen exact | 298 passes (0.897161 / 0.984416); 2,231: 0.908767 / 1.014257 | Rejected | `omni-rms-inline-timing-v2-20261015/` |
+| Probability padding and layout conversion moved into the softmax graph | Model screen exact | +10.95% (1.135499 / 1.137081) and +29.04% (1.309278 / 1.274372) | Rejected | `omni-attention-layout-timing-20261015/` |
+| Query chunks capped at 1,024 rows, scores computed only for reachable keys | Operator within local limits; model screen exact | 298: +3.005% (pooled 1.030049); 2,231: +5.444% (1.077669 / 1.039833) | Rejected | `omni-attention-causal-timing-20261015/` |
+| Expert chunks of 4,096 rows | Model screen exact | 2,231: 2.229% lower (1.009965 / 0.952693); would add up to another 498.25 MiB | Rejected | `omni-chunk4096-timing-v2-20261015/` |
+| Eight-head attention groups promoted to sixteen at 2,049–2,896 tokens | Model screen exact | 2,231: +3.409% (1.065104 / 1.013053); 298 pairs 1.090409 / 0.963882; scratch 605,279,296 → 1,210,558,592 bytes | Rejected | `omni-attention-head-batch-timing-20261015/` |
+| Waits deferred until the last attention head group | Model screen exact | 298 pair 1.038457 over the bound; 2,231: +0.794% (0.985890 / 1.010713) | Rejected | `omni-attention-deferred-timing-20261016/` |
+| Probability–value product and block reduction in one graph | Operator exact | 2,231-token device span 0.273% lower (0.994495 / 0.998635); 512-token pairs 1.091277 / 1.069289 | Rejected at the operator screen | `omni-attention-product-reduce-operator-timing-20261016/` |
+| Native 64×128 expert tile for local counts of at least 64 | Operator exact | Uniform up 1.216104, concentrated down 1.409023, both pairs slower | Rejected at the operator screen | `omni-native-expert-tile64-20261016/` |
+| Expert-local tile order visiting both rows of a column first | Operator exact | Up-dense128 5.886% lower but one pair fails; up-concentrated 5.645% higher | Rejected at the operator screen | `omni-native-expert-order2-20261016/` |
+| Native FP32 MPP Q/K score product | Four synthetic fixtures inexact within local limits (worst `2.51422e-7` relative L2); model screen exact | 2,231: 0.831% lower (0.996309 / 0.981740) | Rejected | `omni-attention-native-score-timing-20261016/` |
+| The same, skipping score tiles wholly beyond the last live query | As above | 2,231: 4.363% lower (0.971015 / 0.933574) | Rejected; adding the scale/mask epilogue passed (lineage step 15) | `omni-attention-causal-native-score-timing-20261016/` |
+| Native score product reading Q/K directly instead of packed copies | Model screen exact | Against the default only: 1.909017 and 1.155806 | Not promoted; its own effect unmeasured | `omni-direct-qk-default-timing-20261016/` |
+| Eight-word BF16 exponent scanner alone | Model screen exact | 298: 4.9946% lower, pooled 0.950053743 against < 0.95 | Rejected; with direct array views it passed (step 17) | `omni-tiny-bits8-timing-20261016/` |
+| Two equal-row tiny-expert products per call | Model screen exact | 298: 1.8813% lower (0.980954 / 0.982271) | Rejected | `omni-paired-expert-timing-20261016/` |
+| Native `vector4x32-fma` tiny-expert products | Within local limits, but `r019` fails 25 of 50 stages (final 0.0840002) and both questions (logit 0.0610426, probability 0.0124707) | Not timed | Rejected on numerics | `omni-tiny-native-v4-rejection-20261016/` |
+| Native dot4-FMA tiny-expert products with separate validation dispatches | Bit-exact to MPS; model screen exact | 298: 3.009% lower (0.969367 / 0.970368); 2,231 pair 1.039992 over the bound | Rejected; fusing the validation passed (step 18) | `omni-tiny-native-dot4-timing-20261016/` |
+| Tiny experts grouped by row count, one dispatch per bucket | Model screen exact | 298: 1.854% lower (0.987848 / 0.979228) | Rejected | `omni-tiny-grouped-validation-timing-20261016/` |
+| Two output columns per tiny-expert thread | Model screen exact | 298: 0.547% lower (0.991710 / 0.996270) | Rejected | `omni-tiny-two-column-timing-20261016/` |
+| Native expert tiles compacted to skip empty and tiny-expert tiles | Operator exact | Dense pooled device ratios 1.028551–1.125057 | Rejected at the operator screen | `omni-native-expert-compact-20261016/` |
+| Native 32×256 expert tile | Operator exact | Up-dense128 1.090327; down 1.433477 and 1.522702 | Rejected at the operator screen | `omni-native-expert-wide256-20261016/` |
+
+### Timing method and attribution diagnostics
+
+- **Identical-binary control** (2026-10-15). The same build under both labels on the 2,231-token
+  request: paired ratios 1.003772 and 1.013625 lie inside [0.98, 1.02], but the four arm medians
+  (2,453.345 to 2,540.457 ms) spread by 1.035507, beyond the 1.03 limit. Small whole-request gains
+  are not resolvable with this protocol; the later 0.97/0.95 margins are an engineering screen, not
+  a noise bound. `omni-whole-request-timing-control-20261015/`
+- **Synthetic operator timing** (2026-10-15). A calibration with identical-work, deliberately slower
+  and bracketed controls found overlapping command-buffer intervals in all 144 quartets (717 of 720
+  adjacent pairs). A serialized protocol then failed calibration: identical-work ratios 1.10931
+  and 0.91471, and 29 of 96 scanner brackets within 0.90–1.10. The output-batch screen had also run
+  106 extra correctness commands before timing in the candidate arm only. Small speed claims
+  therefore need complete-request timing. `omni-timing-calibration-failure-20261015/`,
+  `omni-timing-serial-calibration-20261015/`, `omni-timing-method-audit-20261015/`
+- **Counters.** The M5 Max offers stage sampling and timestamp counters but no dispatch-boundary
+  sampling, so kernels inside a shared encoder cannot be sampled individually.
+  `omni-dispatch-counter-probe-20261016/`
+- **Where the fused build's time goes.** Expert-containing commands take 193.154 ms of a 276.981 ms
+  observed GPU interval union at 298 tokens; at 2,231 tokens expert and attention commands take
+  765.445 and 480.498 ms of 1,594.456 ms. Sampled dense up/down projection medians sum to
+  100.803 and 625.660 ms for the two requests and tiny up/down medians to 76.219 and 48.211 ms;
+  dense up is the largest category. In attention, probability–value products measure 9.862 and
+  183.760 ms, scores 3.497 and 94.636 ms, tail padding 5.304 and 34.532 ms. Gaps between commands
+  are not proven idle. `omni-fused-command-profile-v2-20261016/`,
+  `omni-fused-expert-stage-profile-20261016/`, `omni-fused-attention-stage-profile-20261016/`
+- **Tiny-product sensitivity.** One extra fresh weight scan per tiny product raises 298-token latency
+  from 473.917 to 539.929 ms (13.929%); repeating each tiny product, with matched extra checks in
+  both arms, raises it from 477.015 to 535.068 ms (12.1702%). These are marginal costs, not
+  removable latency. Reusing projection descriptors saves 2.522729 ms of CPU per synthetic request
+  and was deprioritized. `omni-tiny-scan-sensitivity-20261016/`,
+  `omni-tiny-product-sensitivity-20261016/`, `omni-tiny-metadata-cpu-20261016/`
+- **MPS tiny-product arithmetic.** Twenty guessed FP32 reduction recipes all passed local tolerances
+  and none matched MPS bits. Synthetic cancellation probes and a reconstructed addition tree then
+  gave the exact recipe: a four-term FMA cell, separately rounded outer accumulation and an
+  adjacent 32-lane reduction, matching all 1,326,080 retained MPS words; separate multiplication
+  differs in 381,526 up and 491,988 down words. Coverage is one layer of one request, 27 experts
+  and two incoming states, without real 10- or 14-row cases. `omni-tiny-subgroup-replay-20261016/`,
+  `omni-tiny-mps-tree-20261016/`, `omni-tiny-dot4-replay-20261016/`
+- **MPS RMS mean.** The MPSGraph mean's rounding depends on the row count: the 298 shared rows of
+  the 298-row and 2,529-row fixtures differ on 76 means. Fixture-matching reduction trees use 256
+  lanes at sampled counts 7–298, 64 at 511–513 and 32 at 1,023–4,097; no general dispatch rule is
+  established. `omni-rms-shape-validation-20261015/`
