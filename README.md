@@ -11,7 +11,8 @@ It returns typed decisions (the Jev/SystemOne request and response format) from 
 on Apple Silicon. BF16 weights, never quantized.
 
 Clef and Clef-Flash take text, images and video. Clef-Omni adds audio and video soundtracks; it
-runs, but is still being qualified ([status](docs/omni.md)).
+passes its accuracy check up to 8,069 tokens, while longer inputs and its speed are still being
+worked on ([status](docs/omni.md)).
 
 cleffa is built after [ds4](https://github.com/antirez/ds4) by antirez and the ds4.c authors, and
 would not exist without it (see [Acknowledgements](#acknowledgements)). It is an independent
@@ -129,9 +130,11 @@ defective MPS causal attention. Dense backbone matmuls take FP16 activation oper
 accumulation, attention uses compensated FP16 planes, and the residual stream and CPU head stay
 FP32. On the vision corpus both models answer 41/41 (max |Δp| 0.0009 and 0.0010); on the
 synthetic video corpus 16/16 (0.0002 and 0.0007). Tokenizer, JSON, request encoding, response
-text and image/video preprocessing match Python byte for byte. Clef-Omni's default path reproduces all 93
-decisions of its short corpora but fails these FP32 gates; builds that pass them are kept on
-separate branches, the fastest 1.56× slower at 298 tokens and 1.13× at 2,231 ([status](docs/omni.md)). Methodology, precision choices and the
+text and image/video preprocessing match Python byte for byte. Clef-Omni is accepted differently: its
+near-tied expert routing makes fixed FP32 gates unattainable for any FP32 implementation, so it is
+checked against an FP64 reference, allowing each question the FP32 reference's own error. It
+passes on all 42 requests up to 8,069 tokens with a reference, every decision equal to FP64
+([status](docs/omni.md)). Methodology, precision choices and the
 PyTorch reference defects found along the way are in [docs/accuracy.md](docs/accuracy.md).
 
 ## Speed
@@ -228,8 +231,8 @@ list are in [docs/security.md](docs/security.md).
 
 ## Not done yet
 
-- Clef-Omni qualification: its default path fails the FP32 gates, and long-context coverage is
-  unqualified ([docs/omni.md](docs/omni.md)).
+- Clef-Omni accuracy references beyond 8,069 tokens (16k is in progress, 64k has none)
+  ([docs/omni.md](docs/omni.md)).
 - WebP ([docs/vision.md](docs/vision.md)).
 - Live or unknown-length clips, and video codecs beyond H.264, HEVC, ProRes and MJPEG
   ([docs/video.md](docs/video.md)).

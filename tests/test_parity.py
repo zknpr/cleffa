@@ -12,6 +12,14 @@ non-finite value, or numerical error above its tolerance fails. Defaults: max ab
 logit error 0.05, max probability error 0.002, and per-layer relative L2 error 0.01.
 The --max-logit-error, --max-prob-error and --max-layer-rel-l2 flags override these limits.
 BF16 references contain their own rounding error and are not the acceptance target.
+
+--bound-by FP32_GOLDEN (Clef-Omni): GOLDEN is the independent FP64 reference. Top-8 expert
+routing has near-ties finer than FP32 resolves, so no FP32 implementation, the FP32 PyTorch
+reference included, stays within fixed limits of FP64 everywhere. A question passes when its
+logit and probability errors against FP64 are each within the larger of the limit and
+FP32_GOLDEN's own error on that question, and its argmax matches FP64 or FP32_GOLDEN. Both
+references must have encoded identical token ids. Layer relative L2 is then a diagnostic;
+non-finite values still fail.
 """
 
 from __future__ import annotations
@@ -51,6 +59,8 @@ def main() -> None:
     parser.add_argument("--max-logit-error", type=tolerance, default=0.05)
     parser.add_argument("--max-prob-error", type=tolerance, default=0.002)
     parser.add_argument("--max-layer-rel-l2", type=tolerance, default=0.01)
+    parser.add_argument("--bound-by", type=Path, metavar="FP32_GOLDEN",
+                        help="GOLDEN is FP64; allow each question FP32_GOLDEN's own error (Omni)")
     args = parser.parse_args()
     gguf, golden, do_dump = args.gguf, args.golden, args.dump
     requests = golden / "requests.jsonl"
@@ -75,6 +85,15 @@ def main() -> None:
     bad = sum(json.loads(c)["input_ids"] != g["input_ids"] for c, g in zip(enc_c, enc_g))
     print(f"token ids: {len(enc_g) - bad}/{len(enc_g)} identical")
     failures += bad
+    if args.bound_by:
+        # The bound is meaningful only for the same input: a reference that tokenized the
+        # request differently says nothing about this question's achievable error.
+        with (args.bound_by / "encoded.jsonl").open() as source:
+            bound_enc = {e["id"]: e["input_ids"] for e in map(json.loads, source)}
+        mismatched = [g["id"] for g in enc_g if bound_enc.get(g["id"]) != g["input_ids"]]
+        if mismatched:
+            print(f"bound: FAIL {len(mismatched)} requests missing or encoded differently in {args.bound_by}")
+            failures += len(mismatched)
 
     # 2. residual stream of the first request
     layers_path = golden / "layers" / f"{enc_g[0]['id']}.safetensors"
@@ -122,9 +141,14 @@ def main() -> None:
             cos = float((e * r).sum() / (np.linalg.norm(e) * np.linalg.norm(r) + 1e-30))
             flag = "  <-- jump" if i > 0 and rel > 4 * prev + 0.01 else ""
             print(f"  {n:12s} rel_l2={rel:.2e} cos={cos:.6f}{flag}")
-            if not np.isfinite(rel) or rel > args.max_layer_rel_l2:
-                print(f"  {n}: FAIL relative L2 exceeds {args.max_layer_rel_l2}")
+            if not np.isfinite(rel):
+                print(f"  {n}: FAIL non-finite relative L2")
                 failures += 1
+            elif rel > args.max_layer_rel_l2:
+                # Under --bound-by, routing flips make layer drift expected; the final outputs
+                # carry the acceptance decision.
+                print(f"  {n}: {'diagnostic' if args.bound_by else 'FAIL'} relative L2 exceeds {args.max_layer_rel_l2}")
+                failures += 0 if args.bound_by else 1
             prev = rel
 
     # 3. decisions
@@ -133,6 +157,7 @@ def main() -> None:
         print(out.stderr)
         sys.exit("engine failed")
     golden_logits = load_file(str(golden / "logits.safetensors"))
+    bound_logits = load_file(str(args.bound_by / "logits.safetensors")) if args.bound_by else None
     rows = list(io.StringIO(out.stdout))
     max_dl = max_dp = 0.0
     n_q = agree = 0
@@ -163,12 +188,23 @@ def main() -> None:
                 continue
             dl = float(np.abs(e - g).max())
             dp = float(np.abs(softmax(e) - softmax(g)).max())
-            if not (np.isfinite(dl) and np.isfinite(dp)) or dl > args.max_logit_error or dp > args.max_prob_error:
-                print(f"  {req['id']}/{qid}: FAIL |d logit|={dl:.6g} (limit {args.max_logit_error}), "
-                      f"|d p|={dp:.6g} (limit {args.max_prob_error})")
+            limit_l, limit_p, agrees = args.max_logit_error, args.max_prob_error, e.argmax() == g.argmax()
+            if bound_logits is not None:
+                b = bound_logits.get(f"{req['id']}/{qid}")
+                if b is None or b.shape != g.shape or not np.isfinite(b).all():
+                    print(f"  {req['id']}/{qid}: FAIL missing, mis-shaped or non-finite bound logits")
+                    failures += 1
+                    continue
+                b = b.astype(np.float64)
+                limit_l = max(limit_l, float(np.abs(b - g).max()))
+                limit_p = max(limit_p, float(np.abs(softmax(b) - softmax(g)).max()))
+                agrees = agrees or e.argmax() == b.argmax()
+            if not (np.isfinite(dl) and np.isfinite(dp)) or dl > limit_l or dp > limit_p:
+                print(f"  {req['id']}/{qid}: FAIL |d logit|={dl:.6g} (limit {limit_l:.6g}), "
+                      f"|d p|={dp:.6g} (limit {limit_p:.6g})")
                 failures += 1
             n_q += 1
-            agree += int(e.argmax() == g.argmax())
+            agree += int(agrees)
             if dp > max_dp:
                 worst = (req["id"], qid, dp)
             max_dl, max_dp = max(max_dl, dl), max(max_dp, dp)

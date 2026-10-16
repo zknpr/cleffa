@@ -30,6 +30,10 @@ class ParityChecks(unittest.TestCase):
         self.qid = "q"
         self.layers = {"embed": np.ones((2, 2)), "final_norm": np.ones((2, 2))}
         self.dump = np.ones((2, 2, 2), dtype=np.float32)
+        self.bound_dir = self.root / "bound"
+        self.bound_dir.mkdir()
+        (self.bound_dir / "encoded.jsonl").write_text(json.dumps(self.encoded) + '\n')
+        self.bound = self.reference.copy()
 
     def check(self, *flags):
         def run(args, **kwargs):
@@ -44,7 +48,9 @@ class ParityChecks(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, text, '')
 
         def load(path):
-            return {f"r0/{self.qid}": self.reference} if Path(path).name == "logits.safetensors" else self.layers
+            if Path(path).name != "logits.safetensors":
+                return self.layers
+            return {f"r0/{self.qid}": self.bound if Path(path).parent == self.bound_dir else self.reference}
 
         output = io.StringIO()
         with patch.object(parity, 'ROOT', self.root), patch.object(parity.subprocess, 'run', run), \
@@ -130,6 +136,51 @@ class ParityChecks(unittest.TestCase):
         (self.golden / "requests.jsonl").write_text('')
         (self.golden / "encoded.jsonl").write_text('')
         self.assertNotEqual(self.check()[0], 0)
+
+    def test_bound_allows_the_fp32_references_own_error(self):
+        # FP64 reference, native and FP32 bound: native is outside the fixed logit limit but
+        # closer to FP64 than the FP32 reference is on this question.
+        self.engine = self.reference + np.float32(0.08)
+        self.bound = self.reference + np.float32(0.09)
+        self.assertNotEqual(self.check()[0], 0)
+        self.assertEqual(self.check('--bound-by', str(self.bound_dir))[0], 0)
+
+    def test_bound_rejects_error_beyond_the_fp32_reference(self):
+        self.engine = self.reference + np.float32(0.1)
+        self.bound = self.reference + np.float32(0.09)
+        code, output = self.check('--bound-by', str(self.bound_dir))
+        self.assertNotEqual(code, 0)
+        self.assertIn("FAIL |d logit|", output)
+
+    def test_bound_keeps_fixed_limits_when_reference_is_closer(self):
+        self.engine = self.reference + np.float32(0.04)
+        self.bound = self.reference.copy()
+        self.assertEqual(self.check('--bound-by', str(self.bound_dir))[0], 0)
+        self.engine = self.reference + np.float32(0.06)
+        self.assertNotEqual(self.check('--bound-by', str(self.bound_dir))[0], 0)
+
+    def test_bound_requires_identical_encoding(self):
+        (self.bound_dir / "encoded.jsonl").write_text(json.dumps({**self.encoded, "input_ids": [1, 3]}) + '\n')
+        code, output = self.check('--bound-by', str(self.bound_dir))
+        self.assertNotEqual(code, 0)
+        self.assertIn("encoded differently", output)
+
+    def test_bound_argmax_may_follow_either_reference(self):
+        # FP64 prefers option 0 by a hair, the FP32 reference option 1; native follows FP32.
+        self.reference = np.array([0.001, 0.0], dtype=np.float32)
+        self.bound = np.array([0.0, 0.001], dtype=np.float32)
+        self.engine = self.bound.copy()
+        self.assertNotEqual(self.check()[0], 0)
+        self.assertEqual(self.check('--bound-by', str(self.bound_dir))[0], 0)
+
+    def test_bound_makes_layer_drift_diagnostic_but_not_nonfinite(self):
+        self.dump[1] *= 1.1
+        self.assertNotEqual(self.check('--dump')[0], 0)
+        code, output = self.check('--dump', '--bound-by', str(self.bound_dir))
+        self.assertEqual(code, 0, output)
+        self.assertIn("diagnostic", output)
+        self.dump[1, 0, 0] = np.nan
+        self.assertNotEqual(self.check('--dump', '--bound-by', str(self.bound_dir))[0], 0)
 
     def test_invalid_tolerance_fails(self):
         for value in ('nan', 'inf', '-1'):

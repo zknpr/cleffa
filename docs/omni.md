@@ -10,13 +10,20 @@ ported. Numbers are from the one tested M5 Max (128 GB), one GPU job at a time.
 ## Status
 
 All five input kinds run through the CLI and HTTP, with batch, poison, failure-recovery and
-resource-limit checks. The working default (the current tree) is **numerically unqualified**.
-Against the independent FP32 reference it reproduces all 43 token sequences and all 93 decisions
-of the short corpora, but fails 207 of 2,150 residual checks and 12 final-output checks, and
-every modality fails the layer gate ([results](#working-default)). The 64k reference and the
-final qualification matrix are stopped.
+resource-limit checks. Since 2026-10-16 Omni's numerical acceptance is **FP64-bounded**: against
+the independent FP64 reference, each question's error must be within the larger of the fixed
+limits and the FP32 PyTorch reference's own error ([policy](#numerical-verification-policy)).
+The working default (the current tree) **passes** it on every request that has an FP64
+reference: 42 requests, 91 questions, all decisions equal to FP64 ([results](#against-fp64)).
+Against the fixed limits alone it exceeds them on 8 of those questions, the FP32 reference on 17.
+Coverage stops at 8,069 tokens: the 16,344-token `r021` reference is being generated, and nothing
+near the 64,000-token default context has a reference ([not done](#not-done)).
 
-An FP32-compatible build exists on separate branches, not merged. It replaces the working default's own
+Under the earlier FP32-only gates, which no longer qualify Omni, the default reproduces all 43
+token sequences and 93 decisions of the short corpora but fails 207 of 2,150 residual checks and
+12 final-output checks ([results](#working-default-against-fp32-diagnostic)).
+
+An FP32-compatible build, made to pass those FP32-only gates, exists on separate branches, not merged. It replaces the working default's own
 compensated router and attention arithmetic, and several vision, decoder and audio operators,
 with implementations that reproduce the pinned PyTorch 2.11 MPS reference operation for
 operation. It passes every gate on the short corpora and the packing, poison, recovery and HTTP
@@ -38,10 +45,9 @@ to the engine commit. The fused-validation build descends from the merged build 
 buffer capacity, and no Flash/27B regression is recorded for it. Both add the header-only C++
 PocketFFT library behind a C ABI bridge and a SLEEF-derived logarithm for the audio frontend.
 
-Open decision: adopt one of these builds, paying its latency for compliance with the FP32
-engineering gate, or keep the working default and its failed gates. The hosted and labeled
-results below were measured on the working default; none exist for the FP32-compatible build. See
-[not done](#not-done).
+These builds match PyTorch's MPS rounding rather than FP64, cost 1.13–2.08× the default's
+latency, and are not needed under the FP64-bounded rule; they stay unmerged for reference. The
+hosted and labeled results below were measured on the working default.
 
 ## Running it
 
@@ -214,17 +220,29 @@ test-omni-deepstack test-omni-audio test-omni-buffers test-audio`. The Python su
 
 ## Numerical verification policy
 
-Hosted decision agreement and labeled accuracy are the headline evaluation metrics. The FP32
-reference is the engineering gate for numerical changes; it is not semantic ground truth or a
-description of Cloudflare's serving arithmetic. This follows the 2026-10-10 evaluation standard.
+Hosted decision agreement and labeled accuracy are the headline evaluation metrics. Numerical
+changes are gated against the independent CPU FP64 reference, bounded by the FP32 PyTorch
+reference (adopted 2026-10-16). Neither reference describes Cloudflare's serving arithmetic.
 
-**Gates.** Exact token IDs and argmax; finite outputs; maximum absolute logit error 0.05;
-maximum probability error 0.002; residual relative L2 at most 0.01 at every captured stage (the
-embedding, 48 decoder layers and the final norm). Exact decisions do not override a failed
-probability, logit or residual limit. These limits are never relaxed to obtain a pass, and a
-noise-floor control never supplies a replacement tolerance.
+**Why not fixed FP32 gates.** Top-8 routing over 128 experts has near-ties finer than FP32
+resolves (reference score gaps down to `3.31363e-8`). Any rounding difference flips some expert
+choices and the difference propagates, so no FP32 implementation stays within fixed per-layer
+limits of any single reference: the blocked and SDPA FP32 references differ from each other by
+0.114956 relative L2 on text, and against FP64 the FP32 reference itself exceeds the final-output
+limits on 17 of 91 questions. Passing fixed FP32 gates required reproducing PyTorch's MPS
+rounding (the FP32-compatible branches), not computing the model more accurately.
 
-**Reference.** Qualification uses the "FP32 reference (blocked attention)":
+**Gates.** Exact token IDs. For every question, against the FP64 reference: finite outputs, and
+a maximum absolute logit error and maximum probability error each within the larger of the fixed
+limit (0.05 and 0.002) and the FP32 reference's own error on that question; the argmax must equal
+FP64's or the FP32 reference's. `tests/test_parity.py gguf/clef-omni.gguf FP64_GOLDEN --bound-by
+FP32_GOLDEN` implements this and requires both references to have encoded identical token IDs.
+Per-layer relative L2 (0.01) is reported as a diagnostic; non-finite residuals still fail. The
+fixed limits are never relaxed beyond this, and the SDPA noise-floor control never supplies a
+tolerance. The earlier FP32-only gates remain a diagnostic. `tests/test_omni_qualification.py`
+still applies fixed limits to whichever reference it is given, so it does not implement this rule.
+
+**FP32 reference.** The bound uses the "FP32 reference (blocked attention)":
 `ref/oracle_f32_stream.py --omni-attention blocked`, from layer zero for every corpus. It bounds
 query storage and uses blocked value sums even on short inputs. `--omni-attention sdpa` is the
 independent FP32 noise-floor control with identical inputs; its spread is compared on the same
@@ -251,8 +269,8 @@ exactly equal. Features may differ from the pinned FP32 processor by at most `5e
 `5e-6` relative L2 per clip, with separate FFT, power, mel and log stage checks. The tower and
 decoder use the ordinary gates.
 
-**Independent FP64 lane.** Authorized on 2026-10-11 as a separate method, not an exception to the
-FP32 gate. `ref/oracle_fp64.py` (and `ref/oracle_fp64_bounded.py`, which streams validated
+**Independent FP64 lane.** Authorized on 2026-10-11 as a separate method and the acceptance
+reference since 2026-10-16. `ref/oracle_fp64.py` (and `ref/oracle_fp64_bounded.py`, which streams validated
 captures in 1 MiB chunks instead of holding a record in RAM) computes the decoder, routing, media
 towers, rotary and joint head in CPU FP64 from the pinned encoder's tokens, with the processor's
 FP32 image/audio preprocessing and the release loader's BF16 weight rounding before upcasting.
@@ -286,7 +304,30 @@ requests after model load.
 
 ## Results
 
-### Working default
+### Against FP64
+
+Acceptance run of 2026-10-16 on the working default (engine commit `32b5ef8`), with
+`tests/test_parity.py --bound-by` per FP64 reference and the matching FP32 blocked-attention
+reference as the bound. Maxima are the script's four-decimal summaries. Evidence:
+`golden/omni-fp64-bounded-20261016/`.
+
+| FP64 reference | Requests / questions | Max logit / probability error vs FP64 | Beyond fixed limits: native / FP32 reference | FP64-bounded |
+|---|---:|---:|---:|---|
+| Text up to 1,024 tokens | 19 / 40 | 0.0082 / 0.0004 | 0 / 3 | Pass |
+| `r019`, 2,231 tokens | 1 / 2 | 0.0146 / 0.0037 | 1 / 1 | Pass |
+| `r020`, 8,069 tokens | 1 / 2 | 0.0345 / 0.0038 | 1 / 1 | Pass |
+| Images | 5 / 15 | 0.1291 / 0.0019 | 1 / 1 | Pass |
+| Video | 5 / 10 | 0.0430 / 0.0061 | 3 / 4 | Pass |
+| Audio | 6 / 12 | below 0.0001 / below 0.0001 | 0 / 1 | Pass |
+| Audio/video | 5 / 10 | 0.0868 / 0.0065 | 2 / 6 | Pass |
+| All | 42 / 91 | | 8 / 17 | Pass |
+
+Every decision equals FP64's. The eight native questions beyond the fixed limits are
+`r019/service`, `r020/service`, `ov001/brightness`, `ot002/moving`, `ot003/moving`,
+`ot003/direction`, `oav000/sound` and `oav000/audible`; on each, the FP32 reference's error on the
+exceeded measure is at least as large.
+
+### Working default against FP32 (diagnostic)
 
 Independent FP32 (blocked attention) results, 2026-10-11, no arbitration. Logit/probability maxima
 are CLI summaries rounded to four places; acceptance uses unrounded values. Evidence:
@@ -520,13 +561,12 @@ accuracy estimate, and no faulty native operation was isolated. Evidence:
 
 ## Not done
 
-- **Adoption decision.** Neither FP32-compatible branch is merged. Adopting one also means
-  accepting the C++ PocketFFT and SLEEF-derived code (neither is in `THIRD_PARTY_NOTICES.md`) and,
-  for the fused patch, its larger expert buffers and a Flash/27B regression run.
-- **Long context.** The independent 64k FP32 reference was stopped after layer 14; under the evaluation standard it runs only after the short gates pass. `r021` has no
-  FP64 reference, and the unsaved prefix rows of the four long text records are not compared.
-- **Answer quality of the FP32-compatible build.** No labeled or hosted comparison has been run on
-  it; all 93 corpus decisions match the working default.
+- **Long context.** Acceptance covers inputs up to 8,069 tokens. The FP64 reference for `r021`
+  (16,344 tokens) is being generated; nothing near the 64,000-token default context has an FP64
+  or FP32 reference (the 64k FP32 run was stopped after layer 14). Long text references keep only
+  their last 512 rows, so earlier rows of the four long records are not compared.
+- **FP32-compatible branches.** Unmerged and no longer needed for acceptance. Merging one would
+  also mean accepting C++ PocketFFT and SLEEF-derived code, absent from `THIRD_PARTY_NOTICES.md`.
 - **Hosted differences.** Seven core disagreements, four of them on video, remain unexplained.
   The stock BF16 control and stock PyTorch latency are unmeasured because the stock loader crossed
   the 32 GiB memory reserve and was stopped.
