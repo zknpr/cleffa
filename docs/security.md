@@ -47,9 +47,12 @@ Requests and GGUF files are treated as untrusted:
   (`tests/test_server_encoded_video.py`, `tests/test_cli_errors.py`). `clef-tool`, the host test
   driver, always allows them. libav
   decodes each clip in a child process started without a shell. It inherits only stdin (a private,
-  unlinked copy of the clip), stdout and stderr, and is killed after 30 seconds. libav reads the
+  unlinked copy of the clip), stdout and stderr, gets an empty environment, and is killed after 30
+  seconds. libav reads the
   clip through an in-memory reader and can open no other input: `io_open` is denied, the protocol
-  whitelist is empty and MOV external references are off. Input is capped at 64 MiB, sampled RGB
+  whitelist is empty and MOV external references are off. Only H.264, HEVC, ProRes and MJPEG video
+  and AAC, ALAC, MP3, FLAC, Opus and PCM soundtracks reach a decoder; every other libav decoder
+  stays unreachable (`tests/test_encoded_video.py`). Input is capped at 64 MiB, sampled RGB
   at 256 MiB and its JSON output at 384 MiB
   ([docs/video.md](video.md#encoded-uploads)). This is process isolation, not an OS sandbox:
   the worker runs as the server's user with that user's files and network, so a libav bug reached
@@ -116,7 +119,7 @@ steer decisions is unmeasured. Strict mode removes the channel either way.
 
 ## Silent truncation of long states
 
-Clef reads at most 16,384 tokens per request, and that
+Clef reads at most 16,384 tokens per request (Clef-Omni 64,000), and that
 budget includes the schema and the template. The reference keeps the beginning of a longer state
 and silently drops the rest. With logs, the newest lines are usually at the end, so those are the
 ones lost. Whoever controls early text can also pad it to push later content out of view.
@@ -167,7 +170,7 @@ differently:
   reference decodes any container PyAV opens; `tools/audio_request.py` converts other files);
 - an Omni record whose videos mix soundtracks and silent clips (the reference resolves it by
   discarding the tracks);
-- an image whose resized grid alone exceeds the context (16,384 tokens), refused before any
+- an image whose resized grid alone exceeds the context (16,384 tokens; Omni 64,000), refused before any
   resize or patch allocation (the reference would build the patches and fail on length);
 - images the vendored decoders do not read: 16-bit, low-bit grayscale or interlaced PNGs, CMYK,
   12-bit, lossless, arithmetic-coded or luma-under-chroma-sampled JPEGs, progressive JPEGs whose

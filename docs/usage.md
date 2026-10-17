@@ -281,7 +281,8 @@ cap for source images); `--max-videos N`, `--max-video-frames N` and `--max-vide
 same for videos (default 0, the processor and context bounds). For Omni, `--max-audio N` and
 `--max-audio-samples N` bound clips per request (default 4, soundtracks included) and total samples
 (default 4,800,000, 300 seconds at 16 kHz) on both the CLI and the server; 0 removes that limit
-only.
+only. Every clip is padded to the request's longest, so `--max-audio` also bounds frontend memory
+([Omni report](omni.md#running-it)).
 `--no-encoded-video` makes the CLI refuse MP4/MOV uploads; the server refuses them unless started
 with `--allow-encoded-video`.
 For diagnostics, `CLEF_PROFILE=1` reports GPU time per kernel category (it serializes the GPU,
