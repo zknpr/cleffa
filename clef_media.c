@@ -175,7 +175,7 @@ int main(int argc,char **argv) {
     av_log_set_level(AV_LOG_ERROR);av_max_alloc(64u<<20);
     bool omni=!strcmp(argv[1],"omni"),sample=atoi(argv[4])!=0;
     double target=strtod(argv[2],NULL);int requested=atoi(argv[3]),max_frames=atoi(argv[5]);long pixels=strtol(argv[6],NULL,10);size_t audio_cap=strtoul(argv[7],NULL,10);
-    if(!isfinite(target)||target<=0||target>1000||requested<0||requested>768||max_frames<1||max_frames>768||pixels<1||pixels>16777216||audio_cap<1||audio_cap>9600000)die("invalid worker limits");
+    if(!isfinite(target)||target<=0||target>1000||requested<0||requested>768||max_frames<1||max_frames>768||pixels<1||pixels>16777216||audio_cap>9600000)die("invalid worker limits");
     source src={.data=malloc(INPUT_CAP+1)};if(!src.data)die("out of memory");
     src.n=fread(src.data,1,INPUT_CAP+1,stdin);if(ferror(stdin)||src.n<8||src.n>INPUT_CAP)die("encoded clip must be 8 bytes to 64 MiB");
     AVFormatContext *f=open_source(&src);int index=-1;
@@ -221,6 +221,6 @@ int main(int argc,char **argv) {
         for(int i=0;i<count;i++){snprintf(number,sizeof(number),"%s%d",i?",":"",indices[i]);put(number);}put("]");
     }
     av_frame_free(&frame);av_packet_free(&packet);avcodec_free_context(&ctx);close_source(&f);
-    if(omni)soundtrack(&src,audio_cap,pixels);
+    if(omni&&audio_cap)soundtrack(&src,audio_cap,pixels);  // zero: the model has no audio tower
     put("}\n");free(src.data);if(fflush(stdout))die("output flush failed");return 0;
 }

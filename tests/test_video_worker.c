@@ -24,6 +24,12 @@ int main(void) {
     char *env[]={"/usr/bin/env",NULL};
     assert(worker(NULL,0,env,&out,err,sizeof(err)));
     assert(out.len==0);jbuf_free(&out);
+    /* Separators count against the aggregate cap (64 here): an exact fill used to let the comma
+     * carry the request past it, after which OUTPUT_CAP-used wrapped and admitted any clip. */
+    const size_t head=strlen("{\"videos\":[");
+    assert(clip_fits(head,0,OUTPUT_CAP-head));
+    assert(clip_fits(head+20,1,OUTPUT_CAP-head-21) && !clip_fits(head+20,1,OUTPUT_CAP-head-20));
+    assert(!clip_fits(OUTPUT_CAP,1,0) && !clip_fits(OUTPUT_CAP+1,2,1));
     char *missing[]={"/does-not-exist/clef-media",NULL};
     assert(!worker(NULL,0,missing,&out,err,sizeof(err)));
     assert(strstr(err,"make media"));jbuf_free(&out);

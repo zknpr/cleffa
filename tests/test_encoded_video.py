@@ -100,6 +100,25 @@ class EncodedVideo(unittest.TestCase):
             with self.subTest(family=family):
                 self.assertEqual(self.native({**request, 'media_kwargs': None}, family), self.native(request, family))
 
+    def test_omni_without_audio_tower_ignores_soundtracks(self):
+        # As for the dense models, an Omni export without the audio tower takes a soundtracked
+        # upload as its frames; the worker does not decode the soundtrack at all.
+        model = Path(self.tmp.name) / 'omni-vision.gguf'
+        subprocess.run([sys.executable, '-B', ROOT / 'tools/convert.py', ROOT / 'model-omni', model,
+                        '--modalities', 'vision', '--vocab-only'], capture_output=True, check=True)
+        request = {'model': 'clef', 'state': 'test', 'questions': {'q': {'type': 'noul'}}}
+        encoded = {}
+        for audio in (True, False):
+            self.clip(audio=audio)
+            payload = base64.b64encode(self.path.read_bytes()).decode()
+            result = subprocess.run([TOOL, 'encode', model], capture_output=True, text=True, timeout=45, check=True,
+                                    input=json.dumps({**request, 'videos': [{'content_type': 'video/quicktime',
+                                                                             'base64': payload}]}) + '\n')
+            self.assertFalse(result.stdout.startswith('ERR'), result.stdout)
+            encoded[audio] = json.loads(result.stdout)
+            self.assertFalse(encoded[audio].get('audio'))
+        self.assertEqual(encoded[True]['input_ids'], encoded[False]['input_ids'])
+
     def test_soundtrack_codec_allowlist(self):
         # Every decoder libav links is attack surface in the worker, which has the server's
         # privileges: like video, soundtracks are limited to the codecs MP4/MOV carry in practice.

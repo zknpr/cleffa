@@ -71,7 +71,9 @@ H.264, HEVC, ProRes and MJPEG are supported. Dense sampling preserves source ind
 and FPS. Omni samples by presentation timestamps at 2 FPS, applies the pinned
 262,144-pixel decode bound, duplicates an odd last frame and includes a mono 16 kHz
 float soundtrack, from AAC, ALAC, MP3, FLAC, Opus or PCM; other audio codecs are refused
-(the reference decodes any that PyAV opens). Processor options retain their existing validation rules.
+(the reference decodes any that PyAV opens). An Omni model file exported without the audio tower
+takes the frames and ignores the soundtrack, as the dense models do. Processor options retain their
+existing validation rules.
 
 The parent owns a bounded, private input snapshot and starts the worker without a
 shell. The worker uses custom in-memory AVIO, forces the MOV demuxer, disables

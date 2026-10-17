@@ -23,6 +23,12 @@
 #define DECODE_SECONDS 30
 #endif
 static bool error(char *err,size_t n,const char *s) { snprintf(err,n,"encoded video: %s",s);return false; }
+/* Whether a decoded clip of len bytes, after `used` bytes of the combined request and its
+ * separator, stays within the aggregate output cap. Ignoring the separator let an exact fill
+ * carry `used` past the cap, after which OUTPUT_CAP-used wrapped and admitted any clip. */
+static bool clip_fits(size_t used,size_t i,size_t len) {
+    return used<=OUTPUT_CAP && len<=OUTPUT_CAP-used && (i?1u:0u)<=OUTPUT_CAP-used-len;
+}
 static double now(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9; }
 static bool number(const jval *v,double *out) {
     if(!v||(v->type!=J_INT&&v->type!=J_FLOAT))return false;
@@ -140,7 +146,9 @@ bool clef_video_expand(const jval *request,clef_encode_opts opts,clef_video_requ
     snprintf(rate,sizeof(rate),"%.17g",fps);snprintf(count,sizeof(count),"%d",requested);
     snprintf(frames,sizeof(frames),"%d",opts.vision.max_video_frames>0&&opts.vision.max_video_frames<768?opts.vision.max_video_frames:768);
     snprintf(pixels,sizeof(pixels),"%ld",opts.vision.max_image_pixels>0&&opts.vision.max_image_pixels<16777216?opts.vision.max_image_pixels:16777216L);
-    size_t cap=opts.audio.max_samples?opts.audio.max_samples:9600000;if(cap>9600000)cap=9600000;
+    /* Zero: no soundtrack. A model file without the audio tower takes soundtracked uploads as
+     * their frames, as the dense models do, and the worker never decodes the track. */
+    size_t cap=!omni||!opts.audio.token_id?0:opts.audio.max_samples?opts.audio.max_samples:9600000;if(cap>9600000)cap=9600000;
     snprintf(samples,sizeof(samples),"%zu",cap);
     char *argv[]={resolved,omni?"omni":"dense",rate,count,sample?"1":"0",frames,pixels,samples,NULL};
     jbuf result={0};jbuf_puts(&result,"{\"videos\":[");out->arena=jarena_new();if(!out->arena)return error(err,errlen,"out of memory");
@@ -150,7 +158,7 @@ bool clef_video_expand(const jval *request,clef_encode_opts opts,clef_video_requ
         if(!envelope(videos->items[i],&bytes,&n,err,errlen))goto done;
         bool success=worker(bytes,n,argv,&decoded,err,errlen);free(bytes);
         if(!success){jbuf_free(&decoded);goto done;}
-        if(decoded.len>OUTPUT_CAP-result.len){jbuf_free(&decoded);error(err,errlen,"total decoded output exceeds 384 MiB");goto done;}
+        if(!clip_fits(result.len,i,decoded.len)){jbuf_free(&decoded);error(err,errlen,"total decoded output exceeds 384 MiB");goto done;}
         jval *video=json_parse(out->arena,decoded.p,decoded.len,err,errlen);
         if(!video){jbuf_free(&decoded);goto done;}
         tracks+=json_get(video,"audio")!=NULL;
