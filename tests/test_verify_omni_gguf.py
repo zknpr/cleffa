@@ -91,6 +91,11 @@ class VerifyOmni(unittest.TestCase):
         self.verify(self.rewrite(change=("blk.0.ffn_down_exps.weight", lambda x: x ^ 1)), "payload")
         self.verify(self.rewrite(change=("output_norm.weight", lambda x: x+1)), "payload")
 
+    def test_f32_payload_compares_bits(self):
+        # +0.0 and -0.0 are equal as floats; the export must hold the converter's exact bytes.
+        flip = lambda x: np.where(x == 0, np.float32(-0.0), x)
+        self.verify(self.rewrite(change=("blk.0.attn_norm.weight", flip)), "payload")
+
     def test_invalid_metadata(self):
         for key, value in (("clef.format_version", 2), ("clef.capabilities", 5),
                            ("clef.context_default", 65537), ("clef.moe.expert_used_count", 3),

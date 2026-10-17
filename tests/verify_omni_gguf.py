@@ -178,7 +178,8 @@ def verify_omni(model_dir: Path, path: Path) -> None:
             if tensor.tensor_type != kind or (expected_dtype is not None and kind != expected_dtype):
                 raise ValueError(f"{tensor.name}: dtype mismatch")
             expected_dtype = kind
-            want = x.contiguous().view(torch.int16).numpy().view(np.uint16).reshape(-1) if x.dtype == torch.bfloat16 else x.numpy().reshape(-1)
+            # Compare bits for both types: as floats, +0.0 equals -0.0.
+            want = x.contiguous().view(torch.int16).numpy().view(np.uint16).reshape(-1) if x.dtype == torch.bfloat16 else x.numpy().reshape(-1).view(np.uint32)
             raw = tensor.data.reshape(-1).view(want.dtype)
             if offset+want.size > raw.size:
                 raise ValueError(f"{tensor.name}: shape/payload too short")
