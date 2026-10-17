@@ -374,7 +374,6 @@ test: clef-tool clef-server tests/test-dump tests/test-base64 tests/test-vision-
 	.venv/bin/python -B tests/test_labeled_eval.py
 	.venv/bin/python -B tests/test_stock_request.py
 	.venv/bin/python -B tests/test_checkout_latency.py
-	.venv/bin/python -B tests/test_evidence_archive.py
 
 test-errors: all tests/test-metal-errors tests/test-cli-alloc
 	.venv/bin/python -B tests/test_cli_errors.py gguf/clef-flash.gguf

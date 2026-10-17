@@ -23,14 +23,10 @@ section.
 | [video.md](video.md) | Video: frame-array input, encoded MP4/MOV uploads through the optional `clef-media` worker, sampling, timestamps and frame pairs, the offline converter and its isolation, host and FP32-oracle parity on the video corpus, costs, limits and divergences |
 | [omni.md](omni.md) | Clef-Omni: status and the open adoption decision between the fast default and the FP32-compatible branches, running it, architecture, the verification policy, results against the FP32 and FP64 references, where the error comes from, latency, hosted and labeled agreement |
 
-**Evidence archive.** `tools/evidence_archive.py OUT.tar.gz` packs the checkable part of
-`golden/` for publication as a release asset (`cleffa-evidence-<date>.tar.gz`): result,
-manifest, sample and log files, experiment sources, saved logits, and the small files of the
-oracle directories so `tests/test_parity.py` runs without a PyTorch pass. It drops binaries,
-Instruments traces, tensors, environments, the ds4 upstream clone, Cloudflare account dumps
-and every private-workload file, rewrites the local checkout path, home directory and
-account name to placeholders, records before/after hashes per file in `manifest.json`, and
-fails if any forbidden string survives. `--list` shows the selection without writing.
+**Checking a result.** The `golden/` directories the reports cite are the maintainer's local
+record and are not published. A result is checked by reproducing it: the oracles in `ref/`
+regenerate the reference outputs, and the tests and scripts each report names compare the
+engine with them.
 
 Conventions shared by every report: one GPU job at a time on the one tested M5 Max; paired
 ABBA quartets inside one resident process for any claimed engine speedup (comparisons with

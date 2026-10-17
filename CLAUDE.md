@@ -116,9 +116,6 @@ make clean
   decoders can reach from a file as a bug even when the output is clamped, and any pixel that
   differs from libjpeg on a file it decodes without warnings as a parity bug: sanitizers and plain
   fuzzing never catch the second kind.
-- `tools/evidence_archive.py OUT.tar.gz` builds the publishable evidence archive from `golden/`
-  (rules and placeholders in its docstring; `--list` previews). Publishing it as a release asset is
-  a release step and needs explicit approval. `tests/test_evidence_archive.py` covers the rules.
 - Python always runs through `.venv/bin/python` (Python 3.12, torch 2.11, transformers 5.10.2,
   tokenizers 0.22.2). `pyrightconfig.json` points at it.
 
