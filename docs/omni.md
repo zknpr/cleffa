@@ -221,6 +221,20 @@ Model-free checks: `make test-omni-attention test-omni-router test-omni-moe test
 test-omni-deepstack test-omni-audio test-omni-buffers test-audio`. The Python suites are
 `tests/test_omni_*.py`; `tests/test_omni_qualification.py` is the qualification runner below.
 
+`tests/fuzz_audio.c` (`make fuzz-audio`, Homebrew LLVM, ASan and UBSan) fuzzes the request audio
+path: WAV files, sample arrays, data URLs, base64 objects and video soundtracks under item, sample
+and context budgets, the mel frontend over clips of different lengths, the tower's chunk layout,
+and audio/visual token placement and positions. Besides memory errors it fails on non-finite
+features, a layout that does not cover exactly the record's audio tokens, an accepted encode
+beyond `max_length`, an audio placeholder not owned by exactly one clip token, and refused
+positions for a record the encoder placed. A 15-minute run on 2026-10-17 (138 million inputs from
+27 seeds, `tests/fuzz_audio_seeds.py`) found nothing. Its corpus executes every line of
+`clef_audio.c` and `clef_record_omni.c` that request input can reach except the per-clip
+"audio exceeds context" refusal, which needs a clip far larger than a fuzz input; the other
+unexecuted lines are the GGUF loader, caller-contract checks and out-of-memory exits
+(`golden/fuzz-audio-20261017/`). The libav worker behind encoded uploads is not fuzzed; its
+output re-enters through the fuzzed WAV and PNG paths.
+
 ## Numerical verification policy
 
 Hosted decision agreement and labeled accuracy are the headline evaluation metrics. Numerical

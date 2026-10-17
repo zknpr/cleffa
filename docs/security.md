@@ -67,7 +67,8 @@ Requests and GGUF files are treated as untrusted:
   16 kHz PCM16 or float32 with no non-finite sample. Each clip's sample cap, the smaller of the
   remaining `--max-audio-samples` budget and what the remaining context can hold, is checked before
   it is decoded. `--max-audio` bounds clips per request, and audio requests take
-  `--max-image-requests` slots like images.
+  `--max-image-requests` slots like images. `make fuzz-audio` covers this path through token
+  placement; a 15-minute run found nothing ([Omni report](omni.md#source-files-and-tests)).
 - **Server exposure:** the server binds to localhost by default. Exposing it with `--host` puts
   the GPU behind one FIFO queue. A long request (16k tokens takes ~7 s on clef-flash) is never
   co-batched with short ones, but it does delay everything queued behind it. Connection slots

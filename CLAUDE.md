@@ -249,6 +249,9 @@ make fuzz-image && .venv/bin/python -B tests/fuzz_image_seeds.py fuzz/seeds
 # differential: decoder vs libjpeg-turbo, pixel for pixel (Homebrew jpeg-turbo), and the encoder corpus
 make fuzz-jpeg-diff && ./fuzz-jpeg-diff -dict=tests/fuzz_image.dict -fork=14 -ignore_crashes=1 -max_total_time=1200 -artifact_prefix=fuzz/artifacts-diff/ fuzz/corpus-diff fuzz/seeds
 make test-image-diff
+# Omni audio requests: WAV/sample/base64 forms and budgets, mel frontend, chunk layout, token placement
+make fuzz-audio && .venv/bin/python -B tests/fuzz_audio_seeds.py fuzz/audio-seeds
+./fuzz-audio -dict=tests/fuzz_audio.dict -max_len=65536 -fork=8 -ignore_crashes=1 -max_total_time=900 -artifact_prefix=fuzz/artifacts-audio/ fuzz/corpus-audio fuzz/audio-seeds
 
 # invariants
 tests/test_batch.sh  gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # batch invariance + tenant isolation

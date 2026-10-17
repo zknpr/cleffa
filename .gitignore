@@ -70,6 +70,7 @@ __pycache__/
 /tests/test-jpeg-ub
 /fuzz-image
 /fuzz-jpeg-diff
+/fuzz-audio
 /fuzz/
 /tests/vision-config/
 /gemm-tiles

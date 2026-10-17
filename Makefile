@@ -247,6 +247,14 @@ fuzz-jpeg-diff: tests/fuzz_jpeg_diff.c clef_image.c clef_image.h third_party/iri
 	@test -f "$(JPEG_TURBO)/lib/libjpeg.a" || { echo "fuzz-jpeg-diff: no libjpeg.a under $(JPEG_TURBO) (brew install jpeg-turbo, or set JPEG_TURBO)"; exit 1; }
 	$(FUZZ_CC) -isysroot $$(xcrun --show-sdk-path) -O1 -g -std=c11 -D_DARWIN_C_SOURCE -I$(JPEG_TURBO)/include -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -o $@ tests/fuzz_jpeg_diff.c $(JPEG_TURBO)/lib/libjpeg.a -lz
 
+# libFuzzer target for the untrusted-audio path (tests/fuzz_audio.c): WAV parsing, the request forms
+# and their budgets, the mel frontend, the tower's chunk layout and audio/visual token placement.
+# It includes clef_record_omni.c (tokenizer stubbed) and builds the other host sources instrumented.
+FUZZ_AUDIO_SRCS = $(filter-out clef_record_omni.c,$(HOST_OBJS:.o=.c))
+fuzz-audio: tests/fuzz_audio.c clef_record_omni.c clef_record_omni.h clef_record.h clef_audio.h clef_audio_tables.inc $(FUZZ_AUDIO_SRCS)
+	@test -n "$(FUZZ_CC)" || { echo "fuzz-audio: no Homebrew LLVM clang found (brew install llvm, or set FUZZ_CC)"; exit 1; }
+	$(FUZZ_CC) -isysroot $$(xcrun --show-sdk-path) -O1 -g -std=c11 -D_DARWIN_C_SOURCE -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=all -o $@ tests/fuzz_audio.c $(FUZZ_AUDIO_SRCS) -lz
+
 # Includes clef_image.c; crafted JPEGs under UBSan and ASan (each aborted before the jpeg.h fixes).
 tests/test-jpeg-ub: tests/test_jpeg_ub.c clef_image.c clef_image.h third_party/iris/jpeg.h third_party/iris/png.h
 	$(CC) $(CFLAGS) $(DEPFLAGS) -fsanitize=undefined,address -fno-sanitize-recover=all -o $@ tests/test_jpeg_ub.c $(LDFLAGS) $(LDLIBS)
@@ -390,6 +398,6 @@ clean:
 	rm -f tests/audio-layout tests/test-omni-audio tests/test-audio-buffers tests/audio-tower tests/test-audio-record
 	rm -f tests/audio-frontend-probe tests/test-audio-frontend
 	rm -f tests/test-omni-config tests/test-omni-attention tests/test-omni-assign tests/test-omni-moe tests/test-omni-buffers tests/test-omni-router tests/test-omni-positions tests/test-omni-deepstack
-	rm -f *.o *.d tests/*.o tests/*.d tests/test-dense-buffers tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image fuzz-jpeg-diff clef clef-server clef-tool attention-bench omni-attention-bench vision-attention-bench vision-gemm-bench image-bench video-host-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-load tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
+	rm -f *.o *.d tests/*.o tests/*.d tests/test-dense-buffers tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image fuzz-jpeg-diff fuzz-audio clef clef-server clef-tool attention-bench omni-attention-bench vision-attention-bench vision-gemm-bench image-bench video-host-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-load tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
 
 -include $(wildcard *.d tests/*.d)
