@@ -118,48 +118,6 @@ class OmniOracle(unittest.TestCase):
             torch.testing.assert_close(x, y, atol=0, rtol=0)
             self.assertTrue(all(t.shape[0] == 3 for t in dump.values()))
 
-    def test_checked_routes_preserve_matching_execution_and_cleanup(self):
-        expected, dumps = omni.stream_text(self.model, self.inputs)
-        routes = [torch.stack([d[f'routing.{i:02d}.ids'] for i in range(2)]) for d in dumps]
-        events = []
-        got, _ = omni.stream_text(self.model, self.inputs, native_routes=routes,
-                                   record_ids=['a','b'], arbitration_events=events)
-        self.assertEqual(events, [])
-        for a,b in zip(expected,got): torch.testing.assert_close(a,b,atol=0,rtol=0)
-        with patch('omni_arbitration.arbitrate', side_effect=ValueError('FP64 rejects')):
-            with self.assertRaisesRegex(ValueError, 'FP64 rejects'):
-                omni.stream_text(self.model, self.inputs, native_routes=routes,
-                                  record_ids=['a','b'], arbitration_events=[])
-        for module in self.model.modules(): self.assertFalse(module._forward_hooks)
-        self.assertTrue(all(p.dtype == torch.bfloat16 for p in self.model.parameters()))
-
-    def test_native_activation_callback_uses_matching_layer_input(self):
-        import omni_arbitration
-        expected,dumps=omni.stream_text(self.model,self.inputs)
-        routes=[torch.stack([d[f'routing.{i:02d}.ids'] for i in range(2)]) for d in dumps]
-        activations=[torch.stack([d['embed'],d['layer.00'],d['layer.01']]).numpy() for d in dumps]
-        seen=[]
-        original=omni_arbitration.arbitrate
-        def check(output,native,calculate,events,**kwargs):
-            rows=torch.tensor([0,len(output[0])-1])
-            high,metrics=kwargs['calculate_native'](rows)
-            torch.testing.assert_close(high,calculate(rows),atol=0,rtol=0)
-            self.assertEqual(metrics['incoming_relative_l2'],0)
-            seen.append((kwargs['record'],kwargs['layer']))
-            return original(output,native,calculate,events,**kwargs)
-        with patch('omni_arbitration.arbitrate',side_effect=check):
-            got,_=omni.stream_text(self.model,self.inputs,native_routes=routes,native_activations=activations,
-                                    record_ids=['a','b'],arbitration_events=[])
-        self.assertEqual(seen,[('a',0),('b',0),('a',1),('b',1)])
-        for a,b in zip(expected,got): torch.testing.assert_close(a,b,atol=0,rtol=0)
-        activations[0][0].fill(float('nan'))
-        with patch('omni_arbitration.arbitrate',side_effect=check):
-            with self.assertRaisesRegex(ValueError,'incoming activation'):
-                omni.stream_text(self.model,self.inputs,native_routes=routes,native_activations=activations,
-                                 record_ids=['a','b'],arbitration_events=[])
-        for module in self.model.modules(): self.assertFalse(module._forward_hooks)
-        self.assertTrue(all(p.dtype==torch.bfloat16 for p in self.model.parameters()))
-
     def test_failed_generation_does_not_publish(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp)/"golden"
@@ -174,31 +132,6 @@ class OmniOracle(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 with omni.golden_directory(dest):
                     pass
-
-    def test_rounding_callback_receives_native_input_and_rotary_positions(self):
-        import omni_arbitration
-        expected,dumps=omni.stream_text(self.model,self.inputs)
-        routes=[torch.stack([d[f'routing.{i:02d}.ids'] for i in range(2)]) for d in dumps]
-        activations=[torch.stack([d['embed'],d['layer.00'],d['layer.01']]).numpy() for d in dumps]
-        seen=[]
-        def audit(record,number,layer,incoming,pe,rows,positions):
-            index=['a','b'].index(record)
-            self.assertIs(layer,self.model.layers[number])
-            self.assertTrue((incoming==activations[index][number]).all())
-            torch.testing.assert_close(positions.cpu(),torch.arange(len(incoming)).view(1,1,-1).expand(3,1,-1))
-            seen.append((record,number))
-            return omni_arbitration.fp64_router(layer,torch.from_numpy(incoming)[None],pe,rows),[{} for _ in rows]
-        original=omni_arbitration.arbitrate
-        def check(output,native,calculate,events,**kwargs):
-            rows=torch.tensor([0,len(output[0])-1])
-            high,_=kwargs['calculate_rounding'](rows)
-            torch.testing.assert_close(high,calculate(rows),atol=0,rtol=0)
-            return original(output,native,calculate,events,**kwargs)
-        with patch('omni_arbitration.arbitrate',side_effect=check):
-            got,_=omni.stream_text(self.model,self.inputs,native_routes=routes,native_activations=activations,
-                                  record_ids=['a','b'],arbitration_events=[],rounding_auditor=audit)
-        self.assertEqual(seen,[('a',0),('b',0),('a',1),('b',1)])
-        for a,b in zip(expected,got): torch.testing.assert_close(a,b,atol=0,rtol=0)
 
 
 if __name__ == "__main__":

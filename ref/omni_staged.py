@@ -70,7 +70,7 @@ def move(value, device):
 def load_state(stage, device):
     import torch
     if not stage['input']:
-        return {}, None, []
+        return {}
     if digest(stage['input']) != stage['input_sha256']:
         raise ValueError('decoder checkpoint hash mismatch')
     saved = torch.load(stage['input'], map_location='cpu', weights_only=True)
@@ -81,17 +81,16 @@ def load_state(stage, device):
         raise ValueError('decoder checkpoint belongs to another stage')
     for key in ('hidden', 'extras'):
         state[key] = move(state[key], device)
-    return state, saved['native_routes'], saved['events']
+    return state
 
 
-def save_state(stage, state, routes, events):
+def save_state(stage, state):
     import torch
     output = Path(stage['output'])
     if output.exists():
         raise ValueError('refusing to replace a decoder checkpoint')
     with output.open('xb') as target:
-        torch.save(dict(state=move(state, 'cpu'), native_routes=routes, events=events,
-                        policy_sha256=stage['policy_sha256']), target)
+        torch.save(dict(state=move(state, 'cpu'), policy_sha256=stage['policy_sha256']), target)
 
 
 def run(args):
@@ -151,9 +150,7 @@ def worker(job_path, expected_hash):
         if digest(path) != expected:
             raise ValueError('reference source changed during staged execution')
     values = job['arguments']
-    for key in ('model_dir', 'arbitrate_routes', 'arbitrate_activations', 'arbitrate_rounding'):
-        if values.get(key) is not None:
-            values[key] = Path(values[key])
+    values['model_dir'] = Path(values['model_dir'])
     args = SimpleNamespace(**values, _stage=job['stage'])
     import omni
     omni.run(args, streamed=True)

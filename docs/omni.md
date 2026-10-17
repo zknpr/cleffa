@@ -283,12 +283,12 @@ compares it with the branch base. Long text references keep the last 512 rows pe
 **Routing is a diagnostic.** The reference always computes expert choices, outputs and mixture
 weights from its own activations; native logits, activations or choices never enter it. Reports
 give ordered-choice and selected-set difference rates, neither of which is a gate. The FP64
-arbitration options (`--arbitrate-routes`, `--arbitrate-activations`, `--arbitrate-rounding`,
-`--arbitrate-input-shift`) remain available as disclosed diagnostics; the qualification runner
-rejects arbitrated or mixed-policy references. Earlier arbitrated goldens
+route-arbitration options, which settled near-tied FP32 routes using native inputs, were removed
+on 2026-10-17: the independent FP64 lane supersedes them. The qualification runner still rejects
+arbitrated or mixed-policy references, so the earlier arbitrated goldens
 (`golden/clef-omni-text-f32-arbitrated`, `golden/clef-omni-vision-f32-residual-order`,
 `golden/clef-omni-video-f32-input-shift`, `golden/clef-omni-audio-f32-arbitrated`,
-`golden/clef-omni-av-f32-arbitrated`) predate this policy and do not qualify.
+`golden/clef-omni-av-f32-arbitrated`) do not qualify.
 
 **Audio frontend contract.** Sample bytes, padding, masks, token counts and positions must be
 exactly equal. Features may differ from the pinned FP32 processor by at most `5e-5` absolute and

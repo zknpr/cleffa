@@ -67,10 +67,8 @@ def float_module(module,pager,prefix):
 
 
 @torch.inference_mode()
-def stream_text(text_model, inputs, *, dump_last=0, dump_count=None, native_routes=None,
-                record_ids=None, arbitration_events=None, prepared=None, native_activations=None,
-                rounding_auditor=None, allow_input_shift=False, weight_pager=None,
-                stage_state=None, layer_stop=None):
+def stream_text(text_model, inputs, *, dump_last=0, dump_count=None, prepared=None,
+                weight_pager=None, stage_state=None, layer_stop=None):
     """Layer-major FP32 prefill; only one decoder layer is upcast at a time.
 
 The source model retains BF16 weights. Its embedding lookup is byte-exact before
@@ -121,20 +119,8 @@ upcasting; all arithmetic, routing and residual updates after that use FP32.
             continue
         with float_module(layer,weight_pager,f'thinker.model.layers.{li}'):
             for i, (mask, pe, pos, visual_mask, visual_extra, rotary_pos) in enumerate(extras):
-                hook = arb_hook = None
+                hook = None
                 try:
-                    if native_routes is not None:
-                        from omni_arbitration import arbitrate, fp64_router, fp64_native_router
-                        def checked_route(module, args, output, before=hidden[i], pe=pe, i=i, li=li, layer=layer, rotary_pos=rotary_pos):
-                            checked_native = None if native_activations is None else (
-                                lambda rows: fp64_native_router(layer,before,pe,rows,native_activations[i][li]))
-                            checked_rounding = None if rounding_auditor is None else (
-                                lambda rows: rounding_auditor(record_ids[i],li,layer,native_activations[i][li],pe,rows,rotary_pos))
-                            return arbitrate(output, native_routes[i][li],
-                                             lambda rows: fp64_router(layer, before, pe, rows),
-                                             arbitration_events, layer=li, record=record_ids[i], calculate_native=checked_native,
-                                             calculate_rounding=checked_rounding,allow_input_shift=allow_input_shift)
-                        arb_hook = layer.mlp.gate.register_forward_hook(checked_route)
                     if i < count:
                         hook = layer.mlp.gate.register_forward_hook(
                             lambda m, a, o, i=i, li=li: _routing(o, dumps[i], li, dump_last))
@@ -147,8 +133,6 @@ upcasting; all arithmetic, routing and residual updates after that use FP32.
                 finally:
                     if hook:
                         hook.remove()
-                    if arb_hook:
-                        arb_hook.remove()
         if hidden and hidden[0].device.type == "mps":
             torch.mps.synchronize()
             torch.mps.empty_cache()
@@ -242,36 +226,7 @@ def run(args, *, streamed):
         raise ValueError('Omni long corpus no longer encodes to exactly 64000 tokens')
     batches = [collate_records([enc], tok.pad_token_id, torch.device(args.device)) for enc in encoded]
     logits_out, layer_dumps = {}, []
-    native_routes, native_activations, arbitration_events = None, None, []
-    stage_state = None
-    if stage:
-        stage_state, native_routes, arbitration_events = omni_staged.load_state(stage, args.device)
-    route_dir = getattr(args, "arbitrate_routes", None)
-    activation_dir = getattr(args,'arbitrate_activations',None)
-    rounding_dir = getattr(args,'arbitrate_rounding',None)
-    allow_input_shift = getattr(args,'arbitrate_input_shift',False)
-    rounding_auditor = None
-    if rounding_dir and not activation_dir:
-        raise ValueError('--arbitrate-rounding requires --arbitrate-activations')
-    if activation_dir and not route_dir:
-        raise ValueError('--arbitrate-activations requires --arbitrate-routes')
-    if allow_input_shift and not activation_dir:
-        raise ValueError('--arbitrate-input-shift requires --arbitrate-activations')
-    if route_dir:
-        if not streamed:
-            raise ValueError("FP64 route arbitration requires streamed FP32 execution")
-        from omni_arbitration import load_routes
-        if native_routes is None:
-            native_routes = [load_routes(route_dir/(r['id']+'.jsonl'), len(tm.layers), len(e.input_ids),
-                                         tm.config.num_experts, tm.config.num_experts_per_tok)
-                             for r, e in zip(requests, encoded)]
-        if activation_dir:
-            from omni_arbitration import load_activations
-            native_activations = [load_activations(activation_dir/(r['id']+'.bin'),len(tm.layers),len(e.input_ids),tm.config.hidden_size)
-                                  for r,e in zip(requests,encoded)]
-            if rounding_dir:
-                from omni_rounding import RoundingAuditor
-                rounding_auditor = RoundingAuditor(rounding_dir,activation_dir,route_dir)
+    stage_state = omni_staged.load_state(stage, args.device) if stage else None
     intermediate = stage and stage['stop'] < len(tm.layers)
     destination = nullcontext(None) if intermediate else golden_directory(root/"golden"/args.name)
     with destination as out, torch.inference_mode():
@@ -284,15 +239,12 @@ def run(args, *, streamed):
                     prepared=prepare_vision(model.thinker,batches)
                 else:prepared=None
             hidden, layer_dumps = stream_text(tm, batches, dump_last=args.dump_last, dump_count=args.dump_layers,
-                                             native_routes=native_routes, record_ids=[r['id'] for r in requests],
-                                             arbitration_events=arbitration_events, prepared=prepared,
-                                             native_activations=native_activations,rounding_auditor=rounding_auditor,
-                                             allow_input_shift=allow_input_shift,weight_pager=weight_pager,
+                                             prepared=prepared, weight_pager=weight_pager,
                                              stage_state=stage_state,layer_stop=stage['stop'] if stage else None)
             if stage:
                 omni_staged.check_snapshot(args.model_dir, stage['snapshot_inventory'])
             if intermediate:
-                omni_staged.save_state(stage, stage_state, native_routes, arbitration_events)
+                omni_staged.save_state(stage, stage_state)
                 return
             with weight_pager.materialize(model.head,'',head=True), weight_pager.materialize(model.output_embeddings,'thinker.lm_head'):
                 output_weight = model.output_embeddings.weight
@@ -328,7 +280,7 @@ def run(args, *, streamed):
                         records=[dict(id=r["id"], tokens=len(e.input_ids),
                                       dump_start=max(0, len(e.input_ids)-args.dump_last) if args.dump_last else 0,
                                       dumped=bool(d)) for r, e, d in zip(requests, encoded, layer_dumps)])
-        manifest['independent_from_native'] = native_routes is None and native_activations is None
+        manifest['independent_from_native'] = True
         manifest['attention_reference'] = dict(value_reduction=attention_reference or
                 ('legacy-auto' if args.safe_attn else 'stock'), first_layer=0,
                 value_block=safe_attn.VALUE_BLOCK, score_elements=safe_attn.SCORE_ELEMENTS)
@@ -342,22 +294,6 @@ def run(args, *, streamed):
                 manifest['memory']['layers_per_subprocess'] = args.stage_layers
                 manifest['reference_sources_sha256'] = stage['sources']
                 manifest['reference_policy_sha256'] = stage['policy_sha256']
-        if native_routes is not None:
-            manifest['arbitration'] = dict(method='independent-cpu-fp64-layer-attention-and-router',
-                                           accepted=len(arbitration_events), report='arbitration.json',
-                                           native_route_ids_sha256={r['id']: hashlib.sha256(route.numpy().astype('<i8').tobytes()).hexdigest()
-                                                                    for r, route in zip(requests, native_routes)})
-            (out/'arbitration.json').write_text(json.dumps(arbitration_events, indent=2)+'\n')
-            if native_activations is not None:
-                manifest['arbitration']['input_sensitive'] = sum(e['method']=='input-sensitive' for e in arbitration_events)
-                manifest['arbitration']['local_rounding'] = sum(e['method']=='local-rounding' for e in arbitration_events)
-                manifest['arbitration']['input_shift_eligibility_enabled'] = allow_input_shift
-                manifest['arbitration']['input_shift_eligibility'] = sum(e['eligibility']=='input-shift' for e in arbitration_events)
-                hashes = {}
-                for request in requests:
-                    with (activation_dir/(request['id']+'.bin')).open('rb') as capture:
-                        hashes[request['id']] = hashlib.file_digest(capture,'sha256').hexdigest()
-                manifest['arbitration']['native_activations_sha256'] = hashes
         if stage:
             omni_staged.check_snapshot(args.model_dir, stage['snapshot_inventory'])
             for path, expected in stage['sources'].items():

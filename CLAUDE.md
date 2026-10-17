@@ -573,8 +573,8 @@ For Omni MoE, routing choices and flip rates are diagnostics, not acceptance gat
 Near-tied top-8 routing makes fixed per-layer FP32 gates unattainable for any FP32
 implementation, so Omni is accepted against FP64, bounded per question by the FP32
 reference's own error (`--bound-by`; see the top of this file and `docs/omni.md`).
-Keep FP64 arbitration available as an optional diagnostic; the FP32 bound reference
-must run independently of native routing choices. Label that reference
+The FP32 bound reference must run independently of native routing choices (the
+native-input FP64 route arbitration was removed 2026-10-17). Label that reference
 "FP32 reference (blocked attention)". Dense `--safe-attn` retains its original
 head-only splitting. Omni qualification uses `--omni-attention blocked` on
 `ref/oracle_f32_stream.py` at every input length; `--omni-attention sdpa` selects

@@ -43,10 +43,6 @@ def main() -> None:
                     help="Omni FP32 reference: explicit blocked P@V at all lengths, or bounded SDPA control")
     ap.add_argument("--only", nargs="*", help="request ids to run (default: all); all of them are dumped")
     ap.add_argument("--dump-last", type=int, default=0, help="dump only the last N token rows per layer")
-    ap.add_argument("--arbitrate-routes", type=Path, help="Omni: full native ID traces, checked at disputed near ties by CPU FP64")
-    ap.add_argument("--arbitrate-activations", type=Path, help="Omni: full native residual dumps for bounded input-sensitive FP64 arbitration")
-    ap.add_argument("--arbitrate-rounding", type=Path, help="Omni: capture and audit local one-ULP ties in this artifact directory")
-    ap.add_argument("--arbitrate-input-shift", action="store_true", help="Omni: audit eligibility using independent FP64 incoming-state score shifts")
     ap.add_argument("--corpus", default="text", choices=["text", "vision", "video", "omni-vision", "omni-video", "omni-long", "audio", "omni-av"])
     ap.add_argument('--stage-layers', type=int, default=0, help='Omni: reset MPS graph caches in lossless subprocess stages')
     args = ap.parse_args()
@@ -61,8 +57,6 @@ def main() -> None:
 
     if args.omni_attention:
         ap.error("--omni-attention requires Omni")
-    if args.arbitrate_routes or args.arbitrate_activations or args.arbitrate_rounding or args.arbitrate_input_shift:
-        ap.error("--arbitrate-routes requires Omni")
 
     sys.path.insert(0, str(args.model_dir.resolve()))
     from joint_schema_model import collate_records, encode_record, load_release_model

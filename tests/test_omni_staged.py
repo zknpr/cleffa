@@ -80,14 +80,11 @@ class StagedOracle(unittest.TestCase):
             path = Path(tmp) / 'state.pt'
             state = dict(next_layer=4, hidden=[torch.randn(1, 11, 8)],
                          extras=[(None, torch.randn(1, 11, 4))], dumps=[{'embed': torch.randn(11, 8)}])
-            routes = torch.arange(16).reshape(2, 8)
-            save_state({'output': path, 'policy_sha256': 'blocked-from-zero'}, state, routes, [{'method': 'example'}])
+            save_state({'output': path, 'policy_sha256': 'blocked-from-zero'}, state)
             stage = dict(input=path, input_sha256=digest(path), first=4, policy_sha256='blocked-from-zero')
-            got, got_routes, events = load_state(stage, 'cpu')
+            got = load_state(stage, 'cpu')
             self.assertTrue(torch.equal(got['hidden'][0], state['hidden'][0]))
             self.assertTrue(torch.equal(got['dumps'][0]['embed'], state['dumps'][0]['embed']))
-            self.assertTrue(torch.equal(got_routes, routes))
-            self.assertEqual(events, [{'method': 'example'}])
             with self.assertRaisesRegex(ValueError, 'reference policy'):
                 load_state({**stage, 'policy_sha256': 'different-attention'}, 'cpu')
             with self.assertRaisesRegex(ValueError, 'another stage'):
@@ -97,7 +94,7 @@ class StagedOracle(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'hash mismatch'):
                 load_state(stage, 'cpu')
             with self.assertRaisesRegex(ValueError, 'replace'):
-                save_state({'output': path}, state, routes, [])
+                save_state({'output': path}, state)
 
 
 if __name__ == '__main__':

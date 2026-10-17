@@ -62,12 +62,6 @@ clef_metal_omni.o: clef_metal_omni.m clef_metal_internal.h
 clef_metal_audio.o: clef_metal_audio.m clef_metal_internal.h
 	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -ffp-contract=off -c -o $@ $<
 
-tests/omni-layer-probe: tests/omni_layer_probe.m clef_metal.m clef_metal_omni.m clef_metal_src.inc clef_metal_audio.o clef.o clef_head.o $(HOST_OBJS)
-	$(CC) $(OBJCFLAGS) $(DEPFLAGS) -o $@ tests/omni_layer_probe.m clef_metal_audio.o clef.o clef_head.o $(HOST_OBJS) $(LDFLAGS) $(LDLIBS) $(FRAMEWORKS)
-
-tests/audio-frontend-probe: tests/audio_frontend_probe.c
-	$(CC) $(CFLAGS) -ffp-contract=off -o $@ $< -framework Accelerate
-
 tests/audio-features: tests/audio_features.c clef_audio.c clef_audio.h clef_audio_tables.inc clef_json.o
 	$(CC) $(CFLAGS) -ffp-contract=off -o $@ tests/audio_features.c clef_json.o $(LDLIBS)
 
@@ -364,7 +358,6 @@ test: clef-tool clef-server tests/test-dump tests/test-base64 tests/test-vision-
 	.venv/bin/python -B tests/test_memory_guard.py
 	.venv/bin/python -B tests/test_omni_vision_oracle.py
 	.venv/bin/python -B tests/test_omni_audio_oracle.py
-	.venv/bin/python -B tests/test_omni_arbitration.py
 	.venv/bin/python -B tests/test_omni_layer_checks.py
 	.venv/bin/python -B tests/test_omni_qualification_checks.py
 	.venv/bin/python -B tests/test_verify_snapshot.py
@@ -392,11 +385,10 @@ clean:
 	rm -f tests/test-media-audio-format
 	rm -f tests/test-video-worker
 	rm -f tests/test-dump
-	rm -f tests/omni-layer-probe
 	rm -f tests/test-audio
 	rm -f tests/audio-features
 	rm -f tests/audio-layout tests/test-omni-audio tests/test-audio-buffers tests/audio-tower tests/test-audio-record
-	rm -f tests/audio-frontend-probe tests/test-audio-frontend
+	rm -f tests/test-audio-frontend
 	rm -f tests/test-omni-config tests/test-omni-attention tests/test-omni-assign tests/test-omni-moe tests/test-omni-buffers tests/test-omni-router tests/test-omni-positions tests/test-omni-deepstack
 	rm -f *.o *.d tests/*.o tests/*.d tests/test-dense-buffers tests/test-vision-buffers tests/test-base64 tests/test-vision-config tests/test-jpeg-ub fuzz-image fuzz-jpeg-diff fuzz-audio clef clef-server clef-tool attention-bench omni-attention-bench vision-attention-bench vision-gemm-bench image-bench video-host-bench gemm-tiles gdn-bench tests/test-gdn-buffers tests/test-head-attend tests/test-head-linear tests/test-head-load tests/test-head-parallel tests/test-head-parallel-tsan tests/test-record-errors tests/test-metal-errors tests/test-server-writes tests/test-cli-alloc tests/test-prefix-owner tests/test-prefix-planner tests/test-prefix-owner-model tests/test-prefix-attention clef_metal_src.inc
 
