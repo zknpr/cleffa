@@ -616,6 +616,18 @@ stock BF16 CLINC advantage on Flash came from PyTorch 2.11's incorrect implicit 
 MPS; the corrected eager comparison does not address Omni's hosted differences or its numerical
 failures ([corrected comparison](hosted-comparison.md#corrected-bf16-comparison-2026-10-11)).
 
+**Decision Index full sets.** Omni trails its model card on two benchmarks of the community Decision
+Index 0.2.1 suite, served with a 65,536-token window: API-Bank 85.63% (435/508) against 92.7, and
+When2Call MCQ 56.46% (2,062/3,652) against 63.3. Flash on the same harness reads 92.9 and 65.4
+against its card's 93.1 and 65.6, so the harness is not the cause. The 2026-10-17 rerun on the
+current default (exact rotary angles and staged K/V attention) is unchanged from the 2026-10-12
+run on the first integration build: API-Bank has the same 435 cases right, and When2Call loses
+five and gains none (2,067 to 2,062, exact McNemar p = 0.0625). All five sat on near-ties in the
+older run (top-two margins 0.0005 to 0.036); the mean largest probability change per case is
+0.0011 on When2Call and 0.0099 on API-Bank. The changes since 2026-10-12 therefore neither cause
+nor close the gap. Evidence: `golden/decision-index-20261011/` (`runs/clef-omni-flagged5`,
+`runs/clef-omni-recheck-72fa3dc`, `recheck/paired-72fa3dc.txt`).
+
 On the 20 longest selected API-Bank failures from the Decision Index suite, hosted repeats native's
 wrong choice on 17. On the other three, the independent FP32 reference also makes native's choice,
 and so does a bounded BF16 control on the one case it covers. These are selected failures, not an
@@ -627,6 +639,10 @@ accuracy estimate, and no faulty native operation was isolated. Evidence:
 - **Long context.** Acceptance covers inputs up to 16,344 tokens; nothing near the 64,000-token
   default context has an FP64 or FP32 reference (the 64k FP32 run was stopped after layer 14). Long text references keep only
   their last 512 rows, so earlier rows of the four long records are not compared.
+- **Benchmark gap.** API-Bank and When2Call trail the model card by 7.1 and 6.8 points
+  ([full sets](#hosted-and-labeled-agreement)). The independent FP32 reference makes native's
+  choice on all five failures it was run on, and hosted Omni repeats 17 of the 20 longest API-Bank
+  failures; hosted accuracy on the full sets is unmeasured, and the cause is unknown.
 - **FP32-compatible branches.** Unmerged and no longer needed for acceptance. Merging one would
   also mean accepting C++ PocketFFT and SLEEF-derived code, absent from `THIRD_PARTY_NOTICES.md`.
 - **Hosted differences.** Seven core disagreements, four of them on video, remain unexplained;

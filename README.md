@@ -234,6 +234,8 @@ list are in [docs/security.md](docs/security.md).
 
 - Clef-Omni accuracy references beyond 16,344 tokens (64k has none), and its long-context speed:
   23.7 s at 16,344 tokens, mostly attention ([docs/omni.md](docs/omni.md)).
+- Clef-Omni's 7-point deficit against its model card on API-Bank and When2Call, unexplained
+  ([docs/omni.md](docs/omni.md#hosted-and-labeled-agreement)).
 - WebP ([docs/vision.md](docs/vision.md)).
 - Live or unknown-length clips, and video codecs beyond H.264, HEVC, ProRes and MJPEG
   ([docs/video.md](docs/video.md)).
