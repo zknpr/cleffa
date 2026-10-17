@@ -17,10 +17,15 @@ Included
     view; the suffix test is case-insensitive everywhere
   - for the oracle directories ref/oracle.py writes (clef, clef-flash and their documented
     variants, no date suffix): requests.jsonl, encoded.jsonl,
-    logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump
+    logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump;
+    for the Omni FP32 and FP64 reference directories also manifest.json (the FP64 logits let
+    tests/compare_fp64_errors.py rerun on archived reports; test_parity.py's FP64 check also
+    hashes the layer dumps, which stay out)
 Excluded
   - Mach-O binaries, objects, dSYMs, .inc, Instruments .trace bundles and their exported
     counter tables (.xml, .npz), .bin/.npy tensors, archives, PDFs, .git clones, virtualenvs
+  - per-token Omni routing traces in captures/<variant>/<corpus-id>.jsonl; capture
+    manifests, responses and routing diagnostic reports remain included
   - documentation pages saved from Apple's developer site (recognized by their terms link)
   - the engine source inside copied engine trees (a directory holding clef.c or
     clef_engine.h: its tests/, bench/, tools/, metal/, ref/ and docs/ directories and its root
@@ -92,6 +97,11 @@ ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latenc
 # the form every report since the vision work cites; a mixed form stays undated.
 EXPERIMENT = re.compile(r'^[a-z0-9-]+-20(\d{6}|\d{2}-\d{2}-\d{2})$')
 ORACLE_DIR = re.compile(r'^clef(-flash)?(-(vision|video))?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
+OMNI_ORACLE_DIR = re.compile(r'^clef-omni-(text|vision|video|audio|av|long)-f32(-(arbitrated|input-shift|residual-order|blocked-d2|sdpa-control-d2))?$')
+# The FP64 acceptance references (ref/oracle_fp64*.py); text is split by length. Probe runs stay out.
+OMNI_FP64_DIR = re.compile(r'^clef-omni-(text(-(short|mid|8k|16k|bounded))?|vision|video|audio|av)-f64-v[12]$')
+OMNI_ORACLE_FILES = ORACLE_FILES | {'manifest.json','arbitration.json','source-transition.json'}
+OMNI_TRACE_NAME = re.compile(r'^(r|ov|ot|oa|oav|ol)[0-9]+\.jsonl$')
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
 
 EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
@@ -100,7 +110,7 @@ EXCLUDE_DIR_PARTS = {'.git', 'mlx-env', '.venv', '__pycache__', 'node_modules'}
 # directories and root files are source the repository already holds, while result files
 # stored beside them (qualification logs, build manifests) are evidence and stay.
 ENGINE_MARKERS = ('clef.c', 'clef_engine.h')
-ENGINE_DIRS = {'tests', 'bench', 'tools', 'metal', 'ref', 'docs', 'golden', 'gguf', 'model', 'model-flash'}
+ENGINE_DIRS = {'tests', 'bench', 'tools', 'metal', 'ref', 'docs', 'golden', 'gguf', 'model', 'model-flash', 'model-omni'}
 ENGINE_ROOT_FILES = {'Makefile', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md', 'CLAUDE.md', 'AGENTS.md',
                      'pyrightconfig.json', 'requirements.txt', 'smoke_test.py', 'download_models.sh', 'release.sh'}
 ENGINE_ROOT_EXT = {'.d', '.o'}
@@ -334,12 +344,13 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
     if ancestors and not EXPERIMENT.match(top):
         # Only the oracle directories ref/oracle.py writes, and of those the small files, never
         # layers/ or dumps (size-checked in classify). Any other undated directory is not evidence.
-        if not ORACLE_DIR.match(top):
+        omni=OMNI_ORACLE_DIR.fullmatch(top) or OMNI_FP64_DIR.fullmatch(top)
+        if not ORACLE_DIR.match(top) and not omni:
             return 'unrecognized directory'
         if directory:
             if len(parts) >= 2:   # layers/ and any other subdirectory; the oracle dir itself is walked
                 return 'oracle directory'
-        elif not (len(parts) == 2 and path.name in ORACLE_FILES):
+        elif not (len(parts) == 2 and path.name in (OMNI_ORACLE_FILES if omni else ORACLE_FILES)):
             return 'oracle directory'
     return None
 
@@ -361,6 +372,11 @@ def classify(golden: Path, path: Path) -> tuple[bool, str]:
         return False, 'account bookkeeping'
     if AGENT_STATE.match(path.name):
         return False, 'agent checkpoint'
+    if len(parts) >= 4 and parts[-3] == 'captures' and OMNI_TRACE_NAME.fullmatch(path.name):
+        # Per-token score vectors are large intermediates like residual dumps.
+        # Keep their manifests and diagnostic reports, and leave the raw traces
+        # available locally without exhausting the curated archive's size bound.
+        return False, 'raw Omni routing trace'
     st = path.lstat()
     if not stat.S_ISREG(st.st_mode):
         return False, 'not a regular file'   # a FIFO would block the open; a device is not evidence (review #61)
@@ -878,7 +894,8 @@ file's original bytes is published: the replaced values are low-entropy, and suc
 would let a reader confirm guesses offline. Each report names the directories it relies on.
 
 Not included, by rule: engine binaries and objects, Instruments traces and their counter
-exports, model tensors and layer dumps, the MLX environment, the ds4 upstream clone, the
+exports, model tensors, layer dumps and raw per-token Omni routing traces (the capture
+manifests, responses and routing reports remain), the MLX environment, the ds4 upstream clone, the
 ContractNLI dataset archive (its commit hash is in `contractnli-*/source.json`; the dataset is
 CC BY 4.0, Koreeda and Manning, Findings of EMNLP 2021), Cloudflare account and usage dumps,
 and every file from the private article-classification workload.

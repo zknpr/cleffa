@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-extern bool clef_run_ex(clef_engine *, const clef_record *, int, float ****, bool, float *, int, char *, size_t);
+extern bool clef_run_ex(clef_engine *, const clef_record *, int, float ****, bool, clef_dump *, int, char *, size_t);
 
 static void need(bool ok,const char *message) {
     if(!ok) { fprintf(stderr,"ownership model check: %s\n",message); exit(1); }

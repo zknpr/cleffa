@@ -1,4 +1,5 @@
 #include <math.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,6 +30,7 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
         snprintf(err, errlen, "model: not a clef GGUF (convert with tools/convert.py)");
         return false;
     }
+    if (!clef_model_info_load(f, &c->model, err, errlen)) return false;
     if (!cfg_u32(f, "clef.block_count", &c->n_layer, err, errlen) ||
         !cfg_u32(f, "clef.embedding_length", &c->H, err, errlen) ||
         !cfg_u32(f, "clef.feed_forward_length", &c->ffn, err, errlen) ||
@@ -37,11 +39,6 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
         !cfg_u32(f, "clef.attention.key_length", &c->hd, err, errlen) ||
         !cfg_u32(f, "clef.rope.dimension_count", &c->n_rot, err, errlen) ||
         !cfg_u32(f, "clef.vocab_size", &c->vocab, err, errlen) ||
-        !cfg_u32(f, "clef.ssm.conv_kernel", &c->ssm_kernel, err, errlen) ||
-        !cfg_u32(f, "clef.ssm.k_heads", &c->Hk, err, errlen) ||
-        !cfg_u32(f, "clef.ssm.v_heads", &c->Hv, err, errlen) ||
-        !cfg_u32(f, "clef.ssm.k_head_dim", &c->dk, err, errlen) ||
-        !cfg_u32(f, "clef.ssm.v_head_dim", &c->dv, err, errlen) ||
         !cfg_u32(f, "clef.head.width", &c->W, err, errlen) ||
         !cfg_u32(f, "clef.head.routing_layers", &c->routing_layers, err, errlen) ||
         !cfg_u32(f, "clef.head.layers", &c->head_layers, err, errlen) ||
@@ -49,6 +46,12 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
         !cfg_u32(f, "clef.head.feedforward", &c->head_ff, err, errlen)) {
         return false;
     }
+    if (c->model.backbone == CLEF_QWEN35 &&
+        (!cfg_u32(f, "clef.ssm.conv_kernel", &c->ssm_kernel, err, errlen) ||
+         !cfg_u32(f, "clef.ssm.k_heads", &c->Hk, err, errlen) ||
+         !cfg_u32(f, "clef.ssm.v_heads", &c->Hv, err, errlen) ||
+         !cfg_u32(f, "clef.ssm.k_head_dim", &c->dk, err, errlen) ||
+         !cfg_u32(f, "clef.ssm.v_head_dim", &c->dv, err, errlen))) return false;
     if (!gguf_get_f32(f, "clef.attention.layer_norm_rms_epsilon", &c->eps) ||
         !gguf_get_f32(f, "clef.rope.freq_base", &c->rope_theta)) {
         snprintf(err, errlen, "model: missing rms eps / rope base");
@@ -68,15 +71,59 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
         }
         c->layer_full[i] = types[i] == 1;
     }
+    if (c->model.backbone == CLEF_OMNI) {
+        uint32_t value_dim;
+        int32_t sec[3];
+        uint64_t n_sec;
+        const gguf_kv *norm = gguf_find_kv(f, "clef.moe.normalize_topk");
+        if (!cfg_u32(f, "clef.moe.expert_count", &c->n_expert, err, errlen) ||
+            !cfg_u32(f, "clef.moe.expert_used_count", &c->n_expert_used, err, errlen)) return false;
+        /* Pin kernel geometry before any products, divisions or allocation sizes.
+         * Metadata is untrusted even when the tensor payload is a valid GGUF. */
+        if (c->H != 2048 || c->n_layer != 48 || c->ffn != 768 || c->nh != 32 || c->nkv != 4 ||
+            c->hd != 128 || c->n_rot != 128 || c->n_expert != 128 || c->n_expert_used != 8 ||
+            c->vocab != 152064 || c->W != 1024 || c->routing_layers != 2 || c->head_layers != 4 ||
+            c->head_heads != 16 || c->head_ff != 4096 || c->eps != 1e-6f || c->rope_theta != 1e6f ||
+            !gguf_get_u32(f, "clef.attention.value_length", &value_dim) || value_dim != 128 ||
+            !norm || norm->type != GGUF_T_BOOL || norm->value_pos >= f->size || f->base[norm->value_pos] != 1 ||
+            !gguf_read_i32_array(f, "clef.rope.mrope_section", sec, 3, &n_sec) || n_sec != 3 ||
+            sec[0] != 24 || sec[1] != 20 || sec[2] != 20) {
+            snprintf(err, errlen, "model: unsupported Omni decoder/head geometry or routing configuration");
+            return false;
+        }
+        for (int i = 0; i < c->n_layer; i++) if (!c->layer_full[i]) {
+            snprintf(err, errlen, "model: Omni requires full attention in every layer");
+            return false;
+        }
+        const char *ids[] = { "clef.vision.image_token_id", "clef.vision.video_token_id", "clef.vision.start_token_id",
+            "clef.vision.end_token_id", "clef.audio.audio_token_id", "clef.audio.audio_start_token_id", "clef.audio.audio_end_token_id" };
+        uint32_t values[7];
+        for (int i = 0; i < 7; i++) {
+            if (!gguf_get_u32(f, ids[i], &values[i]) || values[i] >= (uint32_t)c->vocab) {
+                snprintf(err, errlen, "model: invalid media token id %s", ids[i]); return false;
+            }
+            for (int j = 0; j < i; j++) if (values[i] == values[j]) {
+                snprintf(err, errlen, "model: media token ids must be distinct"); return false;
+            }
+        }
+        if (c->model.capabilities & CLEF_CAP_AUDIO) {
+            if (!clef_audio_config_load(f,&c->audio,err,errlen)) return false;
+        }
+        c->has_vision = 0;
+        if (!(c->model.capabilities & CLEF_CAP_VISION)) return true;
+    }
     /* Shape assumptions baked into the kernels; refuse anything else rather than misbehave. */
-    if (c->hd != 256 || c->n_rot != 64 || c->nh % c->nkv || c->dk != 128 || c->dv % 16 ||
-        c->Hv % c->Hk || c->ssm_kernel > 8 || c->routing_layers + c->head_layers > 16) {
+    if (c->model.backbone != CLEF_OMNI && (c->hd != 256 || c->n_rot != 64 || c->nh % c->nkv || c->dk != 128 || c->dv % 16 ||
+        c->Hv % c->Hk || c->ssm_kernel > 8 || c->routing_layers + c->head_layers > 16)) {
         snprintf(err, errlen, "model: unsupported shape (hd=%d n_rot=%d dk=%d)", c->hd, c->n_rot, c->dk);
         return false;
     }
     /* Vision tower (optional in the file, present in every converted release). The kernels take
      * hd = 72 with 16-pixel patches in 2x2 windows over two identical temporal taps. */
     c->has_vision = gguf_find_kv(f, "clef.vision.block_count") != NULL;
+    if (c->model.backbone == CLEF_OMNI && !c->has_vision) {
+        snprintf(err,errlen,"model: Omni vision export lacks tower metadata");return false;
+    }
     if (c->has_vision) {
         int pos_n;
         if (!cfg_u32(f, "clef.vision.block_count", &c->v_layers, err, errlen) ||
@@ -109,10 +156,18 @@ static bool load_config(const gguf_file *f, clef_config *c, char *err, size_t er
          * refuses non-interleaved layouts; the GGUF records the section. */
         int32_t sec[4];
         uint64_t n_sec = 0;
-        if (!gguf_read_i32_array(f, "clef.rope.mrope_section", sec, 4, &n_sec) || n_sec != 3 ||
-            sec[0] != 11 || sec[1] != 11 || sec[2] != 10 || c->n_rot != 64) {
+        if (c->model.backbone != CLEF_OMNI && (!gguf_read_i32_array(f, "clef.rope.mrope_section", sec, 4, &n_sec) || n_sec != 3 ||
+            sec[0] != 11 || sec[1] != 11 || sec[2] != 10 || c->n_rot != 64)) {
             snprintf(err, errlen, "model: unsupported M-RoPE layout (the kernels implement interleaved [11, 11, 10])");
             return false;
+        }
+        if (c->model.backbone == CLEF_OMNI) {
+            if (c->v_layers != 27 || c->v_E != 1152 || c->v_ff != 4304 || c->v_heads != 16 || pos_n != 2304 ||
+                !gguf_read_i32_array(f,"clef.vision.deepstack_layers",sec,4,&n_sec) || n_sec != 3 ||
+                sec[0] != 8 || sec[1] != 16 || sec[2] != 24) {
+                snprintf(err,errlen,"model: unsupported Omni vision or DeepStack geometry");return false;
+            }
+            for (int i=0;i<3;i++) c->v_deepstack[i]=sec[i];
         }
         /* Only after the fixed geometry is confirmed: cfg_u32 admits each factor up to 2^24, and
          * this product overflowed int (undefined behavior) on a crafted file before the check
@@ -126,11 +181,33 @@ static const gguf_tensor *bind(const gguf_file *f, const char *name, uint32_t ty
                                char *err, size_t errlen) {
     const gguf_tensor *t = gguf_find_tensor(f, name);
     if (!t) { snprintf(err, errlen, "model: missing tensor %s", name); return NULL; }
-    if (t->type != type || t->ne[0] != ne0 || t->ne[1] != ne1) {
-        snprintf(err, errlen, "model: tensor %s has type %u shape [%llu, %llu], expected type %u [%llu, %llu]",
-                 name, t->type, (unsigned long long)t->ne[0], (unsigned long long)t->ne[1], type,
+    const uint32_t rank = ne1 == 1 ? 1 : 2;
+    if (t->type != type || t->n_dims != rank || t->ne[0] != ne0 || t->ne[1] != ne1 || t->ne[2] != 1 || t->ne[3] != 1) {
+        snprintf(err, errlen, "model: tensor %s has type %u rank %u shape [%llu, %llu], expected type %u [%llu, %llu]",
+                 name, t->type, t->n_dims, (unsigned long long)t->ne[0], (unsigned long long)t->ne[1], type,
                  (unsigned long long)ne0, (unsigned long long)ne1);
         return NULL;
+    }
+    return t;
+}
+
+static const gguf_tensor *bind_experts(const gguf_file *f, const char *name, uint64_t input, uint64_t output,
+                                      uint64_t experts, char *err, size_t errlen) {
+    const gguf_tensor *t = gguf_find_tensor(f, name);
+    if (!t || t->type != GGML_BF16 || t->n_dims != 3 || t->ne[0] != input || t->ne[1] != output ||
+        t->ne[2] != experts || t->ne[3] != 1) {
+        snprintf(err, errlen, "model: missing or invalid rank-3 expert tensor %s", name);
+        return NULL;
+    }
+    return t;
+}
+
+static const gguf_tensor *bind_audio_conv(const gguf_file *f, const char *name, uint64_t input,
+                                         char *err, size_t errlen) {
+    const gguf_tensor *t = gguf_find_tensor(f,name);
+    if (!t || t->type != GGML_BF16 || t->n_dims != 4 || t->ne[0] != 3 || t->ne[1] != 3 ||
+        t->ne[2] != input || t->ne[3] != 480) {
+        snprintf(err,errlen,"model: missing or invalid rank-4 audio convolution %s",name);return NULL;
     }
     return t;
 }
@@ -144,7 +221,8 @@ static bool bind_weights(const gguf_file *f, const clef_config *c, clef_weights 
     name = "output_norm.weight"; BIND(w->output_norm, GGML_F32, c->H, 1);
     const uint64_t C = 2ull * c->Hk * c->dk + (uint64_t)c->Hv * c->dv;
     const uint64_t n_ssm = C + (uint64_t)c->Hv * c->dv + 2ull * c->Hv;
-    const uint64_t n_attn = (uint64_t)c->nh * 2 * c->hd + 2ull * c->nkv * c->hd;
+    const bool omni = c->model.backbone == CLEF_OMNI;
+    const uint64_t n_attn = (uint64_t)c->nh * (omni ? 1 : 2) * c->hd + 2ull * c->nkv * c->hd;
     for (uint64_t i = 0; i < f->n_tensors; i++) {
         const gguf_tensor *t = &f->tensors[i];
         if (t->name.len > 5 && !memcmp(t->name.ptr, "head.", 5) && t->type != GGML_BF16) {
@@ -158,8 +236,18 @@ static bool bind_weights(const gguf_file *f, const clef_config *c, clef_weights 
         clef_layer_w *L = &w->layer[l];
         snprintf(buf, sizeof(buf), "blk.%d.attn_norm.weight", l);   BIND(L->attn_norm, GGML_F32, c->H, 1);
         snprintf(buf, sizeof(buf), "blk.%d.ffn_norm.weight", l);    BIND(L->ffn_norm, GGML_F32, c->H, 1);
-        snprintf(buf, sizeof(buf), "blk.%d.ffn_gate_up.weight", l); BIND(L->ffn_gate_up, GGML_BF16, c->H, 2ull * c->ffn);
-        snprintf(buf, sizeof(buf), "blk.%d.ffn_down.weight", l);    BIND(L->ffn_down, GGML_BF16, c->ffn, c->H);
+        if (omni) {
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_router.weight", l); BIND(L->ffn_router, GGML_BF16, c->H, c->n_expert);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_gate_up_exps.weight", l);
+            L->ffn_gate_up_exps = bind_experts(f, name, c->H, 2ull*c->ffn, c->n_expert, err, errlen);
+            if (!L->ffn_gate_up_exps) return false;
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_down_exps.weight", l);
+            L->ffn_down_exps = bind_experts(f, name, c->ffn, c->H, c->n_expert, err, errlen);
+            if (!L->ffn_down_exps) return false;
+        } else {
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_gate_up.weight", l); BIND(L->ffn_gate_up, GGML_BF16, c->H, 2ull * c->ffn);
+            snprintf(buf, sizeof(buf), "blk.%d.ffn_down.weight", l);    BIND(L->ffn_down, GGML_BF16, c->ffn, c->H);
+        }
         if (c->layer_full[l]) {
             snprintf(buf, sizeof(buf), "blk.%d.attn_qkv.weight", l);    BIND(L->attn_qkv, GGML_BF16, c->H, n_attn);
             snprintf(buf, sizeof(buf), "blk.%d.attn_output.weight", l); BIND(L->attn_output, GGML_BF16, (uint64_t)c->nh * c->hd, c->H);
@@ -185,6 +273,16 @@ static bool bind_weights(const gguf_file *f, const clef_config *c, clef_weights 
         name = "v.mm.0.bias";         BIND(w->v_mm0_b, GGML_F32, M, 1);
         name = "v.mm.2.weight";       BIND(w->v_mm2_w, GGML_BF16, M, (uint64_t)c->H);
         name = "v.mm.2.bias";         BIND(w->v_mm2_b, GGML_F32, (uint64_t)c->H, 1);
+        if (omni) for (int i=0;i<3;i++) {
+            clef_vmerger_w *mw=&w->v_deepstack[i];
+            char n[80];
+            snprintf(n,sizeof(n),"v.deepstack.%d.post_ln.weight",i);name=n;BIND(mw->norm_w,GGML_F32,M,1);
+            snprintf(n,sizeof(n),"v.deepstack.%d.post_ln.bias",i);name=n;BIND(mw->norm_b,GGML_F32,M,1);
+            snprintf(n,sizeof(n),"v.deepstack.%d.mm.0.weight",i);name=n;BIND(mw->fc1_w,GGML_BF16,M,M);
+            snprintf(n,sizeof(n),"v.deepstack.%d.mm.0.bias",i);name=n;BIND(mw->fc1_b,GGML_F32,M,1);
+            snprintf(n,sizeof(n),"v.deepstack.%d.mm.2.weight",i);name=n;BIND(mw->fc2_w,GGML_BF16,M,(uint64_t)c->H);
+            snprintf(n,sizeof(n),"v.deepstack.%d.mm.2.bias",i);name=n;BIND(mw->fc2_b,GGML_F32,(uint64_t)c->H,1);
+        }
         name = buf;
         for (int l = 0; l < c->v_layers; l++) {
             clef_vlayer_w *L = &w->vlayer[l];
@@ -200,6 +298,46 @@ static bool bind_weights(const gguf_file *f, const clef_config *c, clef_weights 
             snprintf(buf, sizeof(buf), "v.blk.%d.ffn_up.bias", l);     BIND(L->up_b, GGML_F32, (uint64_t)c->v_ff, 1);
             snprintf(buf, sizeof(buf), "v.blk.%d.ffn_down.weight", l); BIND(L->down_w, GGML_BF16, (uint64_t)c->v_ff, E);
             snprintf(buf, sizeof(buf), "v.blk.%d.ffn_down.bias", l);   BIND(L->down_b, GGML_F32, E, 1);
+        }
+    }
+    if (c->model.capabilities & CLEF_CAP_AUDIO) {
+        clef_audio_weights *a = &w->audio;
+        const uint64_t E = (uint64_t)c->audio.H, F = (uint64_t)c->audio.ffn;
+        for (int i = 0; i < 3; i++) {
+            snprintf(buf,sizeof(buf),"a.conv2d%d.weight",i+1);
+            a->conv_w[i] = bind_audio_conv(f,buf,i == 0 ? 1 : 480,err,errlen);
+            if (!a->conv_w[i]) return false;
+            snprintf(buf,sizeof(buf),"a.conv2d%d.bias",i+1);name=buf;BIND(a->conv_b[i],GGML_F32,480,1);
+        }
+        name="a.conv_out.weight";BIND(a->conv_out,GGML_BF16,480*16,E);
+        name="a.ln_post.weight";BIND(a->ln_w,GGML_F32,E,1);
+        name="a.ln_post.bias";BIND(a->ln_b,GGML_F32,E,1);
+        name="a.proj1.weight";BIND(a->proj1_w,GGML_BF16,E,E);
+        name="a.proj1.bias";BIND(a->proj1_b,GGML_F32,E,1);
+        name="a.proj2.weight";BIND(a->proj2_w,GGML_BF16,E,c->H);
+        name="a.proj2.bias";BIND(a->proj2_b,GGML_F32,c->H,1);
+        for (int i = 0; i < c->audio.layers; i++) {
+            clef_alayer_w *l = &a->layer[i];
+#define AUDIO_BIND(dst, suffix, type, input, output) do { \
+    snprintf(buf,sizeof(buf),"a.layers.%d.%s",i,suffix);name=buf;BIND(dst,type,input,output); \
+} while (0)
+            AUDIO_BIND(l->q_w,"self_attn.q_proj.weight",GGML_BF16,E,E);
+            AUDIO_BIND(l->q_b,"self_attn.q_proj.bias",GGML_F32,E,1);
+            AUDIO_BIND(l->k_w,"self_attn.k_proj.weight",GGML_BF16,E,E);
+            AUDIO_BIND(l->k_b,"self_attn.k_proj.bias",GGML_F32,E,1);
+            AUDIO_BIND(l->v_w,"self_attn.v_proj.weight",GGML_BF16,E,E);
+            AUDIO_BIND(l->v_b,"self_attn.v_proj.bias",GGML_F32,E,1);
+            AUDIO_BIND(l->out_w,"self_attn.out_proj.weight",GGML_BF16,E,E);
+            AUDIO_BIND(l->out_b,"self_attn.out_proj.bias",GGML_F32,E,1);
+            AUDIO_BIND(l->ln1_w,"self_attn_layer_norm.weight",GGML_F32,E,1);
+            AUDIO_BIND(l->ln1_b,"self_attn_layer_norm.bias",GGML_F32,E,1);
+            AUDIO_BIND(l->ln2_w,"final_layer_norm.weight",GGML_F32,E,1);
+            AUDIO_BIND(l->ln2_b,"final_layer_norm.bias",GGML_F32,E,1);
+            AUDIO_BIND(l->up_w,"fc1.weight",GGML_BF16,E,F);
+            AUDIO_BIND(l->up_b,"fc1.bias",GGML_F32,F,1);
+            AUDIO_BIND(l->down_w,"fc2.weight",GGML_BF16,F,E);
+            AUDIO_BIND(l->down_b,"fc2.bias",GGML_F32,E,1);
+#undef AUDIO_BIND
         }
     }
     return true;
@@ -225,7 +363,8 @@ clef_engine *clef_open(const char *path, char *err, size_t errlen) {
     if (!claim_engine_id(&e->instance_id)) { snprintf(err, errlen, "engine identity exhausted"); free(e); return NULL; }
     if (!gguf_open(&e->gguf, path, err, errlen)) { free(e); return NULL; }
     if (!load_config(&e->gguf, &e->cfg, err, errlen) || !bind_weights(&e->gguf, &e->cfg, &e->w, err, errlen) ||
-        !clef_vision_opts_load(&e->gguf, &e->vision, err, errlen)) {
+        !clef_vision_opts_load(&e->gguf, &e->vision, err, errlen) ||
+        !clef_audio_opts_load(&e->gguf,&e->audio,err,errlen)) {
         clef_close(e);
         return NULL;
     }
@@ -314,9 +453,14 @@ static bool pack_images(const clef_record *recs, int n, const int32_t *bounds, i
 }
 
 /* Shared by clef_run and the parity tool: logits (not probabilities) when raw is set. */
-bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, bool raw, float *dump,
+bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, bool raw, clef_dump *dump,
                  int dump_rows, char *err, size_t errlen) {
+    e->routes_valid = false;
     if (errlen) err[0] = '\0';   /* every failure path below writes a message */
+    if (e->capture_routes && (e->cfg.model.backbone != CLEF_OMNI || n != 1 || e->route_rows < 0)) {
+        snprintf(err, errlen, "routes require one Omni record and a nonnegative row limit");
+        return false;
+    }
     if (n > 1 && getenv("CLEF_DEBUG_FAIL_MULTI")) {
         /* test hook (tests/test_server_retry.py): fail every multi-record forward so the
          * server's per-record retry after a batch failure is exercised */
@@ -326,6 +470,11 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
     int T = 0;
     for (int r = 0; r < n; r++) {
         if (recs[r].ids.len == 0 || recs[r].ids.len > (size_t)(1 << 20)) { snprintf(err, errlen, "record %d: bad length", r); return false; }
+        if ((e->cfg.model.context_length && recs[r].ids.len > (size_t)e->cfg.model.context_length) ||
+            recs[r].ids.len > (size_t)(INT_MAX-T)) {
+            snprintf(err, errlen, "record %d: model context or packed token limit exceeded", r);
+            return false;
+        }
         T += (int)recs[r].ids.len;
     }
     int32_t *ids = malloc((size_t)T * 4), *pos = malloc((size_t)T * 12), *ss = malloc((size_t)T * 4);
@@ -353,8 +502,8 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
     int32_t *img_row = NULL;
     int n_img = 0;
     if (ok) ok = pack_images(recs, n, bounds, 0, T, false, &img, &n_img, &img_row, err, errlen);
-    const clef_gpu_images imgs = { .img = img, .n = n_img, .img_row = img_row };
-    if (ok) ok = clef_gpu_forward(e->gpu, e, ids, pos, ss, bounds, n, T, false, ovf, &in, dump, dump_rows, n_img ? &imgs : NULL, err, errlen);
+    const clef_gpu_media imgs = { .img = img, .n = n_img, .img_row = img_row, .records = recs };
+    if (ok) ok = clef_gpu_forward(e->gpu, e, ids, pos, ss, bounds, n, T, false, ovf, &in, dump, dump_rows, &imgs, err, errlen);
     const double t_head = wall_ms();
     for (int r = 0; ok && r < n; r++) {
         probs[r] = calloc((size_t)recs[r].nq, sizeof(float *));
@@ -384,9 +533,9 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
         int32_t *rows1 = NULL;
         int n_img1 = 0;
         ok = pack_images(&recs[r], 1, b1, 0, len, false, &img1, &n_img1, &rows1, err, errlen);
-        const clef_gpu_images imgs1 = { .img = img1, .n = n_img1, .img_row = rows1 };
+        const clef_gpu_media imgs1 = { .img = img1, .n = n_img1, .img_row = rows1, .records = &recs[r] };
         if (ok) ok = clef_gpu_forward(e->gpu, e, ids + bounds[r], pos + 3 * (size_t)bounds[r], ss0, b1, 1, len, true, NULL, &in,
-                                      r == 0 ? dump : NULL, dump_rows, n_img1 ? &imgs1 : NULL, err, errlen);
+                                      r == 0 ? dump : NULL, dump_rows, &imgs1, err, errlen);
         free(img1); free(rows1);
         free(ss0);
         const double t_rerun_head = wall_ms();
@@ -409,7 +558,16 @@ bool clef_run_ex(clef_engine *e, const clef_record *recs, int n, float ****out, 
     free(ids); free(pos); free(ss); free(bounds);
     if (!ok) { clef_free_probs(recs, n, probs); return false; }
     *out = probs;
+    e->routes_valid = e->capture_routes;
     return true;
+}
+
+bool clef_dump_routes(clef_engine *e, const char *path, char *err, size_t errlen) {
+    if (!e->routes_valid || !path) {
+        snprintf(err, errlen, "no successful captured Omni pass");
+        return false;
+    }
+    return clef_gpu_dump_routes(e->gpu, path, err, errlen);
 }
 
 /* ---- prefix cache ---- */
@@ -622,7 +780,7 @@ static bool run_entry(clef_engine *e, clef_prefix *p, const clef_record *rec, in
     int n_img = 0;
     const int32_t b1[2] = { 0, T - L };
     if (!pack_images(rec, 1, b1, L, T - L, multi, &img, &n_img, &img_row, err, errlen)) { free(pos3); return false; }
-    const clef_gpu_images imgs = { img, n_img, img_row, multi, reuse_images };
+    const clef_gpu_media imgs = { .img=img, .n=n_img, .img_row=img_row, .cache=multi, .reuse=reuse_images, .records=NULL };
     const bool fwd = clef_gpu_forward_prefix(e->gpu, e, p->gpu, rec->ids.ids, pos3, T, L, &plan, &ovf, &in, n_img ? &imgs : NULL, err, errlen);
     free(pos3); free(img); free(img_row);
     if (!fwd) return false;

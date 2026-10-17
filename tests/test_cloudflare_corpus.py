@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 import unittest
+import tempfile
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
@@ -11,6 +12,16 @@ from cloudflare_corpus import check_budget, daily_usage, final_usage, hosted_pay
 
 
 class BudgetTests(unittest.TestCase):
+    def test_native_capture_rejects_changed_body_before_starting_server(self):
+        import cloudflare_corpus
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'plan.json'
+            path.write_text(json.dumps({'requests': [dict(model='clef-flash', id='r0',
+                request={'state': 'changed'}, request_sha256='wrong')]}))
+            with patch('cloudflare_corpus.subprocess.Popen') as spawn, self.assertRaisesRegex(ValueError, 'payload hash'):
+                cloudflare_corpus.capture_native(path, Path(folder) / 'out.json', 'clef-flash')
+            spawn.assert_not_called()
+
     def test_explicit_fallback_does_not_mutate_corpus(self):
         request = {"id": "r000", "model": "clef", "state": "public", "questions": {
             "fallback": {"type": "noul"}, "explicit": {"type": "noul", "instructions": "Keep this."}}}
@@ -20,6 +31,16 @@ class BudgetTests(unittest.TestCase):
         self.assertEqual(payload["questions"]["fallback"]["instructions"], "fallback")
         self.assertEqual(payload["questions"]["explicit"]["instructions"], "Keep this.")
         self.assertNotIn("instructions", request["questions"]["fallback"])
+
+    def test_hosted_media_uses_embedded_data_uris(self):
+        import base64
+        png=base64.b64encode(b'\x89PNG\r\n\x1a\nfixture').decode()
+        request=dict(model='clef',state='',questions={'q':{'type':'noul'}},images=[png],
+                     videos=[{'content_type':'video/quicktime','base64':'AAAA'}])
+        payload=hosted_payload(request,'clef')
+        self.assertEqual(payload['images'],['data:image/png;base64,'+png])
+        self.assertEqual(payload['videos'],['data:video/quicktime;base64,AAAA'])
+        self.assertEqual(request['images'],[png])
 
     def test_full_reservation_and_headroom(self):
         check_budget(6000, 2000)

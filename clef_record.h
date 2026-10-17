@@ -6,8 +6,10 @@
 #include <stdint.h>
 
 #include "clef_gguf.h"
+#include "clef_audio.h"
 #include "clef_image.h"
 #include "clef_json.h"
+#include "clef_model.h"
 #include "clef_tok.h"
 
 /* Port of joint_schema_model.encode_record + the request checks in systemone().
@@ -38,6 +40,18 @@ typedef struct {
 } clef_image_ref;
 
 typedef struct {
+    clef_audio_features feat;
+    int32_t *token_rows;
+    int video_index;         /* -1: standalone, otherwise associated video index */
+} clef_audio_ref;
+
+typedef struct {
+    int32_t token_id,start_token_id,end_token_id;
+    int max_items;           /* zero removes this soft limit */
+    size_t max_samples;      /* total source samples, zero removes this soft limit */
+} clef_audio_opts;
+
+typedef struct {
     clef_tokens ids;
     int32_t schema_start;    /* tokens before the schema: template prefix and state */
     clef_question *q;
@@ -48,6 +62,10 @@ typedef struct {
     clef_image_ref *images;  /* still images then video frame pairs in token order (NULL when none) */
     int n_images;
     int32_t n_image_tokens;  /* sum of all visual tokens, including video pairs */
+    int32_t *pos3;          /* owned Omni [ids.len][3] positions; NULL uses legacy positions */
+    clef_audio_ref *audio;
+    int n_audio;
+    int32_t n_audio_tokens;
 } clef_record;
 
 /* Vision input configuration, from the model file (clef_vision_opts_load). Images are refused
@@ -62,10 +80,17 @@ typedef struct {
     int max_videos;                 /* per request; 0: bounded only by context */
     int max_video_frames;           /* sampled frames per video; 0: processor's 768-frame cap */
     long max_video_tokens;          /* per video after resizing; 0: context bound */
+    /* MP4/MOV uploads in "videos" are decoded by the clef-media libav child process, which runs
+     * with the caller's privileges and no OS sandbox. Zero-initialized options refuse them;
+     * clef-server enables them only with --allow-encoded-video, so having clef-media beside a
+     * server does not by itself expose libav to every client. The CLI, as the test harness,
+     * enables them unless --no-encoded-video (the --strict asymmetry). Frame arrays are unaffected. */
+    bool allow_encoded_video;
 } clef_vision_opts;
 
 typedef struct {
     int max_length;          /* encode_record default 16384 */
+    clef_model_info model;
     int max_state_tokens;    /* <0: unlimited (Python None) */
     /* Strict mode: request-derived text (state, ids, instructions, criteria) is tokenized
      * without added-token recognition, so literal "<|im_end|>" etc. cannot become chat-control
@@ -77,13 +102,15 @@ typedef struct {
      * fails instead, so content past the cut can never be ignored without the caller knowing. */
     bool reject_truncation;
     clef_vision_opts vision;
+    clef_audio_opts audio;
 } clef_encode_opts;
 
-#define CLEF_ENCODE_DEFAULTS { .max_length = 16384, .max_state_tokens = -1, .strict = false, .reject_truncation = false, .vision = { .image_token_id = 0 } }
+#define CLEF_ENCODE_DEFAULTS { .max_length = 16384, .max_state_tokens = -1, .strict = false, .reject_truncation = false, .vision = { .image_token_id = 0 }, .audio = { .max_items = 4, .max_samples = 4800000 } }
 
 /* Reads the clef.vision.* keys of a model file into opts->vision (limits untouched). A file
  * without them leaves image_token_id at 0, so requests with images are rejected. */
 bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, size_t errlen);
+bool clef_audio_opts_load(const gguf_file *f, clef_audio_opts *audio, char *err, size_t errlen);
 
 /* 3D rotary positions of every token (Qwen3_5Model.get_rope_index): text tokens count up on all
  * three axes; an image's tokens share its start on the temporal axis and take their merged-grid

@@ -1,5 +1,7 @@
 #include "clef_record.h"
+#include "clef_record_omni.h"
 #include "clef_video.h"
+#include "clef_encoded_video.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -127,6 +129,12 @@ static bool positive_int(const jval *v, long *out) {
     return nonnegative_int(v, out) && *out > 0;
 }
 
+static bool pixel_size(const jval *v, long *min_px, long *max_px) {
+    return v && v->type == J_OBJECT && v->n == 2 &&
+        positive_int(json_get(v,"shortest_edge"),min_px) &&
+        positive_int(json_get(v,"longest_edge"),max_px) && *min_px <= *max_px;
+}
+
 static bool positive_number(const jval *v, double *out) {
     if (!v || (v->type != J_INT && v->type != J_FLOAT)) return false;
     double value = v->f;
@@ -149,9 +157,13 @@ static bool decode_frame(const jval *im, size_t index, long limit, clef_rgb *rgb
 
 static bool encode_video(const clef_tokenizer *tok, const jval *input, const jval *kwargs, int group,
                          clef_encode_opts opts, size_t *reserve, clef_record *out, char *err, size_t errlen) {
-    long min_px = CLEF_VIDEO_MIN_PIXELS, max_px = CLEF_VIDEO_MAX_PIXELS, requested = 0;
+    const bool omni = opts.model.backbone == CLEF_OMNI;
+    long min_px = omni ? 128*32*32 : CLEF_VIDEO_MIN_PIXELS;
+    long max_px = omni ? 768*32*32 : CLEF_VIDEO_MAX_PIXELS, requested = 0;
     double sample_fps = 2;
-    bool sample = true, explicit_fps = false;
+    bool sample = !omni, explicit_fps = false;
+    const bool soundtrack = omni && json_get(input,"audio")!=NULL;
+    bool explicit_soundtrack=false;
     if (kwargs) {
         if (kwargs->type != J_OBJECT) return fail(err, errlen, "videos_kwargs must be an object", NULL, 0);
         for (size_t i = 0; i < kwargs->n; i++) {
@@ -164,6 +176,10 @@ static bool encode_video(const clef_tokenizer *tok, const jval *input, const jva
             } else if (m->klen == 3 && !memcmp(m->key, "fps", 3)) {
                 explicit_fps = m->val->type != J_NULL;
                 if (explicit_fps && !positive_number(m->val, &sample_fps)) return fail(err, errlen, "sampling fps must be finite and in (0,1000]", NULL, 0);
+            } else if (omni && m->klen==18 && !memcmp(m->key,"use_audio_in_video",18)) {
+                if((soundtrack && m->val->type!=J_TRUE) || (!soundtrack && m->val->type!=J_FALSE))
+                    return fail(err,errlen,"use_audio_in_video must match supplied soundtracks",NULL,0);
+                explicit_soundtrack=true;
             } else if (m->klen == 4 && !memcmp(m->key, "size", 4)) {
                 const jval *s = m->val;
                 if (s->type != J_OBJECT || s->n != 2 || !positive_int(json_get(s, "shortest_edge"), &min_px) ||
@@ -172,7 +188,13 @@ static bool encode_video(const clef_tokenizer *tok, const jval *input, const jva
             } else return fail(err, errlen, "unsupported videos_kwargs: %.*s", m->key, m->klen);
         }
     }
-    if ((requested && explicit_fps) || (!sample && (requested || explicit_fps)))
+    // The pinned encoder replaces its videos_kwargs dictionary wholesale;
+    // omitting fps in an override changes the reference's temporal positions.
+    if (omni && (sample || requested || (kwargs && !explicit_fps) || (explicit_fps && sample_fps != 2)))
+        return fail(err, errlen, "Omni video requires frames already sampled at 2 FPS and do_sample_frames=false", NULL, 0);
+    if(soundtrack && kwargs && !explicit_soundtrack)
+        return fail(err,errlen,"soundtrack videos_kwargs requires explicit use_audio_in_video=true",NULL,0);
+    if (!omni && ((requested && explicit_fps) || (!sample && (requested || explicit_fps))))
         return fail(err, errlen, "choose sampling fps or num_frames; neither with do_sample_frames=false", NULL, 0);
 
     const jval *frames = input->type == J_OBJECT ? json_get(input, "frames") : NULL;
@@ -184,8 +206,10 @@ static bool encode_video(const clef_tokenizer *tok, const jval *input, const jva
     if (frames->type != J_ARRAY || frames->n < 1 || frames->n > CLEF_VIDEO_MAX_SOURCE_FRAMES ||
         !positive_number(json_get(input, "fps"), &info.fps) || frames->n / info.fps > 600)
         return fail(err, errlen, "frames must contain 1..18000 images with positive fps and duration <= 600 seconds", NULL, 0);
-    if (input->n != (source_indices ? 4u : 2u) || !!source_indices != !!total)
+    if (input->n != (source_indices ? 4u : 2u)+(soundtrack?1u:0u) || !!source_indices != !!total)
         return fail(err, errlen, "frame video accepts frames, fps and optional frame_indices with total_num_frames", NULL, 0);
+    if (omni && (info.fps != 2 || source_indices))
+        return fail(err, errlen, "Omni frame video requires fps=2 without source frame indices", NULL, 0);
     int source_map[CLEF_VIDEO_MAX_FRAMES];
     if (source_indices) {
         long source_count;
@@ -221,7 +245,9 @@ static bool encode_video(const clef_tokenizer *tok, const jval *input, const jva
         goto done;
     }
     int rh, rw;
-    if (!clef_video_resize(count, info.height, info.width, min_px, max_px, &rh, &rw, err, errlen)) goto done;
+    // Qwen2VL bounds each frame's area; Qwen3VL bounds the whole temporal grid.
+    if (!(omni ? clef_smart_resize(info.height,info.width,32,min_px,max_px,&rh,&rw,err,errlen)
+               : clef_video_resize(count, info.height, info.width, min_px, max_px, &rh, &rw, err, errlen))) goto done;
     int groups = (count + 1) / 2;
     long tokens = (long)groups * (rh / 32) * (rw / 32);
     if (opts.vision.max_video_tokens > 0 && tokens > opts.vision.max_video_tokens) {
@@ -233,8 +259,9 @@ static bool encode_video(const clef_tokenizer *tok, const jval *input, const jva
     for (int i = 0; i < count; i++) indices[i] = sample && count > 1 ? (int)rint(i * ((info.frames - 1.0) / (count - 1))) : sample ? 0 : i;
     /* NumPy linspace explicitly writes its endpoint after multiplication. */
     if (sample && count > 1) indices[count - 1] = info.frames - 1;
-    size_t extra = 2 + 2 * (size_t)groups;  /* reference retains the original outer video wrapper */
+    size_t extra = omni ? 3 : 2 + 2 * (size_t)groups;
     for (int i = 0; i < groups; i++) {
+        if (omni) { timestamps[i] = i; continue; }
         int a = indices[i * 2], b = indices[i * 2 + 1 < count ? i * 2 + 1 : i * 2];
         /* An adapter may have sampled already. Keep the original source indices and FPS,
          * otherwise timestamps shrink to the duration of the supplied frame array. */
@@ -290,6 +317,12 @@ void clef_record_free(clef_record *r) {
     clef_tokens_free(&r->ids);
     for (int i = 0; i < r->n_images; i++) clef_image_patches_free(&r->images[i].pt);
     free(r->images);
+    for(int i=0;i<r->n_audio;i++) {
+        clef_audio_features_free(&r->audio[i].feat);
+        free(r->audio[i].token_rows);
+    }
+    free(r->audio);
+    free(r->pos3);
     for (int i = 0; i < r->q_alloc; i++) {
         free(r->q[i].opt_span);
         free(r->q[i].opt_id);
@@ -319,6 +352,24 @@ static bool encode_media(const clef_tokenizer *tok, const jval *req, const jval 
         for (size_t i = 0; i < mk->n; i++) {
             const jmember *m = &mk->members[i];
             if (n_videos && m->klen == 13 && !memcmp(m->key, "videos_kwargs", 13)) continue;
+            if (opts.model.backbone == CLEF_OMNI) {
+                const jval *size = NULL;
+                if (m->klen == 4 && !memcmp(m->key,"size",4)) {
+                    if (n_videos) return fail(err,errlen,"Omni mixed media requires separate images_kwargs.size and videos_kwargs.size",NULL,0);
+                    size = m->val;
+                } else if (m->klen == 13 && !memcmp(m->key,"images_kwargs",13)) {
+                    if (!n_videos || m->val->type != J_OBJECT || m->val->n != 1 ||
+                        !(size = json_get(m->val,"size")))
+                        return fail(err,errlen,"Omni images_kwargs requires exactly size alongside videos",NULL,0);
+                }
+                if (size) {
+                    if (json_get(mk,"min_pixels") || json_get(mk,"max_pixels") ||
+                        !pixel_size(size,&prm.min_pixels,&prm.max_pixels))
+                        return fail(err,errlen,"Omni image size needs positive shortest_edge <= longest_edge without duplicate pixel bounds",NULL,0);
+                    continue;
+                }
+                if (n_videos) return fail(err,errlen,"unsupported Omni mixed media option: %.*s",m->key,m->klen);
+            }
             const bool is_min = m->klen == 10 && !memcmp(m->key, "min_pixels", 10);
             const bool is_max = m->klen == 10 && !memcmp(m->key, "max_pixels", 10);
             if (!is_min && !is_max) return fail(err, errlen, "media_kwargs: only min_pixels and max_pixels are supported, not %.*s", m->key, m->klen);
@@ -352,7 +403,7 @@ static bool encode_media(const clef_tokenizer *tok, const jval *req, const jval 
      * it, before the length check refused the request (review #3); without the schema, a request
      * whose schema could never fit still preprocessed its images (review #3, Codex on 600ddfe),
      * and so did one whose state could not (Codex on a99a8a9). */
-    size_t reserve = 1 + 2 * n_images + reserved_tokens;
+    size_t reserve = (opts.model.backbone == CLEF_OMNI ? 3*n_images : 1+2*n_images) + reserved_tokens;
     {
         jbuf pb = {0};
         clef_tokens pt = {0};
@@ -365,6 +416,7 @@ static bool encode_media(const clef_tokenizer *tok, const jval *req, const jval 
         clef_tokens_free(&pt);
         if (!tok_ok) return fail(err, errlen, "out of memory", NULL, 0);
     }
+    if (!clef_omni_encode_record_audio(req,&opts,&reserve,out,err,errlen)) return false;
     if (n_images) {
         out->images = calloc(n_images, sizeof(*out->images));
         if (!out->images) return fail(err, errlen, "out of memory", NULL, 0);
@@ -435,6 +487,15 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         return fail(err, errlen, "at least one question is required", NULL, 0);
     }
     const jval *images = json_get(req, "images"), *videos = json_get(req, "videos");
+    const jval *audio = json_get(req, "audio");
+    /* `record.get("audio") or []`: falsy values mean no audio, as for images. */
+    if (truthy(audio) && audio->type != J_ARRAY)
+        return fail(err, errlen, "audio must be a list", NULL, 0);
+    const size_t n_audio = audio && audio->type == J_ARRAY ? audio->n : 0;
+    if (n_audio && (opts.model.backbone != CLEF_OMNI || !opts.audio.token_id))
+        return fail(err, errlen, "audio is not supported by this model file", NULL, 0);
+    if (n_audio && (n_audio>INT32_MAX || (opts.audio.max_items>0 && n_audio>(size_t)opts.audio.max_items)))
+        return fail(err,errlen,"too many audio items per request",NULL,0);
     if (videos && videos->type != J_NULL && videos->type != J_ARRAY)
         return fail(err, errlen, "videos must be a list", NULL, 0);
     const size_t n_videos = videos && videos->type == J_ARRAY ? videos->n : 0;
@@ -619,7 +680,7 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
      * state yields to the media and is tokenized later, as before. */
     bool state_done = false;
     size_t state_reserve = 0;
-    if (ok && (n_images || n_videos) && opts.reject_truncation) {
+    if (ok && (n_images || n_videos || n_audio) && opts.reject_truncation) {
         size_t cap = (size_t)opts.max_length + 1;
         if (opts.max_state_tokens >= 0 && (size_t)opts.max_state_tokens + 1 < cap) cap = (size_t)opts.max_state_tokens + 1;
         b.len = 0;
@@ -631,7 +692,7 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     }
 
     /* Media follows the schema and that state, which count toward every allocation budget. */
-    if (ok && (n_images || n_videos) && !encode_media(tok, req, images, n_images, videos, n_videos,
+    if (ok && (n_images || n_videos || n_audio) && !encode_media(tok, req, images, n_images, videos, n_videos,
                                                    opts, schema.len + state_reserve, out, err, errlen)) {
         jbuf_free(&b);
         clef_tokens_free(&schema);
@@ -644,7 +705,9 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
         jbuf_puts(&b, SYSTEM_PROMPT);
         jbuf_puts(&b, PROMPT_USER);
         ok = tok_jbuf(tok, &b, false, &prefix);   /* template: real control tokens */
-        if (ok && out->n_images) {
+        if (ok && (out->n_images || out->n_audio) && opts.model.backbone == CLEF_OMNI) {
+            ok = clef_omni_append_visual_tokens(tok,out,&opts,&prefix,err,errlen);
+        } else if (ok && out->n_images) {
             /* _encode_media: "<|vision_start|><|image_pad|><|vision_end|>" per image, then "\n",
              * tokenized by the processor, which expands each <|image_pad|> to the image's tokens.
              * These are engine-made control tokens, never request text, in both modes. */
@@ -742,6 +805,11 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
             return false;
         }
     }
+    if(out->n_audio) {
+        int count=0;
+        for(size_t i=0;i<out->ids.len;i++)count+=out->ids.ids[i]==opts.audio.token_id;
+        if(count!=out->n_audio_tokens)return fail(err,errlen,"audio placeholder tokens in request content do not match features",NULL,0);
+    }
     return true;
 }
 
@@ -765,10 +833,11 @@ static bool json_halves(const jval *v) {   /* [0.5, 0.5, 0.5] */
  * one (Codex on a82292d). Each field the converter checks is checked again here, and the recorded
  * geometry and pixel bounds must equal the numeric keys the engine uses. */
 static bool processor_supported(const gguf_file *f, uint32_t patch, uint32_t merge, uint32_t temporal,
-                                uint32_t min_px, uint32_t max_px, char *err, size_t errlen) {
+                                uint32_t min_px, uint32_t max_px, bool video, char *err, size_t errlen) {
     gguf_str text;
-    if (!gguf_get_str(f, "clef.vision.image_processor", &text)) {
-        snprintf(err, errlen, "model: incomplete clef.vision.* keys (no image_processor)");
+    const char *key = video ? "clef.vision.video_processor" : "clef.vision.image_processor";
+    if (!gguf_get_str(f, key, &text)) {
+        snprintf(err, errlen, "model: incomplete clef.vision.* keys (no %s)",video ? "video_processor" : "image_processor");
         return false;
     }
     jarena *a = jarena_new();
@@ -778,7 +847,10 @@ static bool processor_supported(const gguf_file *f, uint32_t patch, uint32_t mer
     const jval *size = ip && ip->type == J_OBJECT ? json_get(ip, "size") : NULL;
     const jval *rescale = ip && ip->type == J_OBJECT ? json_get(ip, "rescale_factor") : NULL;
     const bool ok = ip && ip->type == J_OBJECT &&
-        json_str_eq(json_get(ip, "image_processor_type"), "Qwen2VLImageProcessor") &&
+        json_str_eq(json_get(ip, video ? "video_processor_type" : "image_processor_type"),
+                    video ? "Qwen2VLVideoProcessor" : "Qwen2VLImageProcessor") &&
+        (!video || (json_get(ip,"do_sample_frames") && json_get(ip,"do_sample_frames")->type == J_FALSE &&
+                    json_get(ip,"return_metadata") && json_get(ip,"return_metadata")->type == J_FALSE)) &&
         json_int_is(json_get(ip, "resample"), 3) &&
         json_halves(json_get(ip, "image_mean")) && json_halves(json_get(ip, "image_std")) &&
         rescale && rescale->type == J_FLOAT && fabs(rescale->f - 1.0 / 255) <= 1e-12 &&
@@ -791,11 +863,17 @@ static bool processor_supported(const gguf_file *f, uint32_t patch, uint32_t mer
         size && size->type == J_OBJECT && json_int_is(json_get(size, "shortest_edge"), min_px) &&
         json_int_is(json_get(size, "longest_edge"), max_px);
     jarena_free(a);
-    if (!ok) snprintf(err, errlen, "model: clef.vision.image_processor describes preprocessing this engine does not implement");
+    if (!ok) snprintf(err, errlen, "model: %s describes preprocessing this engine does not implement",key);
     return ok;
 }
 
 bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, size_t errlen) {
+    clef_model_info model;
+    if (!clef_model_info_load(f, &model, err, errlen)) return false;
+    if (model.backbone == CLEF_OMNI && !(model.capabilities & CLEF_CAP_VISION)) {
+        v->image_token_id = v->video_token_id = v->start_token_id = v->end_token_id = 0;
+        return true;
+    }
     uint32_t patch, merge, temporal, min_px, max_px, image_id, start_id, end_id, video_id, vocab;
     if (!gguf_find_kv(f, "clef.vision.image_token_id")) {
         /* a model file converted without the vision tower: text only */
@@ -833,7 +911,22 @@ bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, s
                  image_id, start_id, end_id, video_id);
         return false;
     }
-    if (!processor_supported(f, patch, merge, temporal, min_px, max_px, err, errlen)) return false;
+    if (model.backbone == CLEF_OMNI) {
+        if (min_px != 65536 || max_px != 1048576) {
+            snprintf(err,errlen,"model: unsupported Omni image defaults");
+            return false;
+        }
+        // The pinned encoder overrides the serialized Qwen2VL size. Validate
+        // both the source processor and the effective numeric metadata.
+        uint32_t video_min, video_max;
+        if (!gguf_get_u32(f,"clef.vision.video.min_pixels",&video_min) || video_min != 131072 ||
+            !gguf_get_u32(f,"clef.vision.video.max_pixels",&video_max) || video_max != 786432) {
+            snprintf(err,errlen,"model: unsupported Omni video defaults");
+            return false;
+        }
+        if (!processor_supported(f,patch,merge,temporal,3136,12845056,false,err,errlen) ||
+            !processor_supported(f,patch,merge,temporal,3136,12845056,true,err,errlen)) return false;
+    } else if (!processor_supported(f, patch, merge, temporal, min_px, max_px, false, err, errlen)) return false;
     v->image = (clef_image_params){ (long)min_px, (long)max_px, (int)patch, (int)merge, (int)temporal };
     v->image_token_id = (int32_t)image_id;
     v->start_token_id = (int32_t)start_id;
@@ -843,6 +936,10 @@ bool clef_vision_opts_load(const gguf_file *f, clef_vision_opts *v, char *err, s
 }
 
 void clef_record_positions(const clef_record *r, int32_t *pos3) {
+    if (r->pos3) {
+        memcpy(pos3,r->pos3,r->ids.len*3*sizeof(*pos3));
+        return;
+    }
     const int32_t T = (int32_t)r->ids.len;
     int32_t cur = 0, t = 0;
     int next = 0;   /* images are in token order */
@@ -868,7 +965,16 @@ void clef_record_positions(const clef_record *r, int32_t *pos3) {
 bool clef_encode_request(const clef_tokenizer *tok, const jval *req, clef_encode_opts opts,
                          clef_record *out, char *err, size_t errlen) {
     memset(out, 0, sizeof(*out));
-    if (encode_request(tok, req, opts, out, err, errlen)) return true;
+    if (opts.max_length <= 0 || (opts.model.context_length && opts.max_length > opts.model.context_length)) {
+        snprintf(err, errlen, "max_length exceeds this model's context limit or is not positive");
+        return false;
+    }
+    clef_video_request expanded = {0};
+    if (!clef_video_expand(req, opts, &expanded, err, errlen)) return false;
+    bool ok = encode_request(tok, expanded.members ? &expanded.request : req, opts, out, err, errlen) &&
+              (opts.model.backbone != CLEF_OMNI || clef_omni_positions(out,err,errlen));
+    clef_video_request_free(&expanded);
+    if (ok) return true;
     clef_record_free(out);  /* every failure path, including ones after partial allocation */
     return false;
 }

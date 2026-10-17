@@ -110,9 +110,17 @@ def main() -> None:
     parser.add_argument("model_dir", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument("--vocab-only", action="store_true", help="metadata + tokenizer only (for tokenizer tests)")
+    parser.add_argument("--modalities", choices=("text", "vision", "all"), default="all",
+                        help="Omni export capabilities; vision includes text (default: all)")
     args = parser.parse_args()
 
     config = json.loads((args.model_dir / "config.json").read_text())
+    if config.get("model_type") == "qwen3_omni_moe":
+        from convert_omni import convert_omni
+        convert_omni(args.model_dir, args.output, vocab_only=args.vocab_only, modalities=args.modalities)
+        return
+    if args.modalities != "all":
+        raise ValueError("--modalities is only supported for Omni")
     if config.get("model_type") != "qwen3_5":
         raise ValueError(f"unsupported model_type {config.get('model_type')}")
     text = config["text_config"]

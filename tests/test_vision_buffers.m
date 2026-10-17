@@ -18,16 +18,19 @@ static void require(bool ok, const char *why) {
     if (!ok) { fprintf(stderr, "vision buffers: %s\n", why); exit(1); }
 }
 static NSArray *vision_buffers(clef_gpu *g) {
-    return @[g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv,
-             g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat];
+    NSMutableArray *all=[NSMutableArray arrayWithArray:@[g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv,
+             g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat]];
+    for(int i=0;i<3;i++)if(g->deepstack[i])[all addObject:g->deepstack[i]];
+    return all;
 }
 int main(void) {
-    @autoreleasepool {
+    for(int omni=0;omni<2;omni++) @autoreleasepool {
         clef_gpu *g = calloc(1, sizeof(*g)); require(g != NULL, "host allocation");
         VisionFailDevice *dev = [VisionFailDevice new]; dev.inner = MTLCreateSystemDefaultDevice();
         require(dev.inner != nil, "no GPU"); g->dev = (id<MTLDevice>)dev;
         g->vis_f32 = g->vis_comp = true;
         clef_config c = {0}; c.v_E = 1152; c.v_ff = 4304; c.v_in = 1536; c.v_merge = 2;
+        c.model.backbone=omni ? CLEF_OMNI : CLEF_QWEN35;
         char err[256];
         // Text-only capacity must not allocate image features: a [capacity][H] FP32 buffer per
         // growth cost 256 MiB on Flash (320 MiB on the 27B) at 16,384 tokens with no image in
@@ -36,10 +39,13 @@ int main(void) {
         c.Hk = 1; c.Hv = 1; c.dk = 16; c.dv = 16;
         require(ensure_capacity(g, &c, 1024, 1, err, sizeof(err)), "text capacity");
         require(g->feat == nil, "text-only capacity allocated an image feature buffer");
+        for(int i=0;i<3;i++)require(g->deepstack[i]==nil,"text-only capacity allocated DeepStack features");
         require(ensure_vision_capacity(g, &c, 4, 4, err, sizeof(err)), "initial capacity");
         require(g->vsplit.length == (size_t)g->vcap * c.v_in * 4, "compensation scratch size");
         require(g->feat.length == (size_t)g->vcap_total / 4 * c.H * 4, "feature rows follow the pass's patches");
         NSArray *old = vision_buffers(g); const int cap = g->vcap, total = g->vcap_total;
+        require(old.count==(omni?20u:17u),"wrong visual allocation count");
+        if(omni)for(int i=0;i<3;i++)require(g->deepstack[i].length==g->feat.length,"DeepStack feature capacity");
         for (int fail = 1; fail <= (int)old.count; fail++) {
             dev.calls = 0; dev.fail_at = fail;
             require(!ensure_vision_capacity(g, &c, cap + 1, total + 1, err, sizeof(err)), "allocation failure accepted");
@@ -82,8 +88,8 @@ int main(void) {
                 "text replacement retained image features");
         clef_gpu_prefix_free(px);
         clef_gpu_close(g);
-        puts("vision buffers: text-only capacity without image features, 17 allocation failures/recovery, "
-             "cache feature growth/budget and maximum keep-warm buffer list PASS");
+        printf("vision buffers: %s, %lu allocation failures/recovery, text-only capacity, cache and keep-warm PASS\n",
+               omni?"Omni":"Qwen3.5",(unsigned long)old.count);
     }
     return 0;
 }

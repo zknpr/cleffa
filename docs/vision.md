@@ -399,7 +399,7 @@ scans were refused in both forms already. A Huffman failure is now a failure eve
 reader counts the padding it appends, so a scan that consumed any of it, even inside a code that
 happened to decode, is refused (`jpeg_overran`); lookahead may still buffer padding without
 consuming it. Every cut file is refused now, Pillow's warning case as a deliberate divergence listed
-in the README. `tests/test_image.py` adds a progressive file cut with and without EOI (both decoded
+in [the security notes](security.md#deliberate-divergences). `tests/test_image.py` adds a progressive file cut with and without EOI (both decoded
 before); all 98 parity images and 1,925 corpus files still decode identically. A 15-minute
 differential run on the result executed 133.7 million inputs with no finding
 (`golden/fuzz-image-2026-10-07/review14/`).
@@ -410,7 +410,7 @@ progressive path at the end of the data. Pillow refuses every progressive one as
 baseline its answer depends on what follows the scan: it refused a file ending there or one byte
 later, and decoded one with eight bytes or two other bytes in place of EOI, so it follows its own
 read-ahead, not the file. EOI is now required for every JPEG; the baseline image is held until the
-decoding pass reaches it. The two baseline files Pillow decodes become refusals listed in the README;
+decoding pass reaches it. The two baseline files Pillow decodes become refusals listed in [the security notes](security.md#deliberate-divergences);
 bytes after EOI are still ignored. `tests/test_image.py` adds three files without EOI (all decoded
 before) and one with bytes after EOI as a parity case. (39) Refuted: an ancillary chunk before IHDR
 (tEXt, gAMA or a private chunk), which the PNG specification forbids, is decoded by Pillow, and the

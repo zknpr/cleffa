@@ -25,13 +25,40 @@ def main() -> None:
     ap.add_argument("golden_dir", type=Path)
     ap.add_argument("--out", type=Path, help="write here instead of GOLDEN_DIR/encoded.jsonl")
     args = ap.parse_args()
+    config = json.loads((args.model_dir/'config.json').read_text())
+    is_omni = config.get('model_type') == 'qwen3_omni_moe'
+    if is_omni:
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
+        from verify_snapshot import load_manifest, verify_snapshot
+        from omni import REVISION
+        bad = verify_snapshot(args.model_dir,load_manifest(REVISION))
+        if bad:
+            raise ValueError('snapshot verification failed: '+'; '.join(bad))
     sys.path.insert(0, str(args.model_dir.resolve()))
     from joint_schema_model import encode_record
     from transformers import AutoProcessor
 
-    tok = AutoProcessor.from_pretrained(args.model_dir).tokenizer   # as load_release_model builds it
+    processor = AutoProcessor.from_pretrained(args.model_dir)
+    tok = processor.tokenizer   # as load_release_model builds it
     requests = [json.loads(l) for l in open(args.golden_dir / "requests.jsonl")]
-    text = "".join(golden_io.encoded_line(r, encode_record(tok, r)) for r in requests)
+    if is_omni:
+        import torch
+        from transformers import Qwen3OmniMoeThinkerConfig
+        from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import Qwen3OmniMoeThinkerForConditionalGeneration
+        from joint_schema_model import load_image
+        from omni_media import media_layout, encode_reference
+        # Positions use only config and token/grid tensors. Meta construction
+        # keeps this host oracle independent of the 61 GB inference weights.
+        with torch.device('meta'):
+            thinker = Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3OmniMoeThinkerConfig(**config['thinker_config']))
+        lines = []
+        for request in requests:
+            encoded = encode_reference(encode_record,request,processor)
+            layout = media_layout(encoded,thinker,processor) if encoded.media else None
+            lines.append(golden_io.encoded_line(request,encoded,media_layout=layout))
+        text = ''.join(lines)
+    else:
+        text = "".join(golden_io.encoded_line(r, encode_record(tok, r)) for r in requests)
     out = args.out or args.golden_dir / "encoded.jsonl"
     if out.exists() and out.read_text() != text:
         sys.exit(f"{out} exists and differs; not overwriting")

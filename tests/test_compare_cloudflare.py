@@ -10,10 +10,170 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bench"))
 from compare_cloudflare import (check_input_ids, check_local_binding, confidence_value, decision, distribution,
-                                hosted_snapshot, load_hosted, local_snapshot, oracle_dtype, oracle_snapshot, score_value)
+                                hosted_snapshot, load_hosted, local_snapshot, oracle_dtype, oracle_snapshot, score_value,
+                                metrics, wilson_interval, capture_records, classify_disagreement,
+                                compare_evaluation)
 
 
 class ComparisonTests(unittest.TestCase):
+    def test_invalidated_stock_control_cannot_explain_hosted_disagreement(self):
+        row = dict(id="r", question="q", modality="text", F_top2_probability_margin=.01,
+                   C={"a": .51, "b": .49}, H1={"a": .49, "b": .51},
+                   B={"a": .48, "b": .52}, C_decision="a", H1_decision="b",
+                   B_decision="b", F_decision="a", C_F_input_ids_match=True,
+                   B_F_input_ids_match=True, H1_counts_match=True)
+        band = dict(threshold=.1, included=[dict(id="r", question="q")],
+                    invalidated_reason="causal-mask leakage reproduced")
+        got = classify_disagreement(row, "H1", band)
+        self.assertFalse(got["precision_eligible"])
+        self.assertEqual(got["category"], "unexplained; stock control failed correctness audit")
+        self.assertEqual(got["stock_control_invalidated"], band["invalidated_reason"])
+        self.assertEqual(got["precision_band"], .1)  # Preserve the frozen historical value.
+
+    def test_control_audit_requires_bound_evidence_and_only_revokes_controls(self):
+        from compare_cloudflare import load_control_audit
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            evidence = root / "probe.json"
+            evidence.write_text('{"causal_backend_valid": false}')
+            audit = dict(complete=True, bands_sha256="bands", stock_sources={"stock.json": "sha"},
+                         invalid_models={"clef-flash": "mask leakage"},
+                         evidence={str(evidence): hashlib.sha256(evidence.read_bytes()).hexdigest()})
+            path = root / "audit.json"
+            path.write_text(json.dumps(audit))
+            got = load_control_audit(path, "bands", audit["stock_sources"], {"clef-flash"})
+            self.assertEqual(got["invalid_models"], audit["invalid_models"])
+            with self.assertRaisesRegex(ValueError, "bands"):
+                load_control_audit(path, "other", audit["stock_sources"], {"clef-flash"})
+            with self.assertRaisesRegex(ValueError, "stock"):
+                load_control_audit(path, "bands", {}, {"clef-flash"})
+            with self.assertRaisesRegex(ValueError, "models"):
+                load_control_audit(path, "bands", audit["stock_sources"], {"clef"})
+            evidence.write_text("changed")
+            with self.assertRaisesRegex(ValueError, "evidence"):
+                load_control_audit(path, "bands", audit["stock_sources"], {"clef-flash"})
+
+    def test_five_arm_evaluation_preserves_failures_and_audits_frozen_band(self):
+        import numpy as np
+        from safetensors.numpy import save
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = {"questions": {"q": {"type": "noul"}}}
+            body_hash = hashlib.sha256(json.dumps(payload).encode()).hexdigest()
+            encoding = {"id": "r", "input_ids": [1, 2], "questions": [
+                {"id": "q", "type": 0, "option_ids": ["true", "false"]}]}
+            token_hash = hashlib.sha256(json.dumps(encoding["input_ids"]).encode()).hexdigest()
+            row = dict(model="clef", id="r", modality="text", request=payload,
+                       request_sha256=body_hash, input_ids_sha256=token_hash, full_input_tokens=2,
+                       questions=encoding["questions"], golden=str(root))
+            plan = dict(type="plan", requests=[row], passes=2, planned_calls=3, protocol_sha256="registered")
+            def write(name, value):
+                path = root / name; path.write_text(json.dumps(value)); return path
+            plan_path = write("plan.json", plan)
+            (root / "requests.jsonl").write_text(json.dumps({"id": "r", **payload}) + "\n")
+            (root / "encoded.jsonl").write_text(json.dumps(encoding) + "\n")
+            raw = np.array([2., 0.], dtype=np.float32)
+            (root / "logits.safetensors").write_bytes(save({"r/q": raw}))
+            write("latency.json", {"dtype": "float32"})
+            def response(p):
+                return {"model": "clef", "answers": {"q": {"type": "noul", "noul": p}},
+                        "usage": {"input_tokens": 2}}
+            common = dict(id="r", request_sha256=body_hash, input_ids_sha256=token_hash, tokens=2)
+            c_path = write("native.json", {"model": "clef", "complete": True,
+                "arm": "strict native HTTP", "strict": True, "hashes": {"clef-server": "binary"},
+                "records": [{**common, "response": response(.9)}]})
+            b_path = write("stock.json", {"model": "clef", "complete": True,
+                "profile": "stock model-card loader and Transformers defaults",
+                "records": [{**common, "response": response(.7)}]})
+            prob = float(np.exp(2) / (np.exp(2) + 1))
+            band = dict(threshold=prob-.7, included=[dict(id="r", question="q",
+                        max_abs_dp=prob-.7, fp32_top2_probability_margin=2*prob-1)])
+            bands = dict(plan_sha256=hashlib.sha256(plan_path.read_bytes()).hexdigest(),
+                         protocol_sha256="registered", frozen_at="before scoring",
+                         stock_sources={"stock.json": hashlib.sha256(b_path.read_bytes()).hexdigest()},
+                         models={"clef": band})
+            bands_path = write("bands.json", bands)
+            calls = [dict(type="call", model="clef", id="r", request_sha256=body_hash,
+                          status=200, warmup=p == -1, **{"pass": p}, response=response(.1),
+                          answer=response(.1), reported_input_tokens=2, full_input_reported=True)
+                     for p in (-1, 0)]
+            calls.append(dict(type="call", model="clef", id="r", request_sha256=body_hash,
+                              status=422, warmup=False, **{"pass": 1}, error="HTTP 422",
+                              response={"success": False}))
+            hosted = root / "hosted.jsonl"
+            def save_hosted():
+                hosted.write_text("".join(json.dumps(r) + "\n" for r in [plan, *calls, {"type": "complete"}]))
+            save_hosted()
+            def compare():
+                return compare_evaluation(plan_path, bands_path, [hosted], [c_path], [b_path])["models"]["clef"]
+            got = compare()
+            self.assertEqual(got["comparisons"]["C_vs_H1"]["all_valid"]["questions"], 1)
+            self.assertEqual(got["comparisons"]["C_vs_H1"]["all_valid"]["decision_agreement"], 0)
+            self.assertEqual(got["comparisons"]["C_vs_H2"]["all_valid"]["questions"], 0)
+            self.assertEqual(got["comparisons"]["H1_vs_H2"]["all_valid"]["questions"], 0)
+            self.assertEqual(got["coverage"][0]["H2"]["status"], 422)
+            self.assertIn("hosted and HF deployment differ", got["disagreements"][0]["category"])
+            evidence = write("probe.json", {"complete": True, "causal_backend_valid": False})
+            audit = write("audit.json", dict(complete=True,
+                bands_sha256=hashlib.sha256(bands_path.read_bytes()).hexdigest(),
+                stock_sources=bands["stock_sources"], invalid_models={"clef": "mask leakage"},
+                evidence={str(evidence): hashlib.sha256(evidence.read_bytes()).hexdigest()}))
+            revised = compare_evaluation(plan_path, bands_path, [hosted], [c_path], [b_path], audit)
+            self.assertEqual(revised["models"]["clef"]["comparisons"], got["comparisons"])
+            self.assertEqual(revised["models"]["clef"]["stock_control_invalidated"], "mask leakage")
+            self.assertEqual(revised["models"]["clef"]["disagreements"][0]["category"],
+                             "unexplained; stock control failed correctness audit")
+            self.assertEqual(revised["control_audit"]["sha256"], hashlib.sha256(audit.read_bytes()).hexdigest())
+            band["threshold"] = 1.
+            write("bands.json", bands)
+            with self.assertRaisesRegex(ValueError, "threshold"):
+                compare()
+            band["threshold"] = prob-.7
+            write("bands.json", bands)
+            calls[0]["request_sha256"] = "changed"
+            save_hosted()
+            with self.assertRaisesRegex(ValueError, "planned request"):
+                compare()
+
+    def test_precision_classification_never_uses_missing_or_mismatched_controls(self):
+        row = dict(id="r", question="q", modality="video", F_top2_probability_margin=.01,
+                   C={"a": .51, "b": .49}, H1={"a": .49, "b": .51},
+                   C_decision="a", H1_decision="b", F_decision="a",
+                   C_F_input_ids_match=True, B_F_input_ids_match=False, H1_counts_match=True)
+        band = dict(threshold=.1, included=[dict(id="r", question="q")])
+        self.assertIn("stock control unavailable", classify_disagreement(row, "H1", band)["category"])
+        row.update(B={"a": .48, "b": .52}, B_decision="b", B_F_input_ids_match=True)
+        self.assertIn("inside preregistered", classify_disagreement(row, "H1", band)["category"])
+        row["H1_counts_match"] = False
+        self.assertIn("input count differs", classify_disagreement(row, "H1", band)["category"])
+        self.assertFalse(classify_disagreement(row, "H1", band)["precision_eligible"])
+
+    def test_capture_selection_cannot_reuse_stale_success_for_failed_final_body(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plan = {("clef", "r"): dict(request_sha256="final")}
+            report = dict(model="clef", complete=True, profile="stock model-card loader and Transformers defaults")
+            old = root / "old.json"; new = root / "new.json"
+            old.write_text(json.dumps({**report, "records": [dict(id="r", request_sha256="old", response={})]}))
+            new.write_text(json.dumps({**report, "records": [dict(id="r", request_sha256="final", error="decoder failed")]}))
+            records, sources = capture_records([old, new], plan, "B")
+            self.assertEqual(records["clef", "r"]["error"], "decoder failed")
+            self.assertEqual(sources[0]["stale_bodies"], ["r"])
+
+    def test_agreement_interval_and_probability_tail(self):
+        low,high=wilson_interval(5,10)
+        self.assertAlmostEqual(low,0.236593090512564,places=12)
+        self.assertAlmostEqual(high,0.763406909487436,places=12)
+        self.assertIsNone(wilson_interval(0,0))
+        rows=[dict(id='r'+str(i),question='q',C={'a':.6,'b':.4},H={'a':p,'b':1-p},
+                   C_decision='a',H_decision='a' if p>=.5 else 'b') for i,p in enumerate((.6,.8,.4))]
+        got=metrics(rows,'C','H')
+        self.assertEqual(got['questions'],3)
+        self.assertEqual(got['decision_agreement'],2)
+        self.assertAlmostEqual(got['mean_max_probability_delta'],.4/3)
+        self.assertAlmostEqual(got['p99_max_probability_delta'],.2)
+        self.assertEqual(got['disagreements'],['r2/q'])
+
     def test_probabilities_require_all_options_and_finite_mass(self):
         for probs in [{"a": 1}, {"a": True, "b": 0}, {"a": float("nan"), "b": 1},
                       {"a": 0.8, "b": 0.8}, {"a": 1.1, "b": -0.1}]:

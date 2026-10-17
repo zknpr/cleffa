@@ -1,9 +1,10 @@
 # Video
 
-How video enters the engine as frame arrays, how a local MP4/MOV clip becomes one, what was
-checked against the reference, and what it costs. Video reuses the image path described in
-[vision.md](vision.md): its decoders, resize kernel, tower and caches. Numbers are from the one
-tested M5 Max (128 GB), one GPU job at a time, as the other reports.
+How video enters as frame arrays or encoded MP4/MOV uploads, how the offline converter turns a
+local clip into a frame array, what was checked against the reference, and what it costs. Video
+reuses the image path described in [vision.md](vision.md): its decoders, resize kernel, tower
+and caches. Numbers are from the one tested M5 Max (128 GB), one GPU job at a time, as the other
+reports.
 
 ## Pipeline
 
@@ -17,8 +18,8 @@ both snapshots, are in `clef_video.h`. The engine reproduces it from a frame arr
    a side. Presampled input carries `frame_indices` (strictly increasing integers, one per frame,
    within `total_num_frames`) with the original average `fps` and
    `media_kwargs.videos_kwargs.do_sample_frames: false`. These indices, not a nominal sampling
-   rate, determine the timestamps. Indexed frames with sampling enabled are refused, and so are
-   compressed video uploads, with a pointer to the converter.
+   rate, determine the timestamps. Indexed frames with sampling enabled are refused. Encoded uploads first pass
+   through the optional codec worker described below.
 2. **Sample**: uniform, following the processor's NumPy `linspace`/`round` rule, at a target
    2 FPS with at least four frames when available and at most 768. `num_frames` selects a count
    instead and clears the default sampling FPS, as `fps: null` does in the reference.
@@ -53,11 +54,53 @@ the schema and any untruncatable state reserved, before resizing or allocating p
 pixels per frame (`--max-image-pixels`) and concurrent media requests (`--max-image-requests`)
 use the existing image limits.
 
+## Encoded uploads
+
+Build the optional worker with `make media`, using the FFmpeg development libraries
+and pkg-config. `clef`, `clef-server` and `clef-tool` find `clef-media` beside their
+own executable. The server accepts uploads only with `--allow-encoded-video` and the CLI unless it
+gets `--no-encoded-video`; a refused upload is rejected before any decoding. `clef-tool` always
+allows them. A missing worker is an explicit
+request error. The main executables
+retain their existing dependencies; no Python interpreter participates in decoding.
+
+The wire forms are `{"content_type":"video/mp4","base64":"..."}`,
+`{"content_type":"video/quicktime","base64":"..."}` and the corresponding data URLs.
+One request must use encoded clips consistently or frame arrays consistently.
+H.264, HEVC, ProRes and MJPEG are supported. Dense sampling preserves source indices
+and FPS. Omni samples by presentation timestamps at 2 FPS, applies the pinned
+262,144-pixel decode bound, duplicates an odd last frame and includes a mono 16 kHz
+float soundtrack, from AAC, ALAC, MP3, FLAC, Opus or PCM; other audio codecs are refused
+(the reference decodes any that PyAV opens). An Omni model file exported without the audio tower
+takes the frames and ignores the soundtrack, as the dense models do. Processor options retain their
+existing validation rules.
+
+The parent owns a bounded, private input snapshot and starts the worker without a
+shell. The worker uses custom in-memory AVIO, forces the MOV demuxer, disables
+external data references and rejects additional resource opens. It inherits only
+stdin/stdout/stderr. Limits are 64 MiB input, 18,000 source frames, 600 seconds,
+16,777,216 source pixels, 256 MiB sampled RGB and 384 MiB decoded JSON per request.
+The parent enforces a 30-second wall deadline per clip, kills and reaps failures,
+and bounds stdout while draining stderr. The worker also limits CPU time and
+codec threads. Existing server body and media-slot limits remain active while
+it decodes. This is process isolation, not an OS privilege sandbox.
+
+`tests/test_encoded_video.py` compares RGB pixels and float audio samples exactly
+with the pinned PyAV loader, including scaled H.264, HEVC, ProRes, MJPEG, timestamp
+sampling and offset soundtracks. It compares token IDs, positions and patches with
+the frame-array path and checks malformed inputs and resource limits.
+`tests/test_server_encoded_video.py` covers strict HTTP parity, concurrent workers
+and recovery after rejection. `make test-encoded-video` builds the worker and runs
+`tests/test_encoded_video.py` with the worker's C tests; it needs the FFmpeg libraries and is
+not part of `make test`. These checks establish local preprocessing parity; they do not
+establish Cloudflare's internal decoder behavior. Encoded `vd000` timings for Flash and 27B are
+in the [performance history](performance-history.md#current-native-and-hosted-timings).
+
 ## Converter
 
 `tools/video_request.py` turns one local MP4/MOV into a frame-array request. It runs `ffprobe`
-and `ffmpeg` as separate processes. No engine binary links or starts a video decoder, and
-`make test` does not need FFmpeg.
+and `ffmpeg` as separate processes. This offline converter remains available;
+`make test` does not need FFmpeg. Encoded-upload checks run separately.
 
 - **Input:** H.264, HEVC, ProRes or MJPEG in MP4/MOV, with exactly one video track. Audio is
   ignored, stored orientation preserved, HDR not tone-mapped. Clips need a known frame count and
@@ -101,7 +144,7 @@ frame host suite passes with FFmpeg absent from PATH, and `otool -L` shows no FF
 any of the three engine binaries.
 
 Divergences from the reference (it answers or behaves differently; the engine errors):
-compressed video; source frame counts, durations, FPS or sample counts outside the limits above;
+unsupported containers/codecs; source frame counts, durations, FPS or sample counts outside the limits above;
 indexed frames with sampling enabled; `videos_kwargs` other than `fps`, `num_frames`, `size` and
 `do_sample_frames`, or a `size` without both positive bounds.
 
@@ -200,10 +243,10 @@ make video-host-bench
   --clips CLIP.mp4 CLIP.mov
 ```
 
-Input forms, limits and sampling controls for callers are in [README.md](../README.md#video).
+Input forms, limits and sampling controls for callers are in [usage.md](usage.md#video).
 
 ## Not done
 
-- Compressed video in the engine or server; live or unknown-length clips in the converter.
+- Live or unknown-length clips; unsupported containers and codecs.
 - Converter codecs beyond H.264, HEVC, ProRes and MJPEG.
 - Accuracy on real video: the corpus is synthetic and unlabeled.

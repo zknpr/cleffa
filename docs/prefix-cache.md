@@ -339,7 +339,7 @@ uncached cost is therefore not ruled out; these results are not described as a c
 or proof of unchanged latency. The primary 8K and 16K quartets changed direction.
 
 The opt-in cache was integrated for its large, repeatable matching-prefix gains and exact
-outputs, with the uncached timing limitation retained in the README.
+outputs, with the uncached timing limitation retained in [usage.md](usage.md#repeated-growing-and-edited-contexts).
 `root-integration-applied.json` pins the evidence behind that decision. The independent
 exact-alpha experiment was rejected on inconsistent kernel timings and is not part of this
 integration.

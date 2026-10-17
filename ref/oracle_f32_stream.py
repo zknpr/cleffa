@@ -36,12 +36,27 @@ def main() -> None:
     ap.add_argument("model_dir", type=Path)
     ap.add_argument("--name", required=True)
     ap.add_argument("--device", default="mps")
+    ap.add_argument("--max-memory-gib",type=float,default=24.,help="Omni reference budget; two thirds bound the MPS allocator (default: 24 GiB)")
     ap.add_argument("--dump-layers", type=int, default=3)
     ap.add_argument("--safe-attn", action="store_true", help="head-chunked SDPA (MPS >= 2^32 offset bug, ref/safe_attn.py)")
+    ap.add_argument("--omni-attention", choices=['blocked', 'sdpa'],
+                    help="Omni FP32 reference: explicit blocked P@V at all lengths, or bounded SDPA control")
     ap.add_argument("--only", nargs="*", help="request ids to run (default: all); all of them are dumped")
     ap.add_argument("--dump-last", type=int, default=0, help="dump only the last N token rows per layer")
-    ap.add_argument("--corpus", default="text", choices=["text", "vision", "video"])
+    ap.add_argument("--corpus", default="text", choices=["text", "vision", "video", "omni-vision", "omni-video", "omni-long", "audio", "omni-av"])
+    ap.add_argument('--stage-layers', type=int, default=0, help='Omni: reset MPS graph caches in lossless subprocess stages')
     args = ap.parse_args()
+    if json.loads((args.model_dir / "config.json").read_text()).get("model_type") == "qwen3_omni_moe":
+        import omni
+        if args.stage_layers:
+            import omni_staged
+            omni_staged.run(args)
+        else:
+            omni.run(args, streamed=True)
+        return
+
+    if args.omni_attention:
+        ap.error("--omni-attention requires Omni")
 
     sys.path.insert(0, str(args.model_dir.resolve()))
     from joint_schema_model import collate_records, encode_record, load_release_model

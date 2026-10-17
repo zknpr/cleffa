@@ -82,12 +82,15 @@ def redacted(value, token: str):
     return value
 
 
-def collect(run_plan: dict, out, account: str, token: str) -> None:
+def collect(run_plan: dict, out, account: str, token: str, *, before_call=None, after_call=None) -> None:
     conn = http.client.HTTPSConnection("api.cloudflare.com", timeout=120)
     headers = {"Content-Type": "application/json", "Connection": "keep-alive",
                "Authorization": f"Bearer {token}"}
     try:
         models = list(dict.fromkeys(r["model"] for r in run_plan["requests"]))
+        gap = run_plan.get('pass_gap_seconds', 0)
+        if not isinstance(gap, (int, float)) or not 0 <= gap <= 3600:
+            raise ValueError('invalid hosted pass gap')
         for model in models:
             rows = [r for r in run_plan["requests"] if r["model"] == model]
             schedule = [(-1, rows[0])]
@@ -96,13 +99,23 @@ def collect(run_plan: dict, out, account: str, token: str) -> None:
                 random.Random(42 + rep).shuffle(order)
                 schedule.extend((rep, row) for row in order)
             path = f"/client/v4/accounts/{account}/ai/run/@cf/cloudflare/{model}"
+            previous_pass = -1
+            completed = {tuple(key) for key in run_plan.get('completed_calls', [])}
             for rep, row in schedule:
+                if (model, row['id'], rep) in completed:
+                    continue
+                if rep > 0 and rep != previous_pass and gap:
+                    time.sleep(gap)
+                previous_pass = rep
                 body = json.dumps(row["request"]).encode()
                 if hashlib.sha256(body).hexdigest() != row["request_sha256"]:
                     raise ValueError("request changed after planning")
+                if before_call:
+                    before_call(model, row)
                 record = {"type": "call", "model": model, "id": row["id"], "pass": rep,
                           "warmup": rep == -1, "request_sha256": row["request_sha256"],
-                          "full_input_tokens": row["full_input_tokens"]}
+                          "full_input_tokens": row["full_input_tokens"],
+                          "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
                 start = time.perf_counter()
                 try:
                     conn.request("POST", path, body, headers)
@@ -110,7 +123,10 @@ def collect(run_plan: dict, out, account: str, token: str) -> None:
                     raw = result.read(1024 * 1024 + 1)
                     record.update(ms=(time.perf_counter() - start) * 1000, status=result.status,
                                   cf_ray=result.getheader("cf-ray"),
-                                  server_timing=result.getheader("server-timing"))
+                                  server_timing=result.getheader("server-timing"),
+                                  completed_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                                  model_revision_headers={key: result.getheader(key) for key in
+                                      ('x-model-revision', 'cf-model-revision', 'x-model-version')})
                     if len(raw) > 1024 * 1024:
                         raise ValueError("response exceeds 1 MiB")
                     # Do not persist credentials, even if an error body echoes a request header.
@@ -123,9 +139,16 @@ def collect(run_plan: dict, out, account: str, token: str) -> None:
                     record = redacted(record, token)
                     out.write(json.dumps(record) + "\n")
                     out.flush()
+                    if after_call:
+                        after_call(record)
+                    if run_plan.get('record_validation_failures') and record.get('status') in (400, 413, 422):
+                        print(f"{model} {row['id']} pass={rep}: HTTP {record['status']} validation failure recorded", flush=True)
+                        continue
                     raise RuntimeError(f"{model}/{row['id']}: collection failed; see output journal") from None
-                out.write(json.dumps(record) + "\n")
+                out.write(json.dumps(redacted(record, token)) + "\n")
                 out.flush()
+                if after_call:
+                    after_call(record)
                 print(f"{model} {row['id']} pass={rep}: {record['ms']:.1f} ms, "
                       f"reported/full tokens={record['reported_input_tokens']}/{row['full_input_tokens']}",
                       flush=True)

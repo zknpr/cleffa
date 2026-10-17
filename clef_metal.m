@@ -10,51 +10,10 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "clef_engine.h"
+#include "clef_metal_internal.h"
 #include "clef_metal_src.inc"   // clef_metal_src / clef_metal_src_len, generated from metal/clef.metal
 
-struct clef_gpu {
-    id<MTLDevice> dev;
-    id<MTLCommandQueue> queue;
-    id<MTLBuffer> weights;            // the whole mmap'd GGUF, no copy
-    NSMutableDictionary<NSString *, id<MTLComputePipelineState>> *ps;
-    id<MTLBuffer> inv_freq;
-    id<MTLBuffer> keep;               // keep-warm sink (clef_gpu_keepalive)
-    int cap;                          // token capacity of the activation buffers
-    int gdn_cap;                      // longest record capacity, rounded to 32 tokens
-    id<MTLBuffer> gdn_w, gdn_u, gdn_ke, gdn_a, gdn_e;
-    id<MTLBuffer> ids, pos, seq_start, seq_bounds;
-    id<MTLBuffer> x, xn, P, Q, K, V, G, A, Xc, beta, gate, O, hfin, nh32, nh16, mem, mem16, mn16, mn32;
-    id<MTLBuffer> ovf;                // FP16 overflow flags, int per token, set at each record's first token
-    id<MTLBuffer> attn_blk;           // attention_tu query blocks: 8 ints each, at most one block per token
-    id<MTLBuffer> kv[16];
-    int n_kv;
-    // vision tower (encode_vision): per-pass patch uploads sized by the pass's patches, activations
-    // by its largest image; feat holds every image's features, img_row maps tokens to them
-    id<MTLBuffer> vis_inv_freq;
-    int vcap, vcap_total;             // patch capacity of the per-image activations and of the uploads
-    id<MTLBuffer> vpatch, vpatch16, vposidx, vposw;
-    id<MTLBuffer> vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit;
-    id<MTLBuffer> img_row, feat;
-    int act_f16;                      // FP16 GEMM inputs per producer class (ACT_*), else BF16
-    float f16_lim;                    // magnitude past which an FP16 operand counts as overflow
-    bool head_f32;                    // head inputs unrounded, head GEMMs on f32 activations
-    int scan_lpc;                     // lanes per value column in gdn_scan (CLEF_SCAN_LPC)
-    bool attn_ref;                    // CLEF_ATTN_REF=1: the simple reference attention kernel
-    bool attn_tu;                     // attention_tu in FP16 passes; false = FP32 kernels everywhere (CLEF_ATTN_TU=0)
-    bool vis_mpp;                     // CLEF_VIS_MPP=0 keeps simdgroup vision attention
-    bool vis_comp;                    // CLEF_VIS_COMP=0 keeps direct FP32 vision GEMMs
-    bool vis_group;                   // combine equal-grid GEMMs within one record
-    bool vis_f32;                     // retain FP32 vision operands; non-residual GEMMs may compensate (vis_comp)
-    bool debug_poison;                // CLEF_DEBUG_POISON=1 (tests): fill every activation buffer with NaN before each forward
-    bool flash_gemm;                  // Flash matrix shapes qualify for selected short 64-row tiles
-    bool profile;                     // CLEF_PROFILE=1: GPU time per kernel category (serializes!)
-    double prof_ms[16];
-    bool stage_time;                  // CLEF_STAGE_TIME=1: host wall time per forward stage (does not serialize)
-    bool cb_failed;                   // a command buffer or encoder could not be created this pass
-    int nil_cb_at, cb_count;          // test hook CLEF_DEBUG_NIL_CMDBUF: creation #nil_cb_at fails
-    int ck_fail_at, ck_count;         // test hook CLEF_DEBUG_PREFIX_CKPT_FAIL: checkpoint allocation #ck_fail_at fails
-};
+
 
 // Cached backbone state of one record's leading tokens (clef_gpu_forward_prefix). The rows of every
 // buffer are the record's own token indices, so a later request that starts with the same tokens
@@ -69,13 +28,13 @@ struct clef_gpu_prefix {
     id<MTLBuffer> kv[16];                                 // the head's memory K|V rows [cap][2W]
 };
 
-enum { P_GEMM, P_ATTN, P_SCAN, P_NORM, P_ATTNPREP, P_CONV, P_GDNOUT, P_SWIGLU, P_HEAD, P_VISION, P_N };
 // GEMM input classes, by the kernel that produces them; ACT_VIS covers every vision-tower operand
-enum { ACT_NORM = 1, ACT_ATTN = 2, ACT_GDN = 4, ACT_MLP = 8, ACT_VIS = 16 };
-enum { X_BF16, X_F16, X_F32 };
+
 // norm includes the embedding; conv_prep is ssm_conv + gdn_prep; head is the final norm and the GPU half of the head;
-// vision is the whole tower, every image
-static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "norm", "attn_prep", "conv_prep", "gdn_out", "swiglu", "head", "vision" };
+// vision is the whole tower, every image; omni_router is the router and top-8 selection, omni_experts the
+// two expert GEMMs, omni_moe the assignment, gather, SwiGLU and combine around them
+static const char *prof_name[P_N] = { "gemm", "attention", "gdn_scan", "norm", "attn_prep", "conv_prep", "gdn_out", "swiglu", "head", "vision",
+                                      "omni_router", "omni_experts", "omni_moe" };
 
 // Command buffers and encoders are nullable (device loss, resource exhaustion). Messages to nil
 // are no-ops and a nil buffer has no .error, so a missing one let the pass "succeed" without
@@ -108,6 +67,13 @@ static bool prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCo
     return true;
 }
 
+_Static_assert(P_N <= sizeof(((clef_gpu *)0)->prof_ms) / sizeof(double), "profile categories exceed prof_ms");
+
+bool clef_metal_prof(clef_gpu *g, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *enc,
+                     int cat, char *err, size_t errlen) {
+    return prof(g, cb, enc, cat, err, errlen);
+}
+
 static double wall_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -133,7 +99,9 @@ static id<MTLComputePipelineState> pipeline(clef_gpu *g, id<MTLLibrary> lib, con
     // attention_prefix_64 shares that rescaling (review #38). Vision MPP softmax partitions
     // each 32-lane SIMDgroup into four-thread rows, so it requires the same width.
     if ((!strcmp(name, "attention_reuse_4") || !strcmp(name, "attention_prefetch_64") || !strcmp(name, "attention_prefix_64") ||
-         !strcmp(name, "vis_attention_mpp")) &&
+         !strcmp(name, "vis_attention_mpp") || !strcmp(name, "omni_attn_prep") ||
+         !strcmp(name, "omni_attention") || !strcmp(name, "omni_route") || !strcmp(name, "omni_router") ||
+         !strcmp(name, "audio_attention") || !strcmp(name, "audio_norm")) &&
         width != 32) {
         snprintf(err, errlen, "metal: %s requires a 32-lane SIMDgroup", name);
         return nil;
@@ -185,13 +153,32 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
             if (!pipeline(g, lib, names[i], err, errlen)) { free(g); return NULL; }
         }
+        if (e->cfg.model.backbone == CLEF_OMNI) {
+            const char *omni_names[] = { "omni_attn_prep", "omni_attention", "omni_router", "omni_route",
+                                         "omni_assign_count", "omni_assign_offsets", "omni_assign_scatter",
+                                         "omni_gather", "omni_expert_gemm", "omni_swiglu", "omni_combine", "omni_trace",
+                                         "omni_vision_merger_norm", "omni_vision_inject", "omni_vision_residual" };
+            for (size_t i = 0; i < sizeof(omni_names)/sizeof(omni_names[0]); i++) {
+                if (!pipeline(g, lib, omni_names[i], err, errlen)) { free(g); return NULL; }
+            }
+        }
+        if (e->cfg.model.capabilities & CLEF_CAP_AUDIO) {
+            const char *audio_names[] = {"audio_attention","audio_norm","audio_bias","audio_im2col","audio_conv_pack","audio_gather","audio_scatter"};
+            for(size_t i=0;i<sizeof(audio_names)/sizeof(audio_names[0]);i++)
+                if(!pipeline(g,lib,audio_names[i],err,errlen)){free(g);return NULL;}
+        }
 
         const clef_config *c = &e->cfg;
         g->flash_gemm = c->H == 4096;
-        float inv[64];
+        // [0, 64): HF's 1 / base ** (arange(0, dim, 2).float() / dim), all f32, for the dense
+        // models and CLEF_OMNI_ROPE=f32. [64, 192): the FP64 frequency base ** (-2j / dim) as an
+        // FP32 hi/lo pair, for Omni's exact rotary angles (omni_rope_cs).
+        float inv[192] = {0};
         for (int j = 0; j < c->n_rot / 2; j++) {
-            // HF: 1 / base ** (arange(0, dim, 2).float() / dim), all f32
             inv[j] = 1.0f / powf(c->rope_theta, (float)(2 * j) / (float)c->n_rot);
+            const double f = pow((double)c->rope_theta, -(double)(2 * j) / (double)c->n_rot);
+            inv[64 + j] = (float)f;
+            inv[128 + j] = (float)(f - (double)inv[64 + j]);
         }
         g->inv_freq = [g->dev newBufferWithBytes:inv length:sizeof(inv) options:MTLResourceStorageModeShared];
         if (!g->inv_freq) { gerr(err, errlen, "cannot allocate rope table"); free(g); return NULL; }
@@ -237,6 +224,12 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
         // HF BF16 path. The head takes the f32 hidden state and runs its GEMMs on f32 activations
         // (tiny GEMMs); CLEF_HEAD_BF16=1 restores the BF16 rounding the HF BF16 path applies there.
         g->act_f16 = getenv("CLEF_ACT_F16") ? atoi(getenv("CLEF_ACT_F16")) & 31 : ACT_NORM | ACT_ATTN | ACT_GDN | ACT_MLP | ACT_VIS;
+        // Omni begins with FP32 operands through routing/experts. This also makes
+        // the DeltaNet prefix-cache eligibility check select the plain fallback.
+        if (c->model.backbone == CLEF_OMNI) g->act_f16 = 0;
+        // Omni rotary angles to about 1e-7 rad (omni_rope_cs); CLEF_OMNI_ROPE=f32 keeps HF's FP32 angles.
+        const char *orp = getenv("CLEF_OMNI_ROPE");
+        g->omni_rope_exact = !orp || strcmp(orp, "f32") != 0;
         g->head_f32 = getenv("CLEF_HEAD_BF16") == NULL;
         g->nil_cb_at = getenv("CLEF_DEBUG_NIL_CMDBUF") ? atoi(getenv("CLEF_DEBUG_NIL_CMDBUF")) : 0;
         g->ck_fail_at = getenv("CLEF_DEBUG_PREFIX_CKPT_FAIL") ? atoi(getenv("CLEF_DEBUG_PREFIX_CKPT_FAIL")) : 0;
@@ -250,6 +243,8 @@ clef_gpu *clef_gpu_open(const clef_engine *e, char *err, size_t errlen) {
 void clef_gpu_close(clef_gpu *g) {
     if (!g) return;
     @autoreleasepool {
+        clef_omni_free(g);
+        clef_audio_gpu_free(g);
         g->ps = nil; g->weights = nil; g->queue = nil; g->dev = nil;
         g->ids = g->pos = g->seq_start = g->seq_bounds = nil;
         g->x = g->xn = g->P = g->Q = g->K = g->V = g->G = g->A = g->Xc = g->beta = g->gate = g->O = nil;
@@ -257,6 +252,7 @@ void clef_gpu_close(clef_gpu *g) {
         g->gdn_w = g->gdn_u = g->gdn_ke = g->gdn_a = g->gdn_e = nil;
         g->vis_inv_freq = g->vpatch = g->vpatch16 = g->vposidx = g->vposw = g->vx = g->vxn = g->vqkv = nil;
         g->vq = g->vk = g->vv = g->va = g->vff = g->vff16 = g->vm = g->vm16 = g->img_row = g->feat = g->vsplit = nil;
+        for (int i=0;i<3;i++) g->deepstack[i]=nil;
         for (int i = 0; i < 16; i++) g->kv[i] = nil;
     }
     free(g);
@@ -286,7 +282,8 @@ bool clef_gpu_keepalive(clef_gpu *g, char *err, size_t errlen) {
                                 g->A, g->Xc, g->beta, g->gate, g->O, g->hfin, g->nh32, g->nh16, g->mem, g->mem16,
                                 g->mn16, g->mn32, g->ovf, g->attn_blk, g->gdn_w, g->gdn_u, g->gdn_ke, g->gdn_a, g->gdn_e,
                                 g->img_row, g->feat, g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv,
-                                g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit };
+                                g->vq, g->vk, g->vv, g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit,
+                                g->deepstack[0], g->deepstack[1], g->deepstack[2] };
         // Include every possible activation and KV buffer, plus the weights. Adding vision
         // scratch must not overflow this list when all 16 head KV slots are populated.
         id<MTLBuffer> bufs[1 + sizeof(act) / sizeof(act[0]) + sizeof(g->kv) / sizeof(g->kv[0])];
@@ -298,6 +295,8 @@ bool clef_gpu_keepalive(clef_gpu *g, char *err, size_t errlen) {
             [enc setBuffer:bufs[i] offset:0 atIndex:0];
             [enc dispatchThreads:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         }
+        clef_omni_keepalive(g, enc);
+        clef_audio_gpu_keepalive(g, enc);
         [enc endEncoding];
         [cb commit];
         [cb waitUntilCompleted];
@@ -336,13 +335,19 @@ static bool ensure_gdn_capacity(clef_gpu *g, const clef_config *c, int T, char *
 }
 
 static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq, char *err, size_t errlen) {
+    if (T <= 0 || T > INT_MAX/2 || n_seq < 1 || n_seq >= INT_MAX/2)
+        return gerr(err, errlen, "invalid activation capacity");
     if (T <= g->cap && n_seq + 1 <= g->cap) return true;
     int cap = g->cap ? g->cap : 512;
-    while (cap < T || cap < n_seq + 1) cap *= 2;
+    while (cap < T || cap < n_seq + 1) {
+        if (cap > INT_MAX/2) return gerr(err, errlen, "activation capacity overflow");
+        cap *= 2;
+    }
     const size_t Tc = (size_t)cap;
     const int C = 2 * c->Hk * c->dk + c->Hv * c->dv;
     const size_t n_ssm = (size_t)C + (size_t)c->Hv * c->dv + 2 * (size_t)c->Hv;
-    const size_t n_attn = (size_t)c->nh * 2 * c->hd + 2 * (size_t)c->nkv * c->hd;
+    const bool omni = c->model.backbone == CLEF_OMNI;
+    const size_t n_attn = (size_t)c->nh * (omni ? 1 : 2) * c->hd + 2 * (size_t)c->nkv * c->hd;
     size_t maxN = 2 * (size_t)c->ffn;
     if (n_ssm > maxN) maxN = n_ssm;
     if (n_attn > maxN) maxN = n_attn;
@@ -363,7 +368,7 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
         // 16,384 tokens (review #3); embed binds img_row in its place when there are no images
         img_row = buf(g, Tc * 4);
         attn_blk = buf(g, Tc * 32);
-        x = buf(g, Tc * c->H * 4); xn = buf(g, Tc * c->H * 2);
+        x = buf(g, Tc * c->H * 4); xn = buf(g, Tc * c->H * (omni ? 4 : 2));
         P = buf(g, Tc * maxN * 4);
         // test hook (tests/test_grow_fail.sh): simulate the largest allocation failing when
         // capacity would grow past CLEF_DEBUG_GROW_FAIL_ABOVE tokens
@@ -374,12 +379,18 @@ static bool ensure_capacity(clef_gpu *g, const clef_config *c, int T, int n_seq,
         Q = buf(g, Tc * c->nh * c->hd * 4 + slack); K = buf(g, Tc * c->nkv * c->hd * 4 + slack);
         V = buf(g, Tc * c->nkv * c->hd * 4 + slack);
         G = buf(g, Tc * c->nh * c->hd * 4);
-        A = buf(g, Tc * maxA * 2);
+        A = buf(g, omni ? 0 : Tc * maxA * 2);
         Xc = buf(g, Tc * C * 4); beta = buf(g, Tc * c->Hv * 4); gate = buf(g, Tc * c->Hv * 4);
         O = buf(g, Tc * c->Hv * c->dv * 4);
         // the head uses either the 16-bit operands (CLEF_HEAD_BF16) or mn32; the other set is a stub
         const size_t h16 = g->head_f32 ? 0 : 1, h32 = g->head_f32 ? 1 : 0;
-        hfin = buf(g, Tc * c->H * 4); nh32 = buf(g, Tc * c->H * 4); nh16 = buf(g, h16 * Tc * c->H * 2);
+        // Dense decoder temporaries are dead before the head: final RMSNorm reads x
+        // into P, then hidden LayerNorm reads P into x. Their dispatches stay serial,
+        // and residual dumps have already been copied. Keep hfin distinct from nh32;
+        // unusual accepted geometries may have projection scratch narrower than H.
+        hfin = !omni && maxN >= (size_t)c->H ? P : buf(g, Tc * c->H * 4);
+        nh32 = omni ? buf(g, Tc * c->H * 4) : x;
+        nh16 = buf(g, h16 * Tc * c->H * 2);
         mem = buf(g, Tc * c->W * 4); mem16 = buf(g, h16 * Tc * c->W * 2); mn16 = buf(g, h16 * Tc * c->W * 2);
         mn32 = buf(g, h32 * Tc * c->W * 4);
         for (int i = 0; i < g->n_kv; i++) kv[i] = buf(g, Tc * 2 * c->W * 4);
@@ -413,8 +424,11 @@ static bool ensure_vision_capacity(clef_gpu *g, const clef_config *c, int max_pa
     const size_t M = E * (size_t)c->v_merge * c->v_merge;   // merger width, four patches per row
     const size_t ob = g->vis_f32 ? 4 : 2;                     // bytes per GEMM operand element
     id<MTLBuffer> vpatch, vpatch16, vposidx, vposw, vx, vxn, vqkv, vq, vk, vv, va, vff, vff16, vm, vm16, vsplit, feat;
+    id<MTLBuffer> extra[3]={nil,nil,nil};
     @autoreleasepool {
         feat = buf(g, Tp / ((size_t)c->v_merge * c->v_merge) * c->H * 4);
+        if (c->model.backbone == CLEF_OMNI) for (int i=0;i<3;i++)
+            extra[i]=buf(g,Tp/4*c->H*4);
         vpatch = buf(g, Tp * In * 4); vpatch16 = buf(g, g->vis_f32 ? 0 : Tp * In * 2); vposidx = buf(g, Tp * 16); vposw = buf(g, Tp * 16);
         vx = buf(g, Pc * E * 4); vxn = buf(g, Pc * E * ob); vqkv = buf(g, Pc * 3 * E * 4);
         vq = buf(g, Pc * E * 4 + 128 * 72 * 4); vk = buf(g, Pc * E * 4 + 128 * 72 * 4); vv = buf(g, Pc * E * 4 + 128 * 72 * 4); va = buf(g, Pc * E * ob);
@@ -428,7 +442,10 @@ static bool ensure_vision_capacity(clef_gpu *g, const clef_config *c, int max_pa
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
         if (!all[i]) return gerr(err, errlen, "cannot allocate vision buffers (previous buffers kept)");
     }
+    if (c->model.backbone == CLEF_OMNI) for (int i=0;i<3;i++)
+        if (!extra[i]) return gerr(err,errlen,"cannot allocate DeepStack buffers (previous buffers kept)");
     g->feat = feat;
+    for (int i=0;i<3;i++) g->deepstack[i]=extra[i];
     g->vpatch = vpatch; g->vpatch16 = vpatch16; g->vposidx = vposidx; g->vposw = vposw;
     g->vx = vx; g->vxn = vxn; g->vqkv = vqkv; g->vq = vq; g->vk = vk; g->vv = vv; g->va = va;
     g->vff = vff; g->vff16 = vff16; g->vm = vm; g->vm16 = vm16; g->vsplit = vsplit;
@@ -443,7 +460,7 @@ typedef struct { int T, N, K; } gemm_args;
 
 static NSUInteger woff(const gguf_tensor *t) { return (NSUInteger)t->offset; }
 
-static void gemm(clef_gpu *g, id<MTLComputeCommandEncoder> enc, int xt, bool acc, id<MTLBuffer> X, NSUInteger xoff,
+void clef_metal_gemm(clef_gpu *g, id<MTLComputeCommandEncoder> enc, int xt, bool acc, id<MTLBuffer> X, NSUInteger xoff,
                  NSUInteger w_off, int N, int K, id<MTLBuffer> Y, NSUInteger yoff, int T) {
     gemm_args a = { T, N, K };
     // Larger FP16 tiles improve long-prefill GEMMs without changing the K reduction.
@@ -510,7 +527,7 @@ static void vision_gemm(clef_gpu *g, id<MTLComputeCommandEncoder> enc, int xt, b
                         id<MTLBuffer> Y, NSUInteger yoff, int T, const act_args *ac, NSUInteger ovf_off, bool presplit) {
     if (!g->vis_comp || acc || xt != X_F32 || !ac->f16) {
         if (xt != X_F32) {
-            gemm(g, enc, xt, acc, X, xoff, w_off, N, K, Y, yoff, T);
+            clef_metal_gemm(g, enc, xt, acc, X, xoff, w_off, N, K, Y, yoff, T);
             return;
         }
         // The 16-row FP32 tile preserves reductions and saves work at short/ragged shapes.
@@ -877,10 +894,58 @@ static int vision_group_size(const clef_gpu *g, const clef_gpu_image *img, int r
     return n;
 }
 
+static void omni_vision_residual(clef_gpu *g,id<MTLComputeCommandEncoder> enc,const gguf_tensor *bias,int H,int rows) {
+    struct {int H,rows;} a={H,rows};
+    [enc setComputePipelineState:g->ps[@"omni_vision_residual"]];[enc setBytes:&a length:sizeof(a) atIndex:0];
+    [enc setBuffer:g->vqkv offset:0 atIndex:1];[enc setBuffer:g->weights offset:woff(bias) atIndex:2];
+    [enc setBuffer:g->vx offset:0 atIndex:3];
+    [enc dispatchThreads:MTLSizeMake((NSUInteger)H*rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+}
+
 // Equal-grid images through the vision tower (metal/clef.metal "vision tower"), their features into the
 // feat rows [img->feat_row, + tokens). patch_off is the image's first row in the pass's patch
 // uploads. The tower's GEMM operands are the ACT_VIS class: f32 by default (CLEF_VIS_F32=1), else x_vis/ac select FP16 or BF16, and an
 // overflow flags the image's record (ovf_row) like any backbone operand.
+static void encode_omni_merger(clef_gpu *g, id<MTLComputeCommandEncoder> enc, const clef_config *c,
+                               const clef_vmerger_w *w, const gguf_tensor *pending, int rows,
+                               int feat_row, int level, int x_vis, const act_args *ac, NSUInteger ovf_off) {
+    const int M=4*c->v_E, H=c->H;
+    struct { int E,rows;float eps;int add_pending; } a={c->v_E,rows,c->v_eps,pending!=NULL};
+    [enc setComputePipelineState:g->ps[@"omni_vision_merger_norm"]];
+    [enc setBytes:&a length:sizeof(a) atIndex:0];[enc setBuffer:g->vx offset:0 atIndex:1];
+    [enc setBuffer:g->weights offset:pending?woff(pending):0 atIndex:2];
+    [enc setBuffer:g->weights offset:woff(w->norm_w) atIndex:3];
+    [enc setBuffer:g->weights offset:woff(w->norm_b) atIndex:4];[enc setBuffer:g->vm offset:0 atIndex:5];
+    rows_kernel(g,enc,@"omni_vision_merger_norm",rows,M);
+    id<MTLBuffer> operand=g->vm;
+    if (x_vis != X_F32) {
+        const long n=(long)rows*M;
+        [enc setComputePipelineState:g->ps[@"vis_act"]];
+        [enc setBuffer:g->vm offset:0 atIndex:0];[enc setBuffer:g->vxn offset:0 atIndex:1];
+        [enc setBytes:&n length:sizeof(n) atIndex:2];[enc setBytes:ac length:sizeof(*ac) atIndex:3];
+        [enc setBuffer:g->ovf offset:ovf_off atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        operand=g->vxn;
+    }
+    // vm holds the grouped norm; vff is dead after the tower's down projection.
+    // Separate input/output scratch prevents aliasing inside the first GEMM.
+    vision_gemm(g,enc,x_vis,false,operand,0,woff(w->fc1_w),M,M,g->vff,0,rows,ac,ovf_off,false);
+    const bias_act_args gelu={M,1,rows};
+    const int mode=g->vis_comp && x_vis==X_F32 && ac->f16 ? 2 : g->vis_f32;
+    [enc setComputePipelineState:g->ps[@"vis_bias_gelu"]];
+    [enc setBytes:&gelu length:sizeof(gelu) atIndex:0];[enc setBuffer:g->vff offset:0 atIndex:1];
+    [enc setBuffer:g->weights offset:woff(w->fc1_b) atIndex:2];[enc setBuffer:g->vm16 offset:0 atIndex:3];
+    [enc setBytes:ac length:sizeof(*ac) atIndex:4];[enc setBuffer:g->ovf offset:ovf_off atIndex:5];
+    [enc setBuffer:g->vm16 offset:0 atIndex:6];[enc setBytes:&mode length:sizeof(mode) atIndex:7];
+    [enc dispatchThreads:MTLSizeMake(M,rows,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    const NSUInteger offset=(NSUInteger)feat_row*H*4;
+    vision_gemm(g,enc,x_vis,false,g->vm16,0,woff(w->fc2_w),H,M,g->deepstack[level],offset,rows,ac,ovf_off,true);
+    [enc setComputePipelineState:g->ps[@"add_bias"]];
+    [enc setBytes:&H length:sizeof(H) atIndex:0];[enc setBuffer:g->deepstack[level] offset:offset atIndex:1];
+    [enc setBuffer:g->weights offset:woff(w->fc2_b) atIndex:2];
+    [enc dispatchThreads:MTLSizeMake(H,rows,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+}
+
 static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer> __strong *cb, id<MTLComputeCommandEncoder> __strong *encp,
                           const clef_gpu_image *img, int n_img, int patch_off, int x_vis, const act_args *ac, char *err, size_t errlen) {
     id<MTLComputeCommandEncoder> enc = *encp;
@@ -902,6 +967,7 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
     const int compout = g->vis_comp && x_vis == X_F32 && ac->f16 ? 2 : f32out;
     // Small images favor the simdgroup kernel; selection depends only on this image.
     const bool mpp = g->vis_mpp && !g->attn_ref && G >= 2048;
+    const bool omni = c->model.backbone == CLEF_OMNI;
     if (x_vis == X_F32) {
         VPROF(P_VISION);
         vision_gemm(g, enc, x_vis, false, g->vpatch, (NSUInteger)patch_off * In * 4, woff(w->v_patch_w), E, In, g->vx, 0, P, ac, ovf_off, false);
@@ -932,10 +998,11 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
     }
     for (int l = 0; l < c->v_layers; l++) {
         const clef_vlayer_w *lw = &w->vlayer[l];
-        // Each residual bias is applied by the next norm, which writes the rounded sum
-        // back to vx before it is reused. This removes two standalone passes per block.
+        // The legacy path defers bias into the next norm. Omni preserves the
+        // pinned Linear+bias, then residual rounding order in separate scratch.
         // x + attn(norm1(x))
-        [enc setComputePipelineState:g->ps[l ? @"layernorm_bias_act" : @"layernorm_act"]];
+        NSString *norm1 = l && !omni ? @"layernorm_bias_act" : @"layernorm_act";
+        [enc setComputePipelineState:g->ps[norm1]];
         [enc setBytes:&la length:sizeof(la) atIndex:0];
         [enc setBuffer:g->vx offset:0 atIndex:1];
         [enc setBuffer:g->weights offset:woff(lw->ln1_w) atIndex:2];
@@ -945,8 +1012,8 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
         [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
         [enc setBuffer:g->vxn offset:0 atIndex:7];
         [enc setBytes:&compout length:sizeof(compout) atIndex:8];
-        if (l) [enc setBuffer:g->weights offset:woff(w->vlayer[l - 1].down_b) atIndex:9];
-        rows_kernel(g, enc, l ? @"layernorm_bias_act" : @"layernorm_act", P, E);
+        if (l && !omni) [enc setBuffer:g->weights offset:woff(w->vlayer[l - 1].down_b) atIndex:9];
+        rows_kernel(g, enc, norm1, P, E);
         VPROF(P_VISION);
         vision_gemm(g, enc, x_vis, false, g->vxn, 0, woff(lw->qkv_w), 3 * E, E, g->vqkv, 0, P, ac, ovf_off, true);
         VPROF(P_GEMM);
@@ -980,10 +1047,12 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
             else [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)(G + 31) / 32, (NSUInteger)c->v_heads, 1) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
             VPROF(P_ATTN);
         }
-        vision_gemm(g, enc, x_vis, true, g->va, 0, woff(lw->out_w), E, E, g->vx, 0, P, ac, ovf_off, false);
+        vision_gemm(g, enc, x_vis, !omni, g->va, 0, woff(lw->out_w), E, E, omni?g->vqkv:g->vx, 0, P, ac, ovf_off, false);
+        if(omni)omni_vision_residual(g,enc,lw->out_b,E,P);
         VPROF(P_GEMM);
         // x + mlp(norm2(x))
-        [enc setComputePipelineState:g->ps[@"layernorm_bias_act"]];
+        NSString *norm2 = omni ? @"layernorm_act" : @"layernorm_bias_act";
+        [enc setComputePipelineState:g->ps[norm2]];
         [enc setBytes:&la length:sizeof(la) atIndex:0];
         [enc setBuffer:g->vx offset:0 atIndex:1];
         [enc setBuffer:g->weights offset:woff(lw->ln2_w) atIndex:2];
@@ -993,8 +1062,8 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
         [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
         [enc setBuffer:g->vxn offset:0 atIndex:7];
         [enc setBytes:&compout length:sizeof(compout) atIndex:8];
-        [enc setBuffer:g->weights offset:woff(lw->out_b) atIndex:9];
-        rows_kernel(g, enc, @"layernorm_bias_act", P, E);
+        if(!omni)[enc setBuffer:g->weights offset:woff(lw->out_b) atIndex:9];
+        rows_kernel(g, enc, norm2, P, E);
         VPROF(P_VISION);
         vision_gemm(g, enc, x_vis, false, g->vxn, 0, woff(lw->up_w), F, E, g->vff, 0, P, ac, ovf_off, true);
         VPROF(P_GEMM);
@@ -1010,11 +1079,15 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
         [enc setBytes:&f32out length:sizeof(f32out) atIndex:7];
         [enc dispatchThreads:MTLSizeMake((NSUInteger)F, (NSUInteger)P, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         VPROF(P_VISION);
-        vision_gemm(g, enc, x_vis, true, g->vff16, 0, woff(lw->down_w), E, F, g->vx, 0, P, ac, ovf_off, false);
+        vision_gemm(g, enc, x_vis, !omni, g->vff16, 0, woff(lw->down_w), E, F, omni?g->vqkv:g->vx, 0, P, ac, ovf_off, false);
+        if(omni)omni_vision_residual(g,enc,lw->down_b,E,P);
         VPROF(P_GEMM);
+        if (c->model.backbone == CLEF_OMNI) for (int i=0;i<3;i++) if (l == c->v_deepstack[i])
+            encode_omni_merger(g,enc,c,&w->v_deepstack[i],NULL,Pm,img->feat_row,i,x_vis,ac,ovf_off);
     }
     // merger: LayerNorm per patch, then each merge window's four rows as one row of 4E
-    [enc setComputePipelineState:g->ps[@"layernorm_bias_act"]];
+    NSString *final_norm = omni ? @"layernorm_act" : @"layernorm_bias_act";
+    [enc setComputePipelineState:g->ps[final_norm]];
     [enc setBytes:&la length:sizeof(la) atIndex:0];
     [enc setBuffer:g->vx offset:0 atIndex:1];
     [enc setBuffer:g->weights offset:woff(w->v_post_ln_w) atIndex:2];
@@ -1024,8 +1097,8 @@ static bool encode_vision(clef_gpu *g, const clef_engine *e, id<MTLCommandBuffer
     [enc setBuffer:g->ovf offset:ovf_off atIndex:6];
     [enc setBuffer:g->vxn offset:0 atIndex:7];
     [enc setBytes:&compout length:sizeof(compout) atIndex:8];
-    [enc setBuffer:g->weights offset:woff(w->vlayer[c->v_layers - 1].down_b) atIndex:9];
-    rows_kernel(g, enc, @"layernorm_bias_act", P, E);
+    if(!omni)[enc setBuffer:g->weights offset:woff(w->vlayer[c->v_layers - 1].down_b) atIndex:9];
+    rows_kernel(g, enc, final_norm, P, E);
     VPROF(P_VISION);
     vision_gemm(g, enc, x_vis, false, g->vxn, 0, woff(w->v_mm0_w), M, M, g->vm, 0, Pm, ac, ovf_off, true);
     VPROF(P_GEMM);
@@ -1063,7 +1136,7 @@ static const gguf_tensor *head_t(const clef_engine *e, const char *name) { retur
 // computes is what a pass over the whole record computes for these rows.
 static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos,
                     const int32_t *seq_start, const int32_t *seq_bounds, int n_seq, int T, bool bf16_only,
-                    bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows, const clef_gpu_images *imgs,
+                    bool *overflow, clef_head_inputs *in, clef_dump *dump_layers, int dump_rows, const clef_gpu_media *imgs,
                     clef_gpu_prefix *px, int L, const clef_prefix_plan *plan, char *err, size_t errlen) {
     const int R = dump_rows > 0 && dump_rows < T ? dump_rows : T;   /* dump the last R token rows */
     const clef_config *c = &e->cfg;
@@ -1071,6 +1144,11 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
     // FP16 operands are only safe with the overflow flags read back (and acted on) by the caller
     if (!bf16_only && g->act_f16 && !overflow) return gerr(err, errlen, "FP16 activations need the overflow flags (pass overflow or bf16_only)");
     if (!ensure_capacity(g, c, T, n_seq, err, errlen)) return false;
+    if (c->model.backbone == CLEF_OMNI) {
+        if (!clef_omni_reserve(g, c, T, err, errlen)) return false;
+        if (!clef_omni_trace_reserve(g, T, c->n_layer, e->route_rows, e->capture_routes, err, errlen)) return false;
+        clef_omni_begin(g);
+    }
     const int n_img = imgs ? imgs->n : 0;
     if (n_img && !c->has_vision) return gerr(err, errlen, "images with a model file without the vision tower");
     const bool cache_images = px && n_img && imgs->cache;
@@ -1122,8 +1200,10 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             for (int i = 0; i < g->n_kv; i++) memset_pattern4(g->kv[i].contents, &nan, g->kv[i].length);
             if (g->vcap) {
                 id<MTLBuffer> vis[] = { g->vpatch, g->vpatch16, g->vposidx, g->vposw, g->vx, g->vxn, g->vqkv, g->vq, g->vk, g->vv,
-                                        g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat };
-                for (size_t i = 0; i < sizeof(vis) / sizeof(vis[0]); i++) memset_pattern4(vis[i].contents, &nan, vis[i].length);
+                                        g->va, g->vff, g->vff16, g->vm, g->vm16, g->vsplit, g->feat,
+                                        g->deepstack[0], g->deepstack[1], g->deepstack[2] };
+                for (size_t i = 0; i < sizeof(vis) / sizeof(vis[0]); i++)
+                    if (vis[i]) memset_pattern4(vis[i].contents, &nan, vis[i].length);
             }
         }
         memcpy(g->ids.contents, ids, (size_t)T * 4);
@@ -1203,16 +1283,32 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             [enc setBuffer:reuse_images ? px->vision : n_img ? g->feat : g->img_row offset:0 atIndex:5];
             [enc dispatchThreads:MTLSizeMake(H, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
+        if(imgs && imgs->records) {
+            bool has_audio=false;
+            for(int r=0;r<n_seq;r++)has_audio|=imgs->records[r].n_audio!=0;
+            if(has_audio) {
+                if(px)return gerr(err,errlen,"audio cannot use a prefix-cache entry");
+                [enc endEncoding];[cb commit];[cb waitUntilCompleted];
+                if(cb.error){snprintf(err,errlen,"metal: %s",cb.error.localizedDescription.UTF8String);return false;}
+                for(int r=0;r<n_seq;r++)
+                    if(!clef_audio_gpu_record(g,e,imgs->records+r,seq_bounds[r],T,err,errlen))return false;
+                if(!new_cb(g,&cb,&enc))return gerr(err,errlen,"cannot create command buffer after audio");
+            }
+        }
         if (dump_layers) {
             [enc endEncoding];
             [cb commit];
             [cb waitUntilCompleted];
             if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
-            memcpy(dump_layers, (float *)g->x.contents + (size_t)(T - R) * H, (size_t)R * H * 4);
+            if (!clef_dump_write(dump_layers, 0, (float *)g->x.contents + (size_t)(T - R) * H,
+                                 (size_t)R * H, err, errlen)) return false;
             if (!new_cb(g, &cb, &enc)) return gerr(err, errlen, "cannot create a command buffer");
         }
 
         for (int l = 0; l < c->n_layer; l++) {
+            if (c->model.backbone == CLEF_OMNI) {
+                if (!clef_omni_encode_layer(g, e, &cb, &enc, l, T, n_seq, bf16_only, err, errlen)) return false;
+            } else {
             const clef_layer_w *lw = &e->w.layer[l];
             norm_args na = { H, c->eps };
             [enc setComputePipelineState:g->ps[@"rmsnorm_act"]];
@@ -1227,7 +1323,7 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
 
             if (c->layer_full[l]) {
                 if (!prof(g, &cb, &enc, P_NORM, err, errlen)) return false;
-                gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->attn_qkv), n_attn, H, g->P, 0, T);
+                clef_metal_gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->attn_qkv), n_attn, H, g->P, 0, T);
                 if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
                 if (tu) {
                     if (!encode_attention_tu(g, &cb, &enc, c, lw, l, T, n_attn, n_blk, &ac_attn, px, L, err, errlen)) return false;
@@ -1316,11 +1412,11 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
                     if (!prof(g, &cb, &enc, P_ATTN, err, errlen)) return false;
                 }
 
-                gemm(g, enc, x_attn, true, g->A, 0, woff(lw->attn_output), H, c->nh * c->hd, g->x, 0, T);
+                clef_metal_gemm(g, enc, x_attn, true, g->A, 0, woff(lw->attn_output), H, c->nh * c->hd, g->x, 0, T);
                 if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
             } else {
                 if (!prof(g, &cb, &enc, P_NORM, err, errlen)) return false;
-                gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->ssm_in), n_ssm, H, g->P, 0, T);
+                clef_metal_gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->ssm_in), n_ssm, H, g->P, 0, T);
                 if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
                 conv_args ca = { C, n_ssm, c->ssm_kernel };
                 [enc setComputePipelineState:g->ps[@"ssm_conv"]];
@@ -1380,7 +1476,7 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
                 [enc dispatchThreadgroups:MTLSizeMake(T, c->Hv, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
                 if (!prof(g, &cb, &enc, P_GDNOUT, err, errlen)) return false;
-                gemm(g, enc, x_gdn, true, g->A, 0, woff(lw->ssm_out), H, c->Hv * c->dv, g->x, 0, T);
+                clef_metal_gemm(g, enc, x_gdn, true, g->A, 0, woff(lw->ssm_out), H, c->Hv * c->dv, g->x, 0, T);
                 if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
             }
 
@@ -1394,7 +1490,7 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             [enc setBuffer:g->ovf offset:0 atIndex:6];
             rows_kernel(g, enc, @"rmsnorm_act", T, H);
             if (!prof(g, &cb, &enc, P_NORM, err, errlen)) return false;
-            gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->ffn_gate_up), 2 * c->ffn, H, g->P, 0, T);
+            clef_metal_gemm(g, enc, x_norm, false, g->xn, 0, woff(lw->ffn_gate_up), 2 * c->ffn, H, g->P, 0, T);
             if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
             swiglu_args sa = { c->ffn };
             [enc setComputePipelineState:g->ps[@"swiglu"]];
@@ -1406,16 +1502,26 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             [enc setBuffer:g->ovf offset:0 atIndex:5];
             [enc dispatchThreads:MTLSizeMake(c->ffn, T, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             if (!prof(g, &cb, &enc, P_SWIGLU, err, errlen)) return false;
-            gemm(g, enc, x_mlp, true, g->A, 0, woff(lw->ffn_down), H, c->ffn, g->x, 0, T);
+            clef_metal_gemm(g, enc, x_mlp, true, g->A, 0, woff(lw->ffn_down), H, c->ffn, g->x, 0, T);
             if (!prof(g, &cb, &enc, P_GEMM, err, errlen)) return false;
+            }
 
+            if (c->model.backbone == CLEF_OMNI && n_img && l < 3) {
+                struct { int T,H; } a={T,H};
+                [enc setComputePipelineState:g->ps[@"omni_vision_inject"]];
+                [enc setBytes:&a length:sizeof(a) atIndex:0];[enc setBuffer:g->x offset:0 atIndex:1];
+                [enc setBuffer:g->deepstack[l] offset:0 atIndex:2];[enc setBuffer:g->img_row offset:0 atIndex:3];
+                [enc dispatchThreads:MTLSizeMake(H,T,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            }
             if (dump_layers) {
                 // Debug path: finish this command buffer and copy the residual out.
                 [enc endEncoding];
                 [cb commit];
                 [cb waitUntilCompleted];
                 if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
-                memcpy(dump_layers + (size_t)(l + 1) * R * H, (float *)g->x.contents + (size_t)(T - R) * H, (size_t)R * H * 4);
+                if (!clef_dump_write(dump_layers, (size_t)(l + 1) * R * H,
+                                     (float *)g->x.contents + (size_t)(T - R) * H,
+                                     (size_t)R * H, err, errlen)) return false;
                 if (!new_cb(g, &cb, &enc)) return gerr(err, errlen, "cannot create a command buffer");
             }
         }
@@ -1439,8 +1545,8 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
         [enc setBuffer:g->nh32 offset:0 atIndex:4];
         [enc setBuffer:g->nh16 offset:0 atIndex:5];
         rows_kernel(g, enc, @"layernorm", T, H);
-        if (g->head_f32) gemm(g, enc, X_F32, false, g->nh32, 0, woff(head_t(e, "head.memory_projection.weight")), W, H, g->mem, 0, T);
-        else gemm(g, enc, X_BF16, false, g->nh16, 0, woff(head_t(e, "head.memory_projection.weight")), W, H, g->mem, 0, T);
+        if (g->head_f32) clef_metal_gemm(g, enc, X_F32, false, g->nh32, 0, woff(head_t(e, "head.memory_projection.weight")), W, H, g->mem, 0, T);
+        else clef_metal_gemm(g, enc, X_BF16, false, g->nh16, 0, woff(head_t(e, "head.memory_projection.weight")), W, H, g->mem, 0, T);
         if (!g->head_f32) {
             long n = (long)T * W;
             [enc setComputePipelineState:g->ps[@"f32_to_bf16"]];
@@ -1472,15 +1578,15 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             [enc setBuffer:g->mn32 offset:0 atIndex:4];
             [enc setBuffer:g->mn16 offset:0 atIndex:5];
             rows_kernel(g, enc, @"layernorm", T, W);
-            if (g->head_f32) gemm(g, enc, X_F32, false, g->mn32, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[i], kvo, T);
-            else gemm(g, enc, X_BF16, false, g->mn16, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[i], kvo, T);
+            if (g->head_f32) clef_metal_gemm(g, enc, X_F32, false, g->mn32, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[i], kvo, T);
+            else clef_metal_gemm(g, enc, X_BF16, false, g->mn16, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[i], kvo, T);
         }
         for (int i = 0; i < c->head_layers; i++) {
             snprintf(name, sizeof(name), "head.layers.%d.multihead_attn.in_proj_weight", i);
             const gguf_tensor *ip = head_t(e, name);
             if (!ip) return gerr(err, errlen, "head tensors missing");
-            if (g->head_f32) gemm(g, enc, X_F32, false, g->mem, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[c->routing_layers + i], kvo, T);
-            else gemm(g, enc, X_BF16, false, g->mem16, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[c->routing_layers + i], kvo, T);
+            if (g->head_f32) clef_metal_gemm(g, enc, X_F32, false, g->mem, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[c->routing_layers + i], kvo, T);
+            else clef_metal_gemm(g, enc, X_BF16, false, g->mem16, 0, woff(ip) + (NSUInteger)W * W * 2, 2 * W, W, kvb[c->routing_layers + i], kvo, T);
         }
         [enc endEncoding];
         const double t_commit = wall_ms();
@@ -1488,6 +1594,7 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
         [cb waitUntilCompleted];
         if (cb.error) { snprintf(err, errlen, "metal: %s", cb.error.localizedDescription.UTF8String); return false; }
         if (g->cb_failed) return gerr(err, errlen, "cannot create a command buffer (mid-pass)");   // see new_cb
+        if (c->model.backbone == CLEF_OMNI && !clef_omni_complete(g, err, errlen)) return false;
         if (g->stage_time) {
             if (reuse_images) fprintf(stderr, "clef: image cache reused %d features\n", image_rows);
             // encode: host time to build the pass; wait: commit to completion; exec: the GPU's own
@@ -1495,7 +1602,9 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
             fprintf(stderr, "clef: stage T=%d n=%d: encode %.2f ms, wait %.2f ms, exec %.2f ms\n", T, n_seq,
                     t_commit - t_enter, wall_ms() - t_commit, (cb.GPUEndTime - cb.GPUStartTime) * 1e3);
         }
-        if (dump_layers) memcpy(dump_layers + (size_t)(c->n_layer + 1) * R * H, (float *)g->hfin.contents + (size_t)(T - R) * H, (size_t)R * H * 4);
+        if (!clef_dump_write(dump_layers, (size_t)(c->n_layer + 1) * R * H,
+                             (float *)g->hfin.contents + (size_t)(T - R) * H,
+                             (size_t)R * H, err, errlen)) return false;
         if (g->profile) {
             g->prof_ms[P_HEAD] += (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
             fprintf(stderr, "clef: profile T=%d:", T);
@@ -1521,15 +1630,15 @@ static bool forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const
 
 bool clef_gpu_forward(clef_gpu *g, const clef_engine *e, const int32_t *ids, const int32_t *pos3,
                       const int32_t *seq_start, const int32_t *seq_bounds, int n_seq, int T, bool bf16_only,
-                      bool *overflow, clef_head_inputs *in, float *dump_layers, int dump_rows,
-                      const clef_gpu_images *imgs, char *err, size_t errlen) {
+                      bool *overflow, clef_head_inputs *in, clef_dump *dump_layers, int dump_rows,
+                      const clef_gpu_media *imgs, char *err, size_t errlen) {
     return forward(g, e, ids, pos3, seq_start, seq_bounds, n_seq, T, bf16_only, overflow, in, dump_layers, dump_rows,
                    imgs, NULL, 0, NULL, err, errlen);
 }
 
 bool clef_gpu_forward_prefix(clef_gpu *g, const clef_engine *e, clef_gpu_prefix *px, const int32_t *ids, const int32_t *pos3,
                              int T, int L, const clef_prefix_plan *plan, bool *overflow, clef_head_inputs *in,
-                             const clef_gpu_images *imgs, char *err, size_t errlen) {
+                             const clef_gpu_media *imgs, char *err, size_t errlen) {
     if (!clef_gpu_prefix_supported(g)) return gerr(err, errlen, "the prefix cache needs tiled attention with FP16 output");
     // 32 aligns both attention paths' query tiles and the DeltaNet block: resuming there
     // reproduces the tiles and blocks of a pass over the whole record

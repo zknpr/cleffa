@@ -4,11 +4,40 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`cleffa`: a C11 + Metal inference engine for Cloudflare's Clef (27B) and Clef-Flash (9B) joint-schema
-models. One prefill pass per SystemOne request, typed decisions out. Text, images and video, BF16
-weights, never quantized. Apple Silicon only (Metal 4 tensor ops, Accelerate). The README is current and
-detailed; read it for measured accuracy/latency numbers and the security notes. This file covers what
-the README does not: how the pieces fit, the parity contract, and the traps.
+`cleffa`: a C11 + Metal inference engine for Cloudflare's Clef (27B), Clef-Flash (9B) and Clef-Omni
+joint-schema models. One prefill pass per SystemOne request, typed decisions out. Text, images and video
+(plus audio on Omni), BF16 weights, never quantized. Apple Silicon only (Metal 4 tensor ops, Accelerate).
+The README is a current-state summary; the details live in `docs/`: request forms and limits in
+`docs/usage.md`, accuracy in `docs/accuracy.md`, security notes and deliberate divergences in
+`docs/security.md`, the test catalog in `docs/testing.md`. This file covers what those do not: how the
+pieces fit, the parity contract, and the traps.
+
+Clef-Omni is implemented under a separate `clef.backbone` discriminator; consult `docs/omni.md`
+before making support or parity claims. The working default passes the FP64-bounded acceptance
+check (below) on every request with an FP64 reference, up to 16,344 tokens; longer contexts are
+uncovered. Its rotary angles are computed exactly (`omni_rope_cs`, FP64 frequencies as FP32
+hi/lo pairs); `CLEF_OMNI_ROPE=f32` restores Hugging Face's FP32 angles, which were the dominant
+shared error of both FP32 implementations at long positions. It fails fixed FP32 gates through near-tied expert routing; FP32-compatible builds that
+pass them by reproducing PyTorch MPS arithmetic, at 1.13-2.08x the latency, live on the unmerged
+branches `omni-fp32-compatible-20261014` and `omni-fp32-fused-20261016` and are not needed.
+`clef_model.c` validates exact metadata, `clef_metal_omni.m` owns the full-attention/MoE
+decoder, and `clef_metal_audio.m` owns the audio tower. Omni uses FP32 activations and
+ordinary execution for prefix-cache requests. DeepStack mergers inject only into
+visual rows after decoder blocks 0/1/2. Audio padding is per record, including its
+associated soundtracks, and video wins ties in temporal audio/video token merging.
+`clef_audio.c` owns bounded sample decoding/frontend processing. Its features hold each
+clip's own frames only, and it evaluates only frames whose window reaches the clip's samples;
+pure-padding frames enter the normalization peak as their exact `log10(1e-10)` constant, so
+cost follows total audio, not clips × longest clip. `clef_record_omni.c`
+owns audio placements and multimodal positions. Float frontend parity follows the
+bounded policy in the Omni report. Omni acceptance is FP64-bounded (user decision,
+2026-10-16): `tests/test_parity.py MODEL FP64_GOLDEN --bound-by FP32_GOLDEN` against the
+independent CPU FP64 reference, allowing each question the larger of the fixed limits and the
+FP32 blocked-attention reference's own error; layer L2 is a diagnostic. Every arithmetic change
+must also be non-inferior to the build it replaces (`test_parity.py --report` for both, then
+`tests/compare_fp64_errors.py`), because the bound alone admits regressions where FP32 is far off. Routing is reported only
+as a diagnostic; historical FP64 arbitration does not qualify a run. Never relax the limits
+beyond that bound to obtain a passing result.
 
 Git repository `cleffa`, imported 2026-10-03. Model snapshots, GGUFs, golden data,
 `.venv` and build outputs are git-ignored (`.gitignore`); stage explicit paths. Built after ds4
@@ -18,8 +47,9 @@ attribution when adapting more of its code.
 ## Build
 
 ```sh
-./download_models.sh clef-flash   # pinned download, hash check, convert, verify -> gguf/ (clef, all)
+./download_models.sh clef-flash   # pinned download, hash check, convert, verify -> gguf/ (clef, clef-omni, all)
 make                    # clef (CLI), clef-server (HTTP), clef-tool (host-side test driver)
+make media              # optional clef-media MP4/MOV worker (FFmpeg dev libraries + pkg-config)
 make clean
 ```
 
@@ -44,12 +74,16 @@ make clean
   environment. It records full versus reported token counts and every response, without retries.
   Missing or mismatched usage does not establish equal work. Its default mode makes no network
   requests. `.venv/bin/python -B tests/test_cloudflare_checkout.py` checks result/error handling.
+- `bench/omni_attention_bench.m` (build like the other `bench/*.m`, run from the repo root)
+  checks a candidate Omni attention kernel for byte-identical output against `omni_attention`,
+  single and packed, then times both ABBA; restructurings that keep the bytes need no FP64 run.
 - `bench/compare_mlx.py T K N --output OUT.json` compares the MPP GEMM algorithm with MLX on
   identical FP16/BF16 operands and FP32 output. It requires optional MLX/NumPy dependencies;
   see `docs/rejected-experiments.md` for isolated installation, measurements and rejected probes.
-- `docs/` holds eight topic reports indexed by `docs/README.md`: performance history, attention,
-  prefix cache, hosted comparison, long-request timing, rejected experiments, vision and video. Add new
-  measurements to the matching report rather than starting a dated file. The raw evidence they
+- `docs/` holds the topic reports indexed by `docs/README.md`: usage, accuracy, security, testing,
+  performance history, attention, prefix cache, hosted comparison, long-request timing, rejected
+  experiments, vision, video and Omni. Keep the README a short current-state summary that links them.
+  Add new measurements to the matching report rather than starting a dated file. The raw evidence they
   cite lives in git-ignored `golden/<experiment>-<date>/` directories.
 - `third_party/iris/` holds the PNG/JPEG single-header decoders imported from ds4 (MIT,
   `THIRD_PARTY_NOTICES.md`); `clef_image.c` is their only includer and sets their decode limits.
@@ -94,10 +128,13 @@ make clean
 |---|---|
 | `model/` | HF snapshot Cloudflare/clef, pinned rev `2f3de3dd` |
 | `model-flash/` | HF snapshot Cloudflare/clef-flash, pinned rev `17f0b0ad` |
+| `model-omni/` | HF snapshot Cloudflare/clef-omni, pinned rev `0db1cd26` (only thinker weights are converted; talker/code2wav are skipped) |
 | `gguf/clef.gguf`, `gguf/clef-flash.gguf` | converter output (55 GB / 19 GB, vision tower included) |
+| `gguf/clef-omni.gguf` | Omni converter output (63.7 GB: decoder, experts, vision and audio towers, head) |
 | `golden/<name>/` | oracle output: `requests.jsonl`, `encoded.jsonl`, `logits.safetensors`, `layers/<id>.safetensors`, `latency.json` |
 
-Golden names in use: `clef-flash` (HF BF16), `clef-flash-f32` (HF FP32, the ground truth),
+Golden names in use: `clef-flash` (historical HF BF16 on MPS, affected by the PyTorch 2.11
+implicit causal-attention defect; not a valid precision-noise control), `clef-flash-f32` (HF FP32 engineering reference),
 `clef-flash-f32s` (streamed FP32, validated bitwise against the full FP32 run), `clef` (27B BF16)
 and `clef-f32` (27B streamed FP32), both generated with `--safe-attn`. The vision corpus
 (`ref/corpus_vision.py`, `--corpus vision` on both oracles) has `clef-flash-vision-f32` (full FP32),
@@ -140,6 +177,15 @@ Verify the snapshot first with `tools/verify_snapshot.py DIR FULL_REVISION`: its
 download metadata. Extra files (including cached Python bytecode) and symbolic links are rejected;
 only `.cache/huggingface/` bookkeeping is ignored. Remove stale snapshot bytecode before verification
 and run reference scripts with Python `-B`. Direct oracle invocations assume prior verification.
+
+PyTorch 2.11 MPS SDPA also produces incorrect FP16/BF16 output with `is_causal=True`
+at short lengths. The local early-boundary audit proves future-value leakage on
+the tested 512-token shapes; a midpoint-only probe misses it.
+`ref/mps_sdpa_causal.py` checks the backend against CPU FP64 on
+identical rounded operands and tests future-value independence. Explicit causal
+masks and eager attention provide separate controls; never silently substitute
+them into a stock capture. The 2026-10-11 corrected labeled BF16 baseline uses
+eager attention, with original stock evidence retained. See `docs/hosted-comparison.md`.
 
 27B references must use `--safe-attn`: PyTorch's MPS SDPA returns wrong output for heads with
 `h·T² >= 2^32` (`ref/mps_sdpa_bug.py`), which the 27B's 24 heads reach at 13,666 tokens. If the
@@ -206,6 +252,9 @@ make fuzz-image && .venv/bin/python -B tests/fuzz_image_seeds.py fuzz/seeds
 # differential: decoder vs libjpeg-turbo, pixel for pixel (Homebrew jpeg-turbo), and the encoder corpus
 make fuzz-jpeg-diff && ./fuzz-jpeg-diff -dict=tests/fuzz_image.dict -fork=14 -ignore_crashes=1 -max_total_time=1200 -artifact_prefix=fuzz/artifacts-diff/ fuzz/corpus-diff fuzz/seeds
 make test-image-diff
+# Omni audio requests: WAV/sample/base64 forms and budgets, mel frontend, chunk layout, token placement
+make fuzz-audio && .venv/bin/python -B tests/fuzz_audio_seeds.py fuzz/audio-seeds
+./fuzz-audio -dict=tests/fuzz_audio.dict -max_len=65536 -fork=8 -ignore_crashes=1 -max_total_time=900 -artifact_prefix=fuzz/artifacts-audio/ fuzz/corpus-audio fuzz/audio-seeds
 
 # invariants
 tests/test_batch.sh  gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # batch invariance + tenant isolation
@@ -390,8 +439,21 @@ GEMM -> `swiglu` -> down GEMM. The residual stream stays f32. GEMM inputs are wr
 BF16 at the same tensor-op rate. A value past 65504 sets a per-record flag, and `clef_run_ex` reruns
 that record alone with BF16 activations.
 
+Dense Flash/27B head buffers reuse completed decoder storage: `nh32` aliases `x`, and
+`hfin` aliases `P` when its projection width is at least `H`. Final RMSNorm and hidden
+LayerNorm run serially with distinct input/output buffers; residual dumps finish before
+reuse, and the final-normalization dump remains intact. Omni keeps independent buffers.
+This removes two FP32 `[capacity][H]` allocations on the released dense models.
+`make test-dense-buffers` checks layouts, capacity bounds and atomic growth failure under
+ASan/UBSan; run it under the shared GPU lock.
+
 The head's memory-side K/V projections for each attention module run on the GPU without bias, on f32
 activations (`clef_head_inputs.kv`); `clef_head.c` explains why dropping the biases is exact.
+CPU head loading validates GPU-only norms and the memory projection without making
+unused FP32 copies. Evidence and decoder cross-attention retain only Q weights on the CPU;
+self-attention retains the complete QKV matrix. Full biases and tensor validation remain.
+`tests/test_head_load.c` checks exact live weights, allocation budgets and partial-load cleanup.
+
 CPU head projections prepare padded, transposed FP32 weight copies at load for multi-row GEMMs.
 Single-row calls and ragged weight shapes retain the original layout to preserve BLAS reductions.
 The decoder's `self_in` shares original QKV weights/bias with `self_attn.in_q`, but owns its packed
@@ -402,12 +464,18 @@ reduction changes slightly with row count, so batching across records would viol
 Its float64 checks live in `test_head_linear.c`; private replay has one documented last-decimal
 probability difference, with unchanged decisions and scores. See `docs/performance-history.md`.
 
-Large CPU head projections split their output columns into two 32-column-aligned halves.
-Larger head attention calls split independent heads between two workers, each with its own
-score scratch. The input reduction and each attention head's BLAS/softmax sequence stay intact.
-`tests/test_head_linear.c` compares both layouts against unsplit BLAS; `tests/test_head_parallel.c`
+Large CPU head projections split their output columns into 32-column-aligned groups.
+Dense packed multi-row calls use four workers when the output width is divisible by 128;
+single rows, unpacked weights, other widths and Omni retain the original two-worker rule.
+The policy belongs to each immutable loaded projection; the matrix-size threshold is unchanged.
+Larger dense head attention calls split independent heads among up to eight workers, each with
+its own score scratch. Expanded worker counts use at most 8 MiB total scratch, falling back
+through four to the original two workers above that budget. Omni keeps two workers. The input
+reduction and each attention head's BLAS/softmax sequence stay intact.
+`tests/test_head_linear.c` compares both layouts against unsplit BLAS and checks actual worker
+selection; `tests/test_head_load.c` checks dense/Omni policy assignment. `tests/test_head_parallel.c`
 checks attention, scratch allocation failure and concurrent first-use configuration. Run
-`make test-head-tsan` to instrument that initialization check. The environment threshold
+`make test-head-tsan` to run it under ThreadSanitizer. The environment threshold
 `CLEF_DEBUG_HEAD_SPLIT_MIN` is read once, thread-safely; setting it to `0` disables the linear
 split only. See `docs/performance-history.md` for timing and qualification limits.
 
@@ -471,6 +539,8 @@ split only. See `docs/performance-history.md` for timing and qualification limit
   records are batched. Scratch is sized to the longest selected record, allocated atomically,
   poisoned by the existing debug hook, and reused only across serial dispatches. Sum each decay
   interval directly: subtracting large prefix sums loses small later decays and can yield NaN.
+  Full blocks evaluate that interval-decay triangle once into the ragged-tail scratch and
+  reuse it for KE, U and A; the values, and so the logits, are bitwise unchanged.
   `make test-gdn` checks both value tiles, all 32 row offsets/tails, float64, strong/overflowing
   decays, output guards and allocation-failure recovery. Arithmetic differs from the old scan;
   assess final logits against FP32, then require exact standalone/packed and poison invariance.
@@ -488,15 +558,32 @@ split only. See `docs/performance-history.md` for timing and qualification limit
 
 ### Parity methodology
 
-Compare the engine against the **FP32** oracle, not BF16. Engine-vs-BF16 differences are mostly the
-reference's own rounding; `tests/compare3.py` reports engine->f32 and bf16HF->f32 distances per layer
+Hosted decision agreement and labeled accuracy are the headline evaluation metrics.
+FP32 is the engineering gate for kernel changes, not semantic ground truth or a
+description of Cloudflare's hosted implementation. HF BF16 on MPS is a separate
+control arm. `tests/compare3.py` reports engine->f32 and bf16HF->f32 distances per layer
 and per question. Point `test_parity.py` at an FP32 golden: it exits 1 on any argmax disagreement,
 non-finite logits/residuals, max absolute logit error > 0.05, max probability error > 0.002, or
-(with `--dump`) per-layer relative L2 error > 0.01. Explicit experiments can override these with
-`--max-logit-error`, `--max-prob-error` and `--max-layer-rel-l2`. Against BF16 the engine disagrees
-exactly where BF16 is wrong (clef-flash `r004/urgency`, `r006/urgency`). A jump at one layer helps
+(with `--dump`) per-layer relative L2 error > 0.01. Do not relax these limits to
+obtain a qualification pass. The recorded Flash BF16-on-MPS differences at
+`r004/urgency` and `r006/urgency` used the affected PyTorch 2.11 implicit causal
+attention path. Do not attribute that spread to BF16 rounding or use its frozen
+precision band to explain a hosted disagreement. Semantic correctness still
+requires labels. A jump at one layer helps
 locate a bug (`--dump` prints jump markers); smooth drift can reflect reference rounding.
 An argmax flip on a small FP32 top-2 margin can be precision error rather than an implementation bug.
+For Omni MoE, routing choices and flip rates are diagnostics, not acceptance gates.
+Near-tied top-8 routing makes fixed per-layer FP32 gates unattainable for any FP32
+implementation, so Omni is accepted against FP64, bounded per question by the FP32
+reference's own error (`--bound-by`; see the top of this file and `docs/omni.md`).
+The FP32 bound reference must run independently of native routing choices (the
+native-input FP64 route arbitration was removed 2026-10-17). Label that reference
+"FP32 reference (blocked attention)". Dense `--safe-attn` retains its original
+head-only splitting. Omni qualification uses `--omni-attention blocked` on
+`ref/oracle_f32_stream.py` at every input length; `--omni-attention sdpa` selects
+the independent FP32 noise-floor control with the same query bounds. Staged
+checkpoints bind the full reference policy and sources, so later stages reject
+states made with different attention arithmetic. Neither mode reads native routes.
 Judge numerical error against FP32 over all questions (mean |dp| and logit error),
 not only argmax. Report labeled task accuracy and probability scores separately;
 unchanged task decisions do not erase a measured numerical-error increase. `r019/service` has an FP32 margin of 0.004 and flips with noise. FP16 on a single producer
@@ -508,6 +595,9 @@ class reached 46/46 there without lowering the error; FP16 on all classes cut it
 `<|im_end|>` etc. cannot become control tokens. Server default is strict (`--no-strict` for reference
 parity); CLI default is parity (`--strict` to opt in) because the CLI is the test harness. Benign
 requests encode identically either way. Keep that asymmetry when adding options.
+Encoded MP4/MOV uploads follow it: `clef_vision_opts.allow_encoded_video` is false when
+zero-initialized, the server sets it only with `--allow-encoded-video`, the CLI unless
+`--no-encoded-video`, and `clef-tool` always.
 
 ### Debug / diagnostic env vars
 
@@ -521,7 +611,7 @@ requests encode identically either way. Keep that asymmetry when adding options.
 bitwise),
 `CLEF_DEBUG_F16_LIMIT` (lower the FP16 overflow limit to exercise the rerun),
 `CLEF_PROFILE=1` (GPU ms for gemm, attention, gdn_scan, norm, attn_prep, conv_prep, gdn_out,
-swiglu, head and vision, with the tower's GEMMs and attention counted under gemm and attention;
+swiglu, head, vision and, for Omni, omni_router, omni_experts and omni_moe, with the tower's GEMMs and attention counted under gemm and attention;
 serializes the GPU, so not for latency),
 `CLEF_STAGE_TIME=1` (host encode, commit-to-completion wait, GPU execution and CPU head time),
 `CLEF_ATTN_TU=0` (tiled FP32 attention control; compensated tensor-unit attention defaults on),
@@ -658,8 +748,8 @@ discard a run with outliers like that.
 
 ## Deliberate divergences from the reference
 
-The engine errors where Python answers or behaves differently. The list lives in the README under
-"Deliberate divergences"; extend it there when adding one, and add the case to `tests/test_record.py`.
+The engine errors where Python answers or behaves differently. The list lives in `docs/security.md`
+under "Deliberate divergences"; extend it there when adding one, and add the case to `tests/test_record.py`.
 Image cases (malformed videos, lone or unknown `media_kwargs`, unsupported encodings, placeholder text in parity
 mode) are there and in `docs/vision.md`.
 

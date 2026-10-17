@@ -53,7 +53,8 @@ def main():
         with (Path(td) / 'server.log').open('w') as log:
             server = subprocess.Popen([str(ROOT / 'clef-server'), '-m', model, '--port', str(port),
                                        '--no-warmup', '--no-keep-warm', '--max-videos', '2', '--max-image-requests', '1',
-                                       '--prefix-cache-mb', '1024'], stdout=log, stderr=log, env=env)
+                                       # The corpus includes an encoded MOV; the server refuses it by default.
+                                       '--prefix-cache-mb', '1024', '--allow-encoded-video'], stdout=log, stderr=log, env=env)
             def post(req, key=None):
                 c = http.client.HTTPConnection('127.0.0.1', port, timeout=120)
                 try:

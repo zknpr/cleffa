@@ -80,7 +80,10 @@ static struct {
      * the media_kwargs.max_pixels that would fit, never downscaled silently: the reference keeps up
      * to 16,384 tokens per image, and image tokens cost the same prefill as text. */
     int max_images;
+    int max_length;
     int max_videos, max_video_frames;
+    int max_audio;
+    size_t max_audio_samples;
     long max_video_tokens;
     long max_image_tokens;
     /* Image memory is bounded at two more points (review #3). Decoding allocates several times a
@@ -100,6 +103,7 @@ static struct {
     int max_conn;
     double io_timeout;       /* seconds; request deadline and per-write timeout (IO_TIMEOUT_S) */
     int keep_warm_ms;        /* idle period between keep-warm GPU passes (KEEP_WARM_MS); 0 = off (--no-keep-warm) */
+    bool allow_encoded_video; /* MP4/MOV uploads through clef-media; off unless --allow-encoded-video */
     size_t cache_bytes;      /* prefix cache budget (--prefix-cache-mb); 0 = off, the header is ignored */
     bool template_cache;     /* --template-cache: single unkeyed requests reuse the template tokens' state */
     atomic_int conns;
@@ -541,20 +545,30 @@ static bool handle_systemone(int fd, const char *body, size_t len, bool keep_ali
     memset(&j, 0, sizeof(j));
     clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
     opts.strict = S.strict;
+    opts.model = S.e->cfg.model;
+    opts.max_length = S.max_length;
     opts.reject_truncation = !S.truncate;
     opts.vision = S.e->vision;
+    opts.audio.token_id=S.e->audio.token_id;
+    opts.audio.start_token_id=S.e->audio.start_token_id;
+    opts.audio.end_token_id=S.e->audio.end_token_id;
+    opts.audio.max_items=S.max_audio;
+    opts.audio.max_samples=S.max_audio_samples;
     opts.vision.max_images = S.max_images;
     opts.vision.max_image_tokens = S.max_image_tokens;
     opts.vision.max_image_pixels = S.max_image_pixels;
     opts.vision.max_videos = S.max_videos;
     opts.vision.max_video_frames = S.max_video_frames;
     opts.vision.max_video_tokens = S.max_video_tokens;
-    /* Any request naming images or videos takes a slot before decoding and keeps it until
+    opts.vision.allow_encoded_video = S.allow_encoded_video;
+    /* Any request naming images, videos or audio takes a slot before decoding and keeps it until
      * its patches are freed; a malformed list is refused by the encoder before any decoding. */
     const jval *ims = req ? json_get(req, "images") : NULL;
     const jval *vids = req ? json_get(req, "videos") : NULL;
+    const jval *audio = req ? json_get(req,"audio") : NULL;
     const bool slot = S.max_image_requests > 0 && ((ims && ims->type == J_ARRAY && ims->n > 0) ||
-                                                 (vids && vids->type == J_ARRAY && vids->n > 0));
+                                                 (vids && vids->type == J_ARRAY && vids->n > 0) ||
+                                                 (audio && audio->type == J_ARRAY && audio->n > 0));
     if (slot) image_slot_acquire();
     if (!req || !clef_encode_request(S.e->tok, req, opts, &j.rec, err, sizeof(err))) {
         if (slot) image_slot_release();
@@ -638,6 +652,8 @@ static bool run_warm_request(const char *req_text, size_t len, char *err, size_t
     clef_record rec;
     clef_encode_opts opts = CLEF_ENCODE_DEFAULTS;
     opts.vision = S.e->vision;
+    opts.model = S.e->cfg.model;
+    opts.max_length = S.max_length;
     bool ok = req && clef_encode_request(S.e->tok, req, opts, &rec, err, errlen);
     if (ok) {
         float ***probs = NULL;
@@ -727,6 +743,8 @@ int main(int argc, char **argv) {
     S.batch_tokens = 4096;
     S.strict = true;
     S.max_images = 4;
+    S.max_audio = 4;
+    S.max_audio_samples = 4800000;
     S.max_videos = 1;
     S.max_video_frames = 32;
     S.max_video_tokens = 1024;
@@ -747,6 +765,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--batch") && i + 1 < argc) S.batch = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--max-length") && i + 1 < argc) {
+            size_t v;
+            if (!parse_size(argv[++i], INT_MAX, &v) || !v) { fprintf(stderr, "clef-server: --max-length must be a positive whole number\n"); return 2; }
+            S.max_length = (int)v;
+        }
         else if (!strcmp(argv[i], "--max-body") && i + 1 < argc) {
             if (!parse_size(argv[++i], SIZE_MAX, &S.max_body)) { fprintf(stderr, "clef-server: --max-body must be a whole number of bytes\n"); return 2; }
         }
@@ -755,6 +778,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-warmup")) do_warmup = false;
         else if (!strcmp(argv[i], "--keep-warm")) S.keep_warm_ms = KEEP_WARM_MS;   /* the default, accepted explicitly */
         else if (!strcmp(argv[i], "--no-keep-warm")) S.keep_warm_ms = 0;
+        else if (!strcmp(argv[i], "--allow-encoded-video")) S.allow_encoded_video = true;
         else if (!strcmp(argv[i], "--batch-tokens") && i + 1 < argc) {
             if (!parse_size(argv[++i], SIZE_MAX, &S.batch_tokens)) { fprintf(stderr, "clef-server: --batch-tokens must be a whole number of tokens\n"); return 2; }
         }
@@ -770,6 +794,14 @@ int main(int argc, char **argv) {
             if (!strcmp(flag, "--max-videos")) S.max_videos = (int)v;
             else if (!strcmp(flag, "--max-video-frames")) S.max_video_frames = (int)v;
             else S.max_video_tokens = (long)v;
+        }
+        else if (!strcmp(argv[i],"--max-audio") && i+1<argc) {
+            size_t value;
+            if(!parse_size(argv[++i],INT_MAX,&value)){fprintf(stderr,"clef-server: --max-audio must be a whole number\n");return 2;}
+            S.max_audio=(int)value;
+        }
+        else if (!strcmp(argv[i],"--max-audio-samples") && i+1<argc) {
+            if(!parse_size(argv[++i],SIZE_MAX,&S.max_audio_samples)){fprintf(stderr,"clef-server: --max-audio-samples must be a whole number\n");return 2;}
         }
         else if (!strcmp(argv[i], "--max-images") && i + 1 < argc) {
             /* whole numbers only: atoi turned a typo into 0, which means unlimited (review #3) */
@@ -795,8 +827,8 @@ int main(int argc, char **argv) {
         else {
             fprintf(stderr, "usage: clef-server -m MODEL.gguf [--host 127.0.0.1] [--port 8080] [--batch 8] "
                             "[--batch-tokens 4096] [--no-strict] [--truncate] [--no-warmup] [--no-keep-warm] [--prefix-cache-mb N] [--template-cache] [--max-body BYTES] [--max-conn N] "
-                            "[--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-image-requests N] "
-                            "[--max-videos N] [--max-video-frames N] [--max-video-tokens N]\n");
+                            "[--max-length N] [--max-images N] [--max-image-tokens N] [--max-image-pixels N] [--max-image-requests N] "
+                            "[--max-videos N] [--max-video-frames N] [--max-video-tokens N] [--max-audio N] [--max-audio-samples N] [--allow-encoded-video]\n");
             return 2;
         }
     }
@@ -809,6 +841,11 @@ int main(int argc, char **argv) {
     char err[512];
     S.e = clef_open(model, err, sizeof(err));
     if (!S.e) { fprintf(stderr, "clef-server: %s\n", err); return 1; }
+    if (!S.max_length) S.max_length = S.e->cfg.model.context_default;
+    if (S.e->cfg.model.context_length && S.max_length > S.e->cfg.model.context_length) {
+        fprintf(stderr, "clef-server: --max-length exceeds model context limit %d\n", S.e->cfg.model.context_length);
+        clef_close(S.e); return 2;
+    }
     if (do_warmup) {
         double t0 = now_ms();
         if (!warmup(err, sizeof(err))) { fprintf(stderr, "clef-server: warm-up failed: %s\n", err); return 1; }
@@ -832,12 +869,19 @@ int main(int argc, char **argv) {
     fprintf(stderr, "clef-server: over-long state is %s\n", S.truncate ? "truncated silently (reference behaviour)" : "rejected");
     if (S.e->vision.image_token_id)
         fprintf(stderr, "clef-server: images: at most %d per request, %ld tokens each after resizing, %ld source pixels each; "
-                        "%d image/video requests decoded or queued at once (0 = unlimited)\n",
+                        "%d media requests decoded or queued at once (0 = unlimited)\n",
                 S.max_images, S.max_image_tokens, S.max_image_pixels, S.max_image_requests);
     else fprintf(stderr, "clef-server: this model file has no vision tower; requests with images are rejected\n");
     if (S.e->vision.image_token_id)
         fprintf(stderr, "clef-server: videos: at most %d per request, %d sampled frames and %ld tokens each (0 = processor/context limit)\n",
                 S.max_videos, S.max_video_frames, S.max_video_tokens);
+    if (S.e->vision.video_token_id)
+        fprintf(stderr, "clef-server: MP4/MOV uploads %s\n", S.allow_encoded_video
+                ? "enabled: decoded by clef-media as this user, without an OS sandbox"
+                : "disabled (--allow-encoded-video enables them)");
+    if(S.e->audio.token_id)
+        fprintf(stderr,"clef-server: audio: at most %d clips including soundtracks, %zu total samples per request (0 = context limit)\n",
+                S.max_audio,S.max_audio_samples);
     if (S.keep_warm_ms) fprintf(stderr, "clef-server: keep-warm pass every %d ms while idle\n", S.keep_warm_ms);
     else fprintf(stderr, "clef-server: keep-warm off\n");
     if (S.cache_bytes) fprintf(stderr, "clef-server: prefix cache of %zu MB for requests with X-Clef-Prefix-Cache\n", S.cache_bytes >> 20);

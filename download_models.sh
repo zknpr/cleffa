@@ -14,6 +14,8 @@ FLASH_REPO="Cloudflare/clef-flash"
 FLASH_REV="17f0b0ad64efb65d273590632833508766b2aae6"
 CLEF_REPO="Cloudflare/clef"
 CLEF_REV="2f3de3dd85f379784083b0814d997ab627200f0c"
+OMNI_REPO="Cloudflare/clef-omni"
+OMNI_REV="0db1cd2607d76a7bdb2a382f659e7b313079f84b"
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 cd "$ROOT"
@@ -26,9 +28,10 @@ cleffa model setup: download, verify, convert to GGUF, verify.
 Usage:
   ./download_models.sh clef-flash [--skip-download] [--token TOKEN]   # 9B, ~19 GB  -> gguf/clef-flash.gguf
   ./download_models.sh clef       [--skip-download] [--token TOKEN]   # 27B, ~55 GB -> gguf/clef.gguf
+  ./download_models.sh clef-omni  [--skip-download] [--token TOKEN]   # thinker + head -> gguf/clef-omni.gguf
   ./download_models.sh all        [--skip-download] [--token TOKEN]
 
-  --skip-download  use the snapshot already in model-flash/ or model/ (it is still verified)
+  --skip-download  use the existing local snapshot (it is still verified)
   --token TOKEN    Hugging Face token (or set HF_TOKEN); the Clef repositories are public
 
 The Python environment (.venv, from requirements.txt) is created on first use, with uv when it is
@@ -41,7 +44,7 @@ die() { echo "download_models.sh: $*" >&2; exit 1; }
 target=""; skip_download=0; token="${HF_TOKEN:-}"
 while [ $# -gt 0 ]; do
     case "$1" in
-        clef-flash|clef|all) [ -z "$target" ] || die "more than one model given"; target=$1 ;;
+        clef-flash|clef|clef-omni|all) [ -z "$target" ] || die "more than one model given"; target=$1 ;;
         --skip-download) skip_download=1 ;;
         --token) [ $# -ge 2 ] || die "--token needs a value"; token=$2; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -78,7 +81,7 @@ fetch() {
         echo "== using the existing snapshot in $3"
     fi
     echo "== verifying $3 against $2"
-    "$PY" tools/verify_snapshot.py "$3" "$2"
+    "$PY" -B tools/verify_snapshot.py "$3" "$2"
 }
 
 # convert DIR NAME
@@ -87,9 +90,9 @@ convert() {
     out="gguf/$2.gguf"; tmp="gguf/$2.gguf.tmp"
     echo "== converting $1 -> $out"
     rm -f "$tmp"
-    "$PY" tools/convert.py "$1" "$tmp"
+    "$PY" -B tools/convert.py "$1" "$tmp"
     echo "== verifying $out against $1"
-    "$PY" tests/verify_gguf.py "$1" "$tmp"
+    "$PY" -B tests/verify_gguf.py "$1" "$tmp"
     mv "$tmp" "$out"
     echo "== $out ready"
 }
@@ -98,7 +101,9 @@ setup_python
 case "$target" in
     clef-flash) fetch "$FLASH_REPO" "$FLASH_REV" model-flash; convert model-flash clef-flash ;;
     clef)       fetch "$CLEF_REPO" "$CLEF_REV" model;       convert model clef ;;
+    clef-omni)  fetch "$OMNI_REPO" "$OMNI_REV" model-omni;  convert model-omni clef-omni ;;
     all)        fetch "$FLASH_REPO" "$FLASH_REV" model-flash; convert model-flash clef-flash
-                fetch "$CLEF_REPO" "$CLEF_REV" model;       convert model clef ;;
+                fetch "$CLEF_REPO" "$CLEF_REV" model;       convert model clef
+                fetch "$OMNI_REPO" "$OMNI_REV" model-omni;  convert model-omni clef-omni ;;
 esac
 echo "done. Build with: make"

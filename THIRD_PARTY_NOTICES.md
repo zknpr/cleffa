@@ -146,14 +146,15 @@ dealings in these Data Files or Software without prior written
 authorization of the copyright holder.
 ```
 
-## Clef and Clef-Flash (Apache-2.0)
+## Clef, Clef-Flash and Clef-Omni (Apache-2.0)
 
 cleffa does not include or redistribute model weights or Cloudflare's code.
-- **Downloads:** `download_models.sh` fetches [Cloudflare/clef](https://huggingface.co/Cloudflare/clef)
-  and [Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) from Hugging Face at
-  pinned revisions. Both are licensed under the Apache License 2.0; the license file ships with each
-  snapshot.
-- **Your conversions:** the GGUF files that `tools/convert.py` produces are derivatives of those
+- **Downloads:** `download_models.sh` fetches [Cloudflare/clef](https://huggingface.co/Cloudflare/clef),
+  [Cloudflare/clef-flash](https://huggingface.co/Cloudflare/clef-flash) and
+  [Cloudflare/clef-omni](https://huggingface.co/Cloudflare/clef-omni) from Hugging Face at pinned
+  revisions. All three are licensed under the Apache License 2.0 (Clef-Omni following its base
+  model, Qwen/Qwen3-Omni-30B-A3B-Instruct); the license file ships with each snapshot.
+- **Your conversions:** the GGUF files that `tools/convert.py` and `tools/convert_omni.py` produce are derivatives of those
   weights. If you redistribute them, the Apache-2.0 terms apply.
 - **Reference code:** the reference oracles in `ref/` import `joint_schema_model.py` from the
   downloaded snapshot. That code is not copied into this repository.
@@ -161,8 +162,10 @@ cleffa does not include or redistribute model weights or Cloudflare's code.
 ## FFmpeg
 
 The optional `tools/video_request.py` client tool invokes locally installed `ffmpeg` and `ffprobe`
-executables for MP4/MOV conversion. The engine does not link FFmpeg. Its source and binaries are
-not vendored here.
+executables for MP4/MOV conversion. The optional native `clef-media` worker links the installed
+libavformat, libavcodec, libswscale, libswresample and libavutil libraries. The main `clef`,
+`clef-server` and `clef-tool` executables launch that worker when needed and do not link FFmpeg.
+FFmpeg source and binaries are not vendored here.
 Its license depends on the build configuration; see the installed distribution's notices and
 [FFmpeg's license page](https://ffmpeg.org/legal.html).
 

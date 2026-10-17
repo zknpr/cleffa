@@ -1,0 +1,8 @@
+{
+  "seed": 718,
+  "sample_lengths": [0, 1, 199, 200, 201, 399, 400, 401, 15999, 16000, 16001],
+  "frame_lengths": [99, 100, 101, 799, 800, 801],
+  "signals": ["silence", "impulse", "sine", "quiet", "loud"],
+  "unequal_lengths": [1, 199, 401, 16001],
+  "long_samples": 496000
+}

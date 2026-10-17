@@ -131,6 +131,78 @@ def make_tree(root: Path):
 
 
 class EvidenceArchive(unittest.TestCase):
+    def test_native_route_traces_stay_local_but_capture_evidence_is_archived(self):
+        exp = self.root / 'omni-check-20261010'
+        capture = exp / 'captures' / 'images'
+        capture.mkdir(parents=True)
+        for name in ('ov001.jsonl', 'r000.jsonl', 'oa002.jsonl', 'oav003.jsonl', 'ol000.jsonl'):
+            (capture / name).write_text('{"layer":0,"token":0,"logits":[0]}\n')
+        for name in ('manifest.json', 'requests.jsonl', 'ov001.output.json'):
+            (capture / name).write_text('{}\n')
+        (exp / 'ov001.jsonl').write_text('{"id":"ov001"}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'routes.tar.gz', 'ev')
+        actual = {entry['path'] for entry in manifest['files']
+                  if entry['path'].startswith(exp.name + '/')}
+        self.assertEqual(actual, {f'{exp.name}/captures/images/{name}'
+                                  for name in ('manifest.json', 'requests.jsonl', 'ov001.output.json')}
+                                 | {f'{exp.name}/ov001.jsonl'})
+
+    def test_independent_omni_reference_and_control_evidence(self):
+        allowed = set()
+        for modality in ('text', 'vision', 'video', 'audio', 'av', 'long'):
+            for suffix in ('blocked-d2', 'sdpa-control-d2'):
+                path = self.root / f'clef-omni-{modality}-f32-{suffix}'
+                (path / 'layers').mkdir(parents=True)
+                for filename in ('requests.jsonl', 'encoded.jsonl', 'manifest.json', 'latency.json'):
+                    (path / filename).write_text('{}\n')
+                    allowed.add(f'{path.name}/{filename}')
+                (path / 'logits.safetensors').write_bytes(safetensors(
+                    {'logits': {'dtype': 'F32', 'shape': [4], 'data_offsets': [0, 16]}}))
+                allowed.add(f'{path.name}/logits.safetensors')
+                (path / 'layers' / 'r000.safetensors').write_bytes(b'not public')
+                (path / 'checkpoint.json').write_text('{}\n')
+        unknown = self.root / 'clef-omni-text-f32-unreviewed'
+        unknown.mkdir()
+        (unknown / 'requests.jsonl').write_text('{}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'independent.tar.gz', 'ev')
+        actual = {entry['path'] for entry in manifest['files']
+                  if entry['path'].startswith('clef-omni-')}
+        self.assertEqual(actual, allowed)
+
+    def test_fp64_references_without_layer_payloads(self):
+        allowed = set()
+        for name in ('text-short-f64-v1', 'text-mid-f64-v1', 'text-8k-f64-v2', 'text-16k-f64-v2',
+                     'text-bounded-f64-v2', 'vision-f64-v1', 'video-f64-v1', 'audio-f64-v1', 'av-f64-v1'):
+            path = self.root / f'clef-omni-{name}'
+            (path / 'layers').mkdir(parents=True)
+            for filename in ('requests.jsonl', 'encoded.jsonl', 'manifest.json'):
+                (path / filename).write_text('{}\n')
+                allowed.add(f'{path.name}/{filename}')
+            (path / 'logits.safetensors').write_bytes(safetensors(
+                {'r000/q': {'dtype': 'F64', 'shape': [2], 'data_offsets': [0, 16]}}))
+            allowed.add(f'{path.name}/logits.safetensors')
+            (path / 'layers' / 'r000.safetensors').write_bytes(b'not public')
+        for probe in ('clef-omni-text-f64-probe-v1', 'clef-omni-text-short-f64-v3'):
+            (self.root / probe).mkdir()
+            (self.root / probe / 'requests.jsonl').write_text('{}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'fp64.tar.gz', 'ev')
+        actual = {entry['path'] for entry in manifest['files']
+                  if entry['path'].startswith('clef-omni-')}
+        self.assertEqual(actual, allowed)
+
+    def test_omni_oracle_audits_without_layer_or_binary_payloads(self):
+        for name in ('clef-omni-audio-f32-arbitrated','clef-omni-video-f32-input-shift','clef-omni-vision-f32-residual-order'):
+            path=self.root/name;(path/'layers').mkdir(parents=True)
+            for filename in ('requests.jsonl','encoded.jsonl','manifest.json','arbitration.json','source-transition.json'):
+                (path/filename).write_text('{}\n')
+            (path/'layers'/'oa000.safetensors').write_bytes(b'not public')
+            (path/'probe').write_bytes(b'\xcf\xfa\xed\xfe'+b'\0'*16)
+        manifest=ea.build(self.root,Path(self.tmp.name)/'omni.tar.gz','ev')
+        names={e['path'] for e in manifest['files']}
+        for path in self.root.glob('clef-omni-*'):
+            self.assertEqual({n for n in names if n.startswith(path.name+'/')},
+                             {path.name+'/'+n for n in ('requests.jsonl','encoded.jsonl','manifest.json','arbitration.json','source-transition.json')})
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name) / 'golden'
