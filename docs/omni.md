@@ -622,7 +622,11 @@ accuracy estimate, and no faulty native operation was isolated. Evidence:
   the 32 GiB memory reserve and was stopped.
 - **Coverage.** Encoded video is checked with one generated H.264/AAC MOV; general codec coverage
   and decoded-pixel parity of encoded uploads are not established.
-- **Working-default speed.** Indirect expert dispatch measured 0.96–3.17% lower latency on the
-  working default's fixtures and was deferred without full qualification
+- **Working-default speed.** About 247 ms at 298 tokens, 1.49 s at 2,231, 8.09 s at 8,069 and
+  23.7 s at 16,344 after staging attention's K/V blocks (bitwise unchanged output;
+  [performance history](performance-history.md#staged-kv-blocks-in-omni-attention-2026-10-17)).
+  Expert GEMMs dominate below about 2k tokens and are memory-bandwidth bound; attention dominates
+  above. Indirect expert dispatch measured 0.96–3.17% lower latency on the working default's
+  fixtures and was deferred without full qualification
   ([rejected experiments](rejected-experiments.md#fp64-precision-prototypes)).
 - **Caches.** Omni prefix and template reuse is unsupported; such requests run in full.

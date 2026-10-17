@@ -2161,7 +2161,16 @@ inline void omni_rescale_fragment(thread simdgroup_float8x8 &hi,
 
 // The established FP32 tiled attention reduction, specialized to hd=128 and
 // ungated FP32 output. Record-aligned key blocks preserve packed-batch parity.
+// Each 32-key K and V block is staged once in threadgroup memory for the whole GQA group
+// (one SIMD-group per query head) instead of loaded from device memory by every head:
+// 7-9% faster at 2-16k tokens with bitwise-identical output (bench/omni_attention_bench.m).
+// The staged words are the words the per-head loads read, including masked rows past the
+// record end, which lie in the slack attn_prep initializes. All SIMD-groups of a
+// threadgroup share i0, and so the key-block sequence, which keeps the barriers uniform.
+// Keeping Q in registers or prefetching the next block into registers was slower
+// (register pressure), as was splitting each head's columns over two SIMD-groups.
 constant constexpr int OMNI_FA_BQ = 8, OMNI_FA_BK = 32, OMNI_FA_HD = 128, OMNI_FA_DT = OMNI_FA_HD / 8;
+constant constexpr int OMNI_FA_KS = OMNI_FA_HD + 4;   // staged row stride; 128 measured slower
 kernel void omni_attention(constant attn_args &a [[buffer(0)]],
                          device const float *Q [[buffer(1)]],
                          device const float *K [[buffer(2)]],
@@ -2171,11 +2180,13 @@ kernel void omni_attention(constant attn_args &a [[buffer(0)]],
                          threadgroup float *smem [[threadgroup(0)]],
                          uint2 tg [[threadgroup_position_in_grid]],
                          uint sg [[simdgroup_index_in_threadgroup]],
-                         uint lane [[thread_index_in_simdgroup]]) {
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint tid [[thread_index_in_threadgroup]]) {
     const int i0 = tg.x * OMNI_FA_BQ, kh = tg.y, grp = a.nh / a.nkv, h = kh * grp + sg;
-    const int T = a.T;
+    const int T = a.T, nthreads = 32 * grp;
     threadgroup float *S = smem + sg * (OMNI_FA_BQ * OMNI_FA_BK + 64);   // 8x32 scores/probs
     threadgroup float *D = S + OMNI_FA_BQ * OMNI_FA_BK;                   // 8x8 diagonal
+    threadgroup float *KV = smem + grp * (OMNI_FA_BQ * OMNI_FA_BK + 64);  // [32][OMNI_FA_KS] K, then V
     device const float *Qh = Q + ((long)h * T + i0) * OMNI_FA_HD;
     device const float *Kh = K + (long)kh * T * OMNI_FA_HD;
     device const float *Vh = V + (long)kh * T * OMNI_FA_HD;
@@ -2202,13 +2213,20 @@ kernel void omni_attention(constant attn_args &a [[buffer(0)]],
     const int k_end = min(i0 + OMNI_FA_BQ, T);                       // exclusive
     for (int seg = seq_start[i0]; seg >= 0;) {
     for (int kb = seg; kb < k_end; kb += OMNI_FA_BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // previous block's V reads done
+        for (int i = tid; i < OMNI_FA_BK * OMNI_FA_HD / 4; i += nthreads) {
+            const int row = i / (OMNI_FA_HD / 4), c4 = i % (OMNI_FA_HD / 4);
+            *(threadgroup float4 *)(KV + row * OMNI_FA_KS + 4 * c4) =
+                *(device const float4 *)(Kh + (long)(kb + row) * OMNI_FA_HD + 4 * c4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         simdgroup_float8x8 s[4];
         for (int j = 0; j < 4; j++) s[j] = simdgroup_float8x8(0.0f);
         for (int d = 0; d < OMNI_FA_DT; d++) {
             simdgroup_float8x8 qt, kt;
             simdgroup_load(qt, Qh + d * 8, OMNI_FA_HD);
             for (int j = 0; j < 4; j++) {
-                simdgroup_load(kt, Kh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD, ulong2(0, 0), true);
+                simdgroup_load(kt, KV + (8 * j) * OMNI_FA_KS + d * 8, OMNI_FA_KS, ulong2(0, 0), true);
                 simdgroup_multiply_accumulate(s[j], qt, kt, s[j]);
             }
         }
@@ -2243,7 +2261,13 @@ kernel void omni_attention(constant attn_args &a [[buffer(0)]],
         for (int c = 0; c < 8; c++) S[r * OMNI_FA_BK + c0 + c] = v[c];
         D[r*8+(lane%4)*2] = alpha;
         D[r*8+(lane%4)*2+1] = alpha;
-        simdgroup_barrier(mem_flags::mem_threadgroup);
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // every head's K reads done; S/D visible
+        for (int i = tid; i < OMNI_FA_BK * OMNI_FA_HD / 4; i += nthreads) {
+            const int row = i / (OMNI_FA_HD / 4), c4 = i % (OMNI_FA_HD / 4);
+            *(threadgroup float4 *)(KV + row * OMNI_FA_KS + 4 * c4) =
+                *(device const float4 *)(Vh + (long)(kb + row) * OMNI_FA_HD + 4 * c4);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         simdgroup_float8x8 dm, p[4];
         simdgroup_load(dm, D, 8);
@@ -2253,7 +2277,7 @@ kernel void omni_attention(constant attn_args &a [[buffer(0)]],
             omni_rescale_fragment(acc[d],low[d],dm);
             for (int j = 0; j < 4; j++) {
                 simdgroup_float8x8 vt, t;
-                simdgroup_load(vt, Vh + (long)(kb + 8 * j) * OMNI_FA_HD + d * 8, OMNI_FA_HD);
+                simdgroup_load(vt, KV + (8 * j) * OMNI_FA_KS + d * 8, OMNI_FA_KS);
                 simdgroup_multiply(t, p[j], vt);
                 omni_accumulate_fragment(acc[d],low[d],t);
             }

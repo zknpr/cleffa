@@ -71,6 +71,9 @@ make clean
   environment. It records full versus reported token counts and every response, without retries.
   Missing or mismatched usage does not establish equal work. Its default mode makes no network
   requests. `.venv/bin/python -B tests/test_cloudflare_checkout.py` checks result/error handling.
+- `bench/omni_attention_bench.m` (build like the other `bench/*.m`, run from the repo root)
+  checks a candidate Omni attention kernel for byte-identical output against `omni_attention`,
+  single and packed, then times both ABBA; restructurings that keep the bytes need no FP64 run.
 - `bench/compare_mlx.py T K N --output OUT.json` compares the MPP GEMM algorithm with MLX on
   identical FP16/BF16 operands and FP32 output. It requires optional MLX/NumPy dependencies;
   see `docs/rejected-experiments.md` for isolated installation, measurements and rejected probes.

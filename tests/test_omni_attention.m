@@ -78,7 +78,7 @@ static float *run(id<MTLDevice> dev, id<MTLCommandQueue> queue,
     [enc setBuffer:v offset:0 atIndex:3];
     [enc setBuffer:starts offset:0 atIndex:4];
     [enc setBuffer:out offset:0 atIndex:5];
-    [enc setThreadgroupMemoryLength:nh*(8*32+64)*4 atIndex:0];
+    [enc setThreadgroupMemoryLength:(nh*(8*32+64)+32*132)*4 atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((T+7)/8, nkv, 1) threadsPerThreadgroup:MTLSizeMake(32*nh, 1, 1)];
     [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
     require(cb.error == nil, cb.error.localizedDescription.UTF8String);

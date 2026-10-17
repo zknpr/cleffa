@@ -233,7 +233,8 @@ bool clef_omni_encode_attention(clef_gpu *g, const clef_engine *e, id<MTLCommand
     [enc setBuffer:g->V offset:0 atIndex:3]; [enc setBuffer:g->seq_start offset:0 atIndex:4];
     // There is no query gate; its otherwise unused FP32 buffer holds attention output.
     [enc setBuffer:g->G offset:0 atIndex:5];
-    [enc setThreadgroupMemoryLength:(c->nh/c->nkv)*(8*32+64)*4 atIndex:0];
+    // Per-head score/probability scratch plus the shared staged K/V block (omni_attention).
+    [enc setThreadgroupMemoryLength:((c->nh/c->nkv)*(8*32+64)+32*132)*4 atIndex:0];
     [enc dispatchThreadgroups:MTLSizeMake((T+7)/8, c->nkv, 1)
         threadsPerThreadgroup:MTLSizeMake(32*(c->nh/c->nkv), 1, 1)];
     OPROF(P_ATTN);

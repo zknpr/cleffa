@@ -1583,6 +1583,33 @@ FP32 operand rate (see [rejected experiments](rejected-experiments.md#default-pa
 Attention grows quadratically: about 382 ms per layer at 16,344 tokens, against 262–294 ms for
 the dense FP32 attention kernels on the same 4,096 head-dimensions.
 
+### Staged K/V blocks in Omni attention, 2026-10-17
+
+Each threadgroup of `omni_attention` runs the eight query heads of one GQA group, one SIMD-group
+per head, and every head loaded the same 32-key K and V blocks from device memory. The kernel now
+stages each block once in threadgroup memory (padded to a 132-float row stride, 16.5 KiB) and
+all eight heads read it from there. Every product, softmax step and compensated accumulation is
+unchanged, so the output is bitwise identical: `bench/omni_attention_bench.m` compares output
+bytes against the previous kernel for one record and three packed records at 1 to 16,344
+tokens, and all 43 Omni requests with FP64 references give byte-identical logits, at batch 1, at
+batch 8 and NaN-poisoned at batch 8. `make test-omni-attention` passes.
+
+The kernel itself is 7.5–9.9% faster at 2,231–16,344 tokens (344.1 → 310.1 ms per layer at
+16,344). Whole requests, three ABBA quartets of three warm `--time` calls each, on the same
+binaries apart from the kernel:
+
+| Request | Before | After | Quartet ratios |
+|---|---:|---:|---|
+| `r003`, 298 tokens | 247.8 ms | 246.8 ms | 0.998, 0.993, 0.995 |
+| `r019`, 2,231 tokens | 1,518.6 ms | 1,490.2 ms | 0.949, 0.977, 1.001 |
+| `r020`, 8,069 tokens | 8,742.1 ms | 8,091.4 ms | 0.925, 0.923, 0.925 |
+| `r021`, 16,344 tokens | 27,163.8 ms | 23,707.5 ms | 0.877, 0.875, 0.868 |
+
+The 16k saving (3.5 s) is larger than 48 layers of the synthetic kernel saving (1.6 s); the
+benchmark's random Q/K/V are not the model's, and the whole-request figure is the one measured.
+Rejected variants are in [rejected experiments](rejected-experiments.md#default-path-speed-candidates).
+Evidence: `golden/omni-attention-staged-20261017/`.
+
 ## Dense head memory, 2026-10-14
 
 Flash and 27B keep fewer CPU head weights and reuse two completed decoder buffers on the GPU

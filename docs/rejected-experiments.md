@@ -1565,6 +1565,17 @@ PyTorch references, and every long-request question got worse (`r020/service` |d
 check ([policy](omni.md#numerical-verification-policy)). Evidence for both:
 `golden/omni-attention-block-20261017/`.
 
+**Omni attention restructuring around staged K/V, 2026-10-17.** With K/V blocks staged in
+threadgroup memory ([adopted](performance-history.md#staged-kv-blocks-in-omni-attention-2026-10-17)),
+these exact variants were measured against the previous kernel in `bench/omni_attention_bench.m`
+(time ratio, lower is faster; staged alone 0.92 at 2,231 and 0.91 at 8,069 tokens). Keeping each
+head's Q fragments in registers: 1.13 at 298 and 1.05 at 2,231. Prefetching the next block into
+registers during compute: 1.18–1.20. Staging 16 keys at a time to halve threadgroup memory:
+3.2 (the per-half fragment indexing spills). Two SIMD-groups per head, each owning 64 output
+columns and half the score fragments, with the first running the softmax: 0.98. An unpadded
+128-float stride: 0.94–0.96 (bank conflicts). Register pressure from the two-float accumulators
+(64 floats per lane) limits all of them. Evidence: `golden/omni-attention-staged-20261017/kernel-bench.txt`.
+
 **Expert GEMM bandwidth.** `bench/expert_bench.m` reproduces the expert GEMMs at 298 tokens: 128
 experts of about 19 rows. FP32 and FP16 operands run at 330–375 GB/s of weight traffic against a
 520–545 GB/s streaming read on this machine; 32×64 tiles and 2- or 4-way split-K do not raise it.

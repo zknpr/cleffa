@@ -74,6 +74,7 @@ __pycache__/
 /tests/vision-config/
 /gemm-tiles
 /gdn-bench
+/omni-attention-bench
 /tests/test-gdn-buffers
 
 .DS_Store
