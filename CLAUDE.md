@@ -472,7 +472,7 @@ reduction and each attention head's BLAS/softmax sequence stay intact.
 `tests/test_head_linear.c` compares both layouts against unsplit BLAS and checks actual worker
 selection; `tests/test_head_load.c` checks dense/Omni policy assignment. `tests/test_head_parallel.c`
 checks attention, scratch allocation failure and concurrent first-use configuration. Run
-`make test-head-tsan` to instrument that initialization check. The environment threshold
+`make test-head-tsan` to run it under ThreadSanitizer. The environment threshold
 `CLEF_DEBUG_HEAD_SPLIT_MIN` is read once, thread-safely; setting it to `0` disables the linear
 split only. See `docs/performance-history.md` for timing and qualification limits.
 

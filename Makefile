@@ -214,12 +214,13 @@ tests/test-head-linear: tests/test_head_linear.o $(HOST_OBJS)
 tests/test-head-parallel: tests/test_head_parallel.o $(HOST_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS) $(LDLIBS) -framework Accelerate
 
-# Instrument the included head implementation and concurrent first-use regression.
+# Instrument the included head implementation: the parallel attention workers and the concurrent
+# first-use regression (about 10 s).
 tests/test-head-parallel-tsan: tests/test_head_parallel.c clef_head.c $(HOST_OBJS)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -O1 -fsanitize=thread -o $@ tests/test_head_parallel.c $(HOST_OBJS) $(LDFLAGS) $(LDLIBS) -framework Accelerate
 
 test-head-tsan: tests/test-head-parallel-tsan
-	tests/test-head-parallel-tsan --init-only
+	tests/test-head-parallel-tsan
 
 # Decode files from cjpeg, sips, ffmpeg and Pillow with cleffa and with Pillow, pixel for pixel; encoders
 # that are not installed are skipped. Not part of make test (it depends on those tools).

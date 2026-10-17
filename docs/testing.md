@@ -53,7 +53,7 @@ tests/test_gpu_fail.sh gguf/clef-flash.gguf golden/clef-flash/requests.jsonl  # 
 tests/test_lingering_close.sh gguf/clef-flash.gguf        # starts its own server: an error response drains a half-closed client's body
 make test-prefix-attention                           # exact full vs resumed attention, poisoned guards, float64 bounds; no model needed
 make test-prefix-model                               # both models: a populated cache entry is refused by another engine and by a reopened one
-make test-head-tsan                                  # ThreadSanitizer check of the CPU head's first-use configuration
+make test-head-tsan                                  # ThreadSanitizer run of the CPU head's parallel attention and first-use configuration
 .venv/bin/python -B tests/test_gemm_dispatch.py gguf/clef-flash.gguf     # exact logits across the Flash 768-1,024 tile boundaries
 .venv/bin/python -B tests/test_prefix_cache.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl    # cache transitions, overflow, bypass, allocation recovery
 .venv/bin/python -B tests/test_prefix_public.py gguf/clef-flash.gguf golden/clef-flash/requests.jsonl   # poisoned fill/hit pairs keep the uncached logits
