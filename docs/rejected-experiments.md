@@ -751,7 +751,7 @@ and accumulate kernels static outer tensor extents, with arithmetic unchanged. A
 cases were bit-identical, but five of six frozen single-GEMM gates failed: median
 candidate/baseline ratios for T146/300/2235 were 1.002078/0.993634/1.068260 at K4096,N4096 and
 1.022428/1.001913/1.002906 at K6144,N5120, against a required 3% improvement at both longer
-lengths. Flash T2235 varied substantially, so the screen does not establish a precise slowdown.
+lengths and at most 2% extra at T146. Flash T2235 varied substantially, so the screen does not establish a precise slowdown.
 No complete-request test followed. Evidence: `golden/dense-fp32-static-slice-20261014/`.
 
 ## FFN
@@ -1038,9 +1038,9 @@ below is the 2026-10-15 attempt, which stopped before any candidate inference.
 The candidate caches the interval-decay triangle once per full 32-token block of
 `gdn_chunk_prep` for KE, U and A to reuse. It passed all 133 synthetic byte-comparison cases,
 and every measured ABBA quartet favored it: at 4,096 to 16,347 tokens with 48 value heads,
-preparation time fell 16.91% to 32.15% and preparation plus scan time 5.20% to 12.82%. All
-series passed the frozen advancement gate, but synthetic kernel timings do not establish request
-gains, and production Flash does not use the chunked route.
+preparation time reductions ranged from 16.91% to 32.15% and preparation plus scan from 5.20% to
+12.82%. All series passed the frozen advancement gate, but synthetic kernel timings do not
+establish request gains, and production Flash does not use the chunked route.
 
 The whole-engine screen stopped in its fresh Flash baseline because the private builds omitted
 the `clef-media` helper: encoded-video records `vd005` and `vd006` returned explicit errors, and
@@ -1102,9 +1102,9 @@ justifies claiming that every possible kernel optimization has been exhausted.
 ## Dense precision controls, 2026-10-14 and 2026-10-15
 
 Each private candidate changed one local rounding or operator-grouping step in Flash and 27B to
-test whether the complete model moves closer to the FP32 reference, on the canonical 46-request
-text/image/video corpus (103 questions and 339 logits per model) unless noted. The frozen rule
-for every entry below was to keep every FP32 decision and the 0.05 logit / 0.002 probability
+test whether the complete model moves closer to the FP32 reference. Candidates that reached a
+model screen used the canonical 46-request text/image/video corpus (103 questions and 339 logits
+per model) unless noted. The frozen rule was to keep every FP32 decision and the 0.05 logit / 0.002 probability
 ceilings, and to lower both the mean question-maximum logit and probability errors ("mean"
 errors below) on both models. The user approved at most 2% extra full-request latency for a
 demonstrated accuracy gain; timings used six ABBA quartets per case. None was integrated or
@@ -1118,7 +1118,7 @@ existing FP32 residual GEMM, lowered mean probability error 19.01% on Flash and 
 27B's maximum rose from 0.001136 to 0.001796. On a separate 24-request numerical fixture, 27B's
 request-mean probability error fell 6.22% with a 95% interval that crossed zero and a maximum
 5.47% higher, failing the predeclared improvement criterion; that fixture had informed earlier
-choices and is not untouched validation. Latency rose 4.70% to 5.62% on both models, and 35 of
+choices and is not untouched validation. Latency increases ranged from 4.70% to 5.62% on both models, and 35 of
 36 quartets were slower. Evidence: `golden/dense-attn-output-20261014/` and
 `golden/dense-attn-output-f32-20261014/`.
 
@@ -1186,7 +1186,7 @@ until `contract(on)` was restored. Evidence:
 **Candidate and cost.** Keeping the FP32 producer values in the dead scan O buffer and projecting
 them with `gemm_f32_acc_32x128`, for dense DeltaNet blocks only, passed 914 local GPU dispatches
 and changed all 39 selected default logits in each model. The fourteen-case latency screen
-rejected it before any accuracy campaign: latency rose 9.35% to 15.83% across fresh and cached
+rejected it before any accuracy campaign: latency increases ranged from 9.35% to 15.83% across fresh and cached
 requests on both models, and all 84 quartets were slower. Plausible but unmeasured causes are the
 doubled activation operand width, the loss of larger half-only tiles some baseline cases use, and
 in-place FP32 producer writes. Evidence: `golden/dense-gdn-f32-feasibility-20261015/`
@@ -1245,7 +1245,7 @@ From 2026-10-12 to 2026-10-13 the work tried to make native arithmetic more accu
 independent CPU FP64 references ([FP64 controls](omni.md#fp64-controls)), with the FP32 screen
 still the acceptance gate. Each change passed its own local operator tests unless noted. Rows
 2–8 are variants of one full-compensation prototype (row 8 builds on row 6); rows 10–15 change
-one operator family at a time on the row-8 prototype. `r020` is the 8,069-token text control;
+one operator family at a time on the row-8 prototype, cumulatively from row 11. `r020` is the 8,069-token text control;
 "FP32 n" counts failed FP32-screen questions.
 
 | # | Change | Result | Evidence |
@@ -1264,15 +1264,15 @@ one operator family at a time on the row-8 prototype. `r020` is the 8,069-token 
 | 12 | Compensated QKV with a separate FP32 Q/K store, then accurate decoder RMS | 16 failed stages; with RMS, 1; not qualified | `omni-qk-store-20261013/` |
 | 13 | Attention low components through the final division; compensated probability–value products | Division fails the local exact-constant test; products: `r020` 16 failed | `omni-prefix-attention-20261013/` |
 | 14 | Compensated attention scores and softmax | Local error 8.8-fold lower; `r020` 16 failed | `omni-attention-scores-20261013/` |
-| 15 | Compensated selected-expert weight normalization | `r020` 16 → 17 failed; FP32 15 on default arithmetic | `omni-route-weights-20261013/` |
+| 15 | Compensated selected-expert weight normalization | On the combined precision profile, `r020` 16 → 17 failed; FP32 15 on default arithmetic | `omni-route-weights-20261013/` |
 | 16 | GPU-written indirect dispatch grids for expert tiles (arithmetic unchanged) | Prototype 0.40–3.02% lower but `r019` +1.06%; default 0.96–3.17% lower, deferred | `omni-precision-performance-20261013/` |
 
 What this established:
 
 - **Local accuracy does not predict the whole request.** On `r020`, a correctly rounded QKV
   projection alone restores the reference expert at the first flip, yet the native Q/K, QKV,
-  attention and routing-weight corrections each moved that flip earlier to near-ties (reference
-  score gap `3.31363e-8`). Exact layer arithmetic cannot undo state drift that is already
+  attention and routing-weight corrections each moved that flip earlier, to near-ties such as layer 12/token 5,606
+  (reference score gap `3.31363e-8`). Exact layer arithmetic cannot undo state drift that is already
   sufficient for the flip, and the row-8 prototype's native arithmetic partly cancels earlier
   error at that tie.
 - **FP32 storage is not the obstacle.** Ideal FP64 arithmetic with FP32 stores at the native
@@ -1341,7 +1341,7 @@ regression control. Ratios are candidate/parent; "paired" values are the two ABB
 
 | Candidate | Result | Evidence |
 |---|---|---|
-| Q/K helper callbacks in one MPS wrapper | 298: 1.92% lower; 2,231: 0.69% higher, then 1.12% lower; not promoted | `omni-fp32-qk-async-20261014/` |
+| Q/K helper callbacks in one MPS wrapper | 298: 1.92% lower; 2,231: 0.69% higher, then 1.12% lower; whole-model outputs checked on `r003` and `r019` only; not promoted | `omni-fp32-qk-async-20261014/` |
 | Empty Q/K-to-attention submission removed | Local checks only; −0.03% and +0.91%; not promoted | `omni-fp32-qk-handoff-20261014/` |
 | Unused expert activation rows trimmed | 2,231: 14.8% slower | `omni-activation-extent-20261014/` |
 | Activation in the tiny-expert projection command | Short 2.5% lower; long mixed; the follow-up aborted | `omni-expert-projection-activation-20261014/` |
@@ -1352,7 +1352,7 @@ regression control. Ratios are candidate/parent; "paired" values are the two ABB
 | Native RMS mean with fixed reduction trees | 298: 1.179361 / 1.010239 | `omni-rms-native-timing-20261015/` |
 | RMS square, mean and normalization fused into the caller's encoder | 298 passes; 2,231: 0.908767 / 1.014257 | `omni-rms-inline-timing-v2-20261015/` |
 | Probability padding and layout conversion in the softmax graph | +10.95% and +29.04% | `omni-attention-layout-timing-20261015/` |
-| Query chunks of 1,024 rows, reachable-key scores only (operator within local limits) | 298: +3.005%; 2,231: +5.444% | `omni-attention-causal-timing-20261015/` |
+| Query chunks of 1,024 rows, reachable-key scores only (operator output within local limits; model screen exact) | 298: +3.005%; 2,231: +5.444% | `omni-attention-causal-timing-20261015/` |
 | Expert chunks of 4,096 rows | 2,231: 2.229% lower (1.009965 / 0.952693); up to another 498.25 MiB | `omni-chunk4096-timing-v2-20261015/` |
 | Sixteen-head attention groups at 2,049–2,896 tokens | 2,231: +3.409% | `omni-attention-head-batch-timing-20261015/` |
 | Waits deferred to the last attention head group | 298 pair 1.038457 over the bound; 2,231: +0.794% | `omni-attention-deferred-timing-20261016/` |
@@ -1368,7 +1368,7 @@ regression control. Ratios are candidate/parent; "paired" values are the two ABB
 | Native dot4-FMA tiny-expert products, separate validation | 298: 3.009% lower; 2,231 pair 1.039992 over the bound; fused validation passed (step 18) | `omni-tiny-native-dot4-timing-20261016/` |
 | Tiny experts grouped by row count | 298: 1.854% lower | `omni-tiny-grouped-validation-timing-20261016/` |
 | Two output columns per tiny-expert thread | 298: 0.547% lower | `omni-tiny-two-column-timing-20261016/` |
-| Native expert tiles skipping empty and tiny-expert tiles (operator) | Pooled device ratios 1.028551–1.125057 | `omni-native-expert-compact-20261016/` |
+| Native expert tiles skipping empty and tiny-expert tiles (operator) | Dense pooled device ratios 1.028551–1.125057 | `omni-native-expert-compact-20261016/` |
 | Native 32×256 expert tile (operator) | Up-dense128 1.090327; down 1.433477 and 1.522702 | `omni-native-expert-wide256-20261016/` |
 
 ### Default-path speed candidates
@@ -1426,8 +1426,8 @@ operand type.
 - **Synthetic operator timing** (2026-10-15). Calibration found overlapping command-buffer
   intervals in all 144 quartets, a serialized protocol failed calibration, and the output-batch
   screen had run 106 extra correctness commands in the candidate arm only, so small speed claims
-  need complete-request timing; the M5 Max also offers no dispatch-boundary sampling to separate
-  kernels sharing an encoder. `omni-timing-calibration-failure-20261015/`,
+  need complete-request timing; a 2026-10-16 probe found the M5 Max offers no dispatch-boundary
+  sampling to separate kernels sharing an encoder. `omni-timing-calibration-failure-20261015/`,
   `omni-timing-serial-calibration-20261015/`, `omni-timing-method-audit-20261015/`,
   `omni-dispatch-counter-probe-20261016/`
 - **Where the fused build's time goes.** Expert-containing commands take 193.154 ms of a

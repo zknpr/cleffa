@@ -84,7 +84,7 @@ The Jev figure is Cloudflare's published median on its own corpus and hardware: 
 a like-for-like comparison. On the 27B the engine was 1.3–1.6× faster than PyTorch up to ~360
 tokens and 1.25–1.3× from 594 tokens up. FP16 activations, the default since, matched BF16
 within noise (`bench/mixed_bench.m` runs FP16 at the BF16 rate; 308 ms against 311 ms on a
-260-token 27B request).
+260-token 27B request, best times from alternating runs).
 
 ## Attention kernel unrolling, 2026-10-03
 
@@ -449,7 +449,8 @@ U and A); it now evaluates the triangle once into the ragged-tail scratch, unuse
 leaving outputs bitwise unchanged. The kernel screen
 ([rejected experiments](rejected-experiments.md#interval-decay-reuse-in-chunk-preparation-2026-10-15))
 measured 17–32% faster preparation in isolation. On the 27B, the only model on the chunked path,
-all 22 core-corpus records give byte-identical logits with FP16 and BF16 activations. Profiled on
+all 22 core-corpus records give logits byte-identical to the previous build, with FP16 and with
+BF16 activations. Profiled on
 `r021` (16,347 tokens), the DeltaNet stage (`gdn_scan`) took a median 1,101.8 ms against
 1,169.7 ms, all three ABBA quartets favoring the candidate: about 0.3% of the request, which
 full-request timing on a heat-soaked GPU cannot resolve (median ratios 1.0037 at 8,072 tokens
@@ -1351,8 +1352,8 @@ resident/eager BF16 implementation, not stock PyTorch. Evidence:
 
 ### Current native and hosted timings
 
-All arms send identical HTTP bodies sequentially, excluding model loading; native includes
-localhost HTTP, hosted the network. Warm values are medians of three; hosted's two observations
+All arms use identical HTTP bodies, run sequentially and exclude model loading; native includes
+localhost HTTP, stock the analogous work in process, hosted the network. Warm values are medians of three; hosted's two observations
 are not a latency estimate. A fixture's first call can include page faults and runtime
 initialization; stock Flash first calls took 249 ms on `r000` and 703 ms on `v000`.
 
@@ -1374,8 +1375,8 @@ Native Flash is faster than stock BF16 on text and image. Hosted is faster than 
 both observations of text, images, short audio (`oa000`, shorter than the historical benchmark's
 `oa005`) and audio/video, and straddles it on video, so local Omni is not generally faster than
 hosted. Single long-text calls, one observation each, took 2,623/6,152 ms for native Flash at
-8,072/16,347 tokens, 10,073/23,362 ms for 27B and 11,049/32,561 ms for Omni at 8,069/16,344
-tokens; stock Flash took 5,248/14,659 ms. `core-timings.json` binds each timing to its exact
+8,072/16,347 tokens, 10,073/23,362 ms for 27B at those lengths and 11,049/32,561 ms for Omni at
+8,069/16,344 tokens; stock Flash took 5,248/14,659 ms. `core-timings.json` binds each timing to its exact
 body.
 
 ### Paired labeled Flash workloads
@@ -1389,8 +1390,8 @@ across distinct requests, not a warm-repeat benchmark.
 | CLINC150+OOS | 453 | 1,065 | 1,945 | 1.83x |
 
 Three warm repeats of the first BANKING77 request give native 529 ms and stock 982 ms. The
-affected stock path answers 276/453 CLINC requests correctly, native 247/453 and the corrected
-eager BF16 control 250/453, with no significant paired difference ([labeled
+affected stock path answers 276/453 CLINC requests correctly against native's 247/453; the
+corrected eager BF16 control answers 250/453, with no significant paired difference ([labeled
 evaluation](hosted-comparison.md#labeled-evaluation-coverage-2026-10-10)). The later full-CLINC
 and eager captures give no per-request latency. Evidence:
 `golden/evaluation-standard-2026-10-10/labeled/` (`native-flash.json`, `stock-flash.json`,
@@ -1430,8 +1431,8 @@ Expert GEMMs now visit the padded expert runs in one grid, each tile locating it
 upper-bound search over the offsets, instead of every expert launching row tiles for the whole
 chunk; at 1,024 rows the per-column grid bound drops from 4,096 to 380 groups. Shapes, tile
 origins and reductions are unchanged. Timing here and in the next entry uses three sequential
-resident processes (baseline, optimized, baseline), not an interleaved comparison; the baseline
-is the original 256-row engine.
+resident processes (baseline, optimized, baseline), not an interleaved comparison; the optimized
+arm is the final CLI, including the 1,024-row chunks below, against the original 256-row engine.
 
 | Tokens | Original first, ms | Original last, ms | Optimized, ms | Reduction from mean baseline |
 |---|---:|---:|---:|---:|
@@ -1485,8 +1486,8 @@ the GPU and overstate wall time; wall times are warm `--time` medians. Both come
 | 239 (`oa000`, audio) | 149.2 ms | 7.0 ms | 36.7 ms | 9.7 ms | 8.7 ms | 242.8 ms |
 
 Expert GEMMs dominate up to about 2k tokens and attention beyond. At 298 tokens the expert GEMMs
-stream about 58 GB of BF16 weights at about 354 GB/s, bound by memory bandwidth rather than the
-FP32 operand rate ([rejected experiments](rejected-experiments.md#default-path-speed-candidates)).
+stream about 58 GB of BF16 weights at about 354 GB/s; their floor is the memory bandwidth, not
+the FP32 operand rate ([rejected experiments](rejected-experiments.md#default-path-speed-candidates)).
 Attention grows quadratically, about 382 ms per layer at 16,344 tokens against 262–294 ms for the
 dense FP32 attention kernels on the same 4,096 head-dimensions.
 
@@ -1527,10 +1528,12 @@ partial-load leak.
 
 These are tracked allocations, not RSS. Warm CPU head loading (74.467 → 72.398 ms on Flash,
 83.356 → 83.614 ms on 27B) supports no loading-speed claim. With both buffer sets resident, four
-ABBA quartets per model at lengths from 146 to 2,235 tokens put median differences below 1% in
-either direction, with varying quartet signs: the benefit is memory, not latency. All 339 corpus
-logits and every `r000` residual stage stay byte-identical per model, singly and in NaN-poisoned
-batches, as do 786 logits in prefix, BF16-head and forced-overflow state checks. Evidence:
+ABBA quartets after two warm calls per arm, at 146, 300 and 2,235 tokens on each model, put
+median differences below 1% in either direction, with varying quartet signs: the benefit is
+memory, not latency. All 339 corpus logits stay byte-identical per model, singly and in
+NaN-poisoned batches of eight, as do 786 logits in prefix, BF16-head and forced-overflow state
+checks; every `r000` residual stage and the final-normalization dump match the baseline byte for
+byte. Evidence:
 `golden/dense-perf-20261014/final/`.
 
 ## Dense CPU attention workers, 2026-10-14
@@ -1612,7 +1615,7 @@ most 1% extra latency.
 | 27B | Cached | 8072 | −0.804% | 4/6 |
 | 27B | Cached | 16347 | −0.077% | 4/6 |
 
-The Flash cached 8K result keeps a baseline stall (quartet mean 349.244 ms against 140.1025 ms),
+The Flash cached 8K result keeps a baseline stall (baseline quartet mean 349.244 ms against 140.1025 ms for the candidate),
 so it is not a speedup estimate. Most effects are below 1% with mixed quartet directions: the
 replay supports the head-performance claim, but this ten-case screen does not establish universal
 latency nonregression. Qualification preserves the 926 primary logits and 352 more in prefix
@@ -1630,7 +1633,7 @@ showed this transpose dominating head loading, above the prospective materiality
 | Flash | 67.9035 ms | 73.9205 ms | 91.86% |
 | 27B | 72.3345 ms | 83.1570 ms | 86.99% |
 
-A fixed 32×32 tiled traversal (`pack_linear` in `clef_head.c`) now does the copy, preserving
+The transpose interval includes calloc first-touch and page faults. A fixed 32×32 tiled traversal (`pack_linear` in `clef_head.c`) now does the copy, preserving
 every value, padding byte, bound check, error path and ownership rule. Omni shares the helper;
 synthetic Omni byte checks pass, but no Omni loading speed was measured.
 
