@@ -125,12 +125,23 @@ static void audio_samples(SwrContext *swr,AVFrame *f,float *samples,size_t *coun
     for(int i=0;i<n;i++)if(!isfinite(scratch[i]))die("nonfinite audio sample");
     memcpy(samples+*count,scratch,(size_t)n*sizeof(float));*count+=(size_t)n;av_free(scratch);
 }
+/* Every decoder libav links is attack surface in this worker, which runs with the server's
+ * privileges and no OS sandbox. As for video, expose only the codecs MP4/MOV soundtracks carry
+ * in practice, not the long tail (ADPCM variants, AC-3, WMA, ATRAC, QDM2...). */
+static int soundtrack_codec(enum AVCodecID id) {
+    static const enum AVCodecID allowed[]={AV_CODEC_ID_AAC,AV_CODEC_ID_ALAC,AV_CODEC_ID_MP3,AV_CODEC_ID_FLAC,AV_CODEC_ID_OPUS,
+        AV_CODEC_ID_PCM_S16LE,AV_CODEC_ID_PCM_S16BE,AV_CODEC_ID_PCM_S24LE,AV_CODEC_ID_PCM_S24BE,AV_CODEC_ID_PCM_S32LE,
+        AV_CODEC_ID_PCM_S32BE,AV_CODEC_ID_PCM_F32LE,AV_CODEC_ID_PCM_F32BE,AV_CODEC_ID_PCM_F64LE,AV_CODEC_ID_PCM_F64BE};
+    for(size_t i=0;i<sizeof(allowed)/sizeof(*allowed);i++)if(id==allowed[i])return 1;
+    return 0;
+}
 static void soundtrack(source *src,size_t cap,long pixels) {
     AVFormatContext *f=open_source(src);int index=-1;
     for(unsigned i=0;i<f->nb_streams;i++)if(f->streams[i]->codecpar->codec_type==AVMEDIA_TYPE_AUDIO) {
         if(index>=0)die("exactly one audio track is supported");index=(int)i;
     }
     if(index<0){close_source(&f);return;}
+    if(!soundtrack_codec(f->streams[index]->codecpar->codec_id))die("supported soundtrack codecs: AAC, ALAC, MP3, FLAC, Opus, PCM");
     AVCodecContext *ctx=decoder(f->streams[index],pixels);
     SwrContext *swr=NULL;AVChannelLayout mono=AV_CHANNEL_LAYOUT_MONO;
     float *samples=malloc(cap*sizeof(float));if(!samples)die("out of memory");size_t count=0;

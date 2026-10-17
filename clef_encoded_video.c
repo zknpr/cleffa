@@ -22,7 +22,6 @@
 #ifndef DECODE_SECONDS
 #define DECODE_SECONDS 30
 #endif
-extern char **environ;
 static bool error(char *err,size_t n,const char *s) { snprintf(err,n,"encoded video: %s",s);return false; }
 static double now(void) { struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec+t.tv_nsec*1e-9; }
 static bool number(const jval *v,double *out) {
@@ -66,7 +65,10 @@ static bool worker(const uint8_t *bytes,size_t n,char **argv,jbuf *out,char *err
     if(!rc)rc=posix_spawn_file_actions_adddup2(&actions,pipes[1],STDOUT_FILENO);
     if(!rc)rc=posix_spawn_file_actions_adddup2(&actions,errors[1],STDERR_FILENO);
     if(!rc)rc=posix_spawnattr_setflags(&attr,POSIX_SPAWN_CLOEXEC_DEFAULT);
-    if(!rc)rc=posix_spawn(&pid,argv[0],&actions,&attr,argv,environ);
+    /* No environment: the worker parses attacker-controlled files and needs none of the
+     * server's variables, which can hold deployment secrets. */
+    char *empty[]={NULL};
+    if(!rc)rc=posix_spawn(&pid,argv[0],&actions,&attr,argv,empty);
     posix_spawnattr_destroy(&attr);posix_spawn_file_actions_destroy(&actions);
     if(rc){snprintf(err,errlen,"encoded video: cannot start clef-media (%s); build it with make media",strerror(rc));goto done;}
     close(pipes[1]);pipes[1]=-1;close(errors[1]);errors[1]=-1;
@@ -114,8 +116,10 @@ bool clef_video_expand(const jval *request,clef_encode_opts opts,clef_video_requ
     if(encoded!=videos->n)return error(err,errlen,"use encoded clips or frame arrays consistently in one request");
     if(!opts.vision.video_token_id)return error(err,errlen,"model has no video tower");
     if(videos->n>32||(opts.vision.max_videos>0&&videos->n>(size_t)opts.vision.max_videos))return error(err,errlen,"too many videos");
-    const bool omni=opts.model.backbone==CLEF_OMNI;const jval *mk=json_get(request,"media_kwargs"),*vk=mk?json_get(mk,"videos_kwargs"):NULL;
+    const bool omni=opts.model.backbone==CLEF_OMNI;const jval *mk=json_get(request,"media_kwargs");
+    if(mk&&mk->type==J_NULL)mk=NULL;  // absent, as in encode_media; the expansion replaces it
     if(mk&&mk->type!=J_OBJECT)return error(err,errlen,"media_kwargs must be an object");
+    const jval *vk=mk?json_get(mk,"videos_kwargs"):NULL;
     double fps=2;int requested=0;bool sample=!omni,explicit_fps=false;
     if(vk) {
         if(vk->type!=J_OBJECT)return error(err,errlen,"videos_kwargs must be an object");

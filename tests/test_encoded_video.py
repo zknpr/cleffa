@@ -90,6 +90,32 @@ class EncodedVideo(unittest.TestCase):
                     actual = np.concatenate([frame.to_ndarray().reshape(-1) for frame in wav.decode(audio=0)])
                 np.testing.assert_array_equal(actual, samples)
 
+    def test_null_media_kwargs_is_absent(self):
+        # As for frame arrays and images, where the reference treats null media_kwargs as absent.
+        self.clip()
+        payload = base64.b64encode(self.path.read_bytes()).decode()
+        request = {'model': 'clef', 'state': 'test', 'questions': {'q': {'type': 'noul'}},
+                   'videos': [{'content_type': 'video/quicktime', 'base64': payload}]}
+        for family in ('qwen3_5', 'qwen3_omni_moe'):
+            with self.subTest(family=family):
+                self.assertEqual(self.native({**request, 'media_kwargs': None}, family), self.native(request, family))
+
+    def test_soundtrack_codec_allowlist(self):
+        # Every decoder libav links is attack surface in the worker, which has the server's
+        # privileges: like video, soundtracks are limited to the codecs MP4/MOV carry in practice.
+        for audio_codec, accepted in [('aac', True), ('pcm_f32le', True), ('pcm_s16le', True),
+                                      ('adpcm_ms', False), ('ac3', False)]:
+            with self.subTest(audio_codec=audio_codec):
+                self.clip(audio=True, audio_codec=audio_codec)
+                result = subprocess.run([MEDIA, 'omni', '2', '0', '0', '32', '16777216', '4800000'],
+                                        input=self.path.read_bytes(), capture_output=True, timeout=35)
+                if accepted:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(json.loads(result.stdout)['audio'].startswith('data:audio/wav;base64,'))
+                else:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(b'supported soundtrack codecs', result.stderr)
+
     def test_rejects_bad_envelopes_and_decoder_limits(self):
         self.clip()
         payload = base64.b64encode(self.path.read_bytes()).decode()

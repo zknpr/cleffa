@@ -32,12 +32,12 @@ class OmniVideoRequest(unittest.TestCase):
         self.path=Path(self.tmp.name)/'clip $(touch unexpected);.mp4'
         self.request={'model':'clef-omni','state':'Describe movement.','questions':{'moving':{'type':'boolean'}}}
 
-    def clip(self,width=96,height=64,count=9,vfr=False,audio=False,codec='libx264',audio_offset=0):
+    def clip(self,width=96,height=64,count=9,vfr=False,audio=False,codec='libx264',audio_offset=0,audio_codec='aac'):
         y,x=np.mgrid[:height,:width]
         frames=np.stack([np.stack([(x*7+i*17)%256,(y*5+i*19)%256,((x+y)*3+i*23)%256],-1).astype('uint8') for i in range(count)])
         command=['ffmpeg','-v','error','-f','rawvideo','-pixel_format','rgb24','-video_size',f'{width}x{height}',
                  '-framerate','6','-i','pipe:0']
-        if audio: command+=['-itsoffset',str(audio_offset),'-f','lavfi','-i','sine=frequency=440:sample_rate=16000:duration=1.5','-shortest','-c:a','aac']
+        if audio: command+=['-itsoffset',str(audio_offset),'-f','lavfi','-i','sine=frequency=440:sample_rate=16000:duration=1.5','-shortest','-c:a',audio_codec]
         if vfr: command+=['-vf',r'setpts=if(lt(N\,3)\,N\,N+2)/(6*TB)','-fps_mode','vfr']
         pixel={'mjpeg':'yuvj420p','prores_ks':'yuv422p10le'}.get(codec,'yuv420p')
         if codec=='libx265': command+=['-x265-params','pools=none:frame-threads=1:log-level=error']

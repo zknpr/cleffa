@@ -18,6 +18,12 @@ int main(void) {
     assert(!worker(NULL,0,failed,&out,err,sizeof(err)));
     assert(strstr(err,"bad input")&&!strchr(err,'\n'));jbuf_free(&out);
     int status;assert(waitpid(-1,&status,WNOHANG)==-1&&errno==ECHILD);
+    /* The worker parses attacker-controlled files: the server's environment, which can hold
+     * deployment secrets, must not reach it. env prints nothing for an empty environment. */
+    assert(!setenv("CLEF_TEST_SECRET","leak",1));
+    char *env[]={"/usr/bin/env",NULL};
+    assert(worker(NULL,0,env,&out,err,sizeof(err)));
+    assert(out.len==0);jbuf_free(&out);
     char *missing[]={"/does-not-exist/clef-media",NULL};
     assert(!worker(NULL,0,missing,&out,err,sizeof(err)));
     assert(strstr(err,"make media"));jbuf_free(&out);
