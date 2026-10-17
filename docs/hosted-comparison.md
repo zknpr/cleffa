@@ -192,7 +192,8 @@ Sources and labels are pinned in `golden/labeled-evals-20261010/`. Scores are in
 ## Expanded Omni labeled results, 2026-10-11
 
 Completed local Omni and 27B subsets and an extended saved hosted Omni collection were rescored
-with zero new hosted calls; Omni's numerical qualification remains incomplete. Native combines
+with zero new hosted calls; Omni's numerical qualification was then incomplete (it has since passed
+the FP64-bounded check, [Omni report](omni.md#against-fp64)). Native combines
 strict HTTP and CLI captures (329 HTTP plus 56 CLI rows on BANKING77, 70 HTTP plus 262 CLI rows
 on the hosted CLINC subset), whose 399 overlapping answer objects are identical;
 `BANKING77:test:170` uses its HTTP response, because the CLI request has literal Unicode and the
