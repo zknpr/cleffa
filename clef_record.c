@@ -488,7 +488,8 @@ static bool encode_request(const clef_tokenizer *tok, const jval *req, clef_enco
     }
     const jval *images = json_get(req, "images"), *videos = json_get(req, "videos");
     const jval *audio = json_get(req, "audio");
-    if (audio && audio->type != J_NULL && audio->type != J_ARRAY)
+    /* `record.get("audio") or []`: falsy values mean no audio, as for images. */
+    if (truthy(audio) && audio->type != J_ARRAY)
         return fail(err, errlen, "audio must be a list", NULL, 0);
     const size_t n_audio = audio && audio->type == J_ARRAY ? audio->n : 0;
     if (n_audio && (opts.model.backbone != CLEF_OMNI || !opts.audio.token_id))

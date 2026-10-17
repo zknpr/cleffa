@@ -38,6 +38,13 @@ class AudioRecord(unittest.TestCase):
         for audio in ([[]],[[True]],[[1e100]],['https://example.com/a.wav'],[request['audio'][0]]*5):
             bad=copy.deepcopy(request);bad['audio']=audio
             self.assertIn('error',self.native(bad))
+        # The reference reads `record.get("audio") or []`: falsy values mean no audio; other
+        # non-lists fail there too.
+        plain=copy.deepcopy(request);del plain['audio'];want=self.native(plain);self.assertNotIn('error',want)
+        for audio in (None,False,0,0.0,'',{},[]):
+            with self.subTest(audio=audio):self.assertEqual(self.native({**plain,'audio':audio}),want)
+        for audio in (True,1,'x',{'a':1}):
+            with self.subTest(audio=audio):self.assertIn('error',self.native({**plain,'audio':audio}))
         bad=copy.deepcopy(request);bad['state']='<|audio_pad|>'
         self.assertIn('error',self.native(bad))
         self.assertNotIn('error',self.native(bad,mode='encode-strict'))

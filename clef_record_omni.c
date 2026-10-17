@@ -179,7 +179,8 @@ done:
 bool clef_omni_encode_record_audio(const jval *request,const clef_encode_opts *opts,size_t *reserve,
                                    clef_record *record,char *err,size_t errlen) {
     const jval *audio=json_get(request,"audio"),*videos=json_get(request,"videos");
-    size_t tracks=0,standalone=audio && audio->type==J_ARRAY?audio->n:0;
+    if(audio && audio->type!=J_ARRAY)audio=NULL;  // the encoder refused truthy non-lists; falsy ones are absent
+    size_t tracks=0,standalone=audio?audio->n:0;
     if(videos && videos->type==J_ARRAY)for(size_t i=0;i<videos->n;i++)tracks+=json_get(videos->items[i],"audio")!=NULL;
     if(!tracks)return clef_omni_encode_audio(audio,0,opts,reserve,record,err,errlen);
     if(tracks!=videos->n)return error(err,errlen,"all videos must supply soundtracks or none may supply them");
