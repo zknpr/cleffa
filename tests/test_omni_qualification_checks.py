@@ -152,6 +152,36 @@ class Qualification(unittest.TestCase):
         (self.path/'requests.jsonl').write_text('{}\n')
         with self.assertRaises(ValueError):self.validate()
 
+    def gate_commands(self,reference):
+        model=self.path/'model.gguf';model.write_bytes(b'gguf')
+        inventory={name:dict(golden=name+'-golden',fp32=name+'-fp32',control=name+'-control',
+                             captures=str(self.path/'captures')) for name in qualification.CORPORA}
+        (self.path/'inventory.json').write_text(json.dumps(inventory))
+        seen={}
+        def run(gates,folder):seen.update(gates);return dict(complete=False,gates=[])
+        class Corpus:build=staticmethod(lambda:[{}])
+        argv=['test_omni_qualification.py','--model',str(model),'--golden-root',str(self.path),
+              '--inventory',str(self.path/'inventory.json'),'--output',str(self.path/reference/'report.json'),
+              '--reference',reference]
+        hashes=dict(clef='0'*64)
+        with patch.object(qualification,'build_binaries',return_value=(dict(gates=[]),hashes)),\
+             patch.object(qualification,'binary_hashes',return_value=hashes),\
+             patch.object(qualification,'validate_golden',return_value={}),\
+             patch.object(qualification,'validate_capture'),\
+             patch.object(qualification,'run_gates',side_effect=run),\
+             patch.object(qualification.importlib,'import_module',return_value=Corpus),\
+             patch.object(sys,'argv',argv),self.assertRaises(SystemExit):
+            qualification.main()
+        return seen
+
+    def test_fp64_parity_gates_are_bounded_by_the_fp32_reference(self):
+        gates=self.gate_commands('fp64')
+        for name in qualification.CORPORA:
+            command=gates[name.replace('_','-')+'-parity']
+            if name=='long':self.assertNotIn('--bound-by',command)
+            else:self.assertEqual(command[-2:],['--bound-by',str(self.path.resolve()/(name+'-fp32'))])
+        self.assertFalse(any('--bound-by' in command for command in self.gate_commands('fp32').values()))
+
     def test_failed_and_missing_gates_never_complete(self):
         calls=[]
         def runner(command,**kwargs):

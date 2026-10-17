@@ -17,7 +17,10 @@ Included
     view; the suffix test is case-insensitive everywhere
   - for the oracle directories ref/oracle.py writes (clef, clef-flash and their documented
     variants, no date suffix): requests.jsonl, encoded.jsonl,
-    logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump
+    logits.safetensors and latency.json only, so tests/test_parity.py can run without --dump;
+    for the Omni FP32 and FP64 reference directories also manifest.json (the FP64 logits let
+    tests/compare_fp64_errors.py rerun on archived reports; test_parity.py's FP64 check also
+    hashes the layer dumps, which stay out)
 Excluded
   - Mach-O binaries, objects, dSYMs, .inc, Instruments .trace bundles and their exported
     counter tables (.xml, .npz), .bin/.npy tensors, archives, PDFs, .git clones, virtualenvs
@@ -95,6 +98,8 @@ ORACLE_FILES = {'requests.jsonl', 'encoded.jsonl', 'logits.safetensors', 'latenc
 EXPERIMENT = re.compile(r'^[a-z0-9-]+-20(\d{6}|\d{2}-\d{2}-\d{2})$')
 ORACLE_DIR = re.compile(r'^clef(-flash)?(-(vision|video))?(-f32s?)?(-r02[01](r021)?)?(-unsafe(-attn)?|-safe)?$')
 OMNI_ORACLE_DIR = re.compile(r'^clef-omni-(text|vision|video|audio|av|long)-f32(-(arbitrated|input-shift|residual-order|blocked-d2|sdpa-control-d2))?$')
+# The FP64 acceptance references (ref/oracle_fp64*.py); text is split by length. Probe runs stay out.
+OMNI_FP64_DIR = re.compile(r'^clef-omni-(text(-(short|mid|8k|16k|bounded))?|vision|video|audio|av)-f64-v[12]$')
 OMNI_ORACLE_FILES = ORACLE_FILES | {'manifest.json','arbitration.json','source-transition.json'}
 OMNI_TRACE_NAME = re.compile(r'^(r|ov|ot|oa|oav|ol)[0-9]+\.jsonl$')
 MACHO = {b'\xcf\xfa\xed\xfe', b'\xce\xfa\xed\xfe', b'\xca\xfe\xba\xbe', b'\xfe\xed\xfa\xcf', b'\xfe\xed\xfa\xce'}
@@ -339,7 +344,7 @@ def path_reason(golden: Path, path: Path, directory: bool) -> str | None:
     if ancestors and not EXPERIMENT.match(top):
         # Only the oracle directories ref/oracle.py writes, and of those the small files, never
         # layers/ or dumps (size-checked in classify). Any other undated directory is not evidence.
-        omni=OMNI_ORACLE_DIR.fullmatch(top)
+        omni=OMNI_ORACLE_DIR.fullmatch(top) or OMNI_FP64_DIR.fullmatch(top)
         if not ORACLE_DIR.match(top) and not omni:
             return 'unrecognized directory'
         if directory:

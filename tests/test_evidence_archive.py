@@ -169,6 +169,27 @@ class EvidenceArchive(unittest.TestCase):
                   if entry['path'].startswith('clef-omni-')}
         self.assertEqual(actual, allowed)
 
+    def test_fp64_references_without_layer_payloads(self):
+        allowed = set()
+        for name in ('text-short-f64-v1', 'text-mid-f64-v1', 'text-8k-f64-v2', 'text-16k-f64-v2',
+                     'text-bounded-f64-v2', 'vision-f64-v1', 'video-f64-v1', 'audio-f64-v1', 'av-f64-v1'):
+            path = self.root / f'clef-omni-{name}'
+            (path / 'layers').mkdir(parents=True)
+            for filename in ('requests.jsonl', 'encoded.jsonl', 'manifest.json'):
+                (path / filename).write_text('{}\n')
+                allowed.add(f'{path.name}/{filename}')
+            (path / 'logits.safetensors').write_bytes(safetensors(
+                {'r000/q': {'dtype': 'F64', 'shape': [2], 'data_offsets': [0, 16]}}))
+            allowed.add(f'{path.name}/logits.safetensors')
+            (path / 'layers' / 'r000.safetensors').write_bytes(b'not public')
+        for probe in ('clef-omni-text-f64-probe-v1', 'clef-omni-text-short-f64-v3'):
+            (self.root / probe).mkdir()
+            (self.root / probe / 'requests.jsonl').write_text('{}\n')
+        manifest = ea.build(self.root, Path(self.tmp.name) / 'fp64.tar.gz', 'ev')
+        actual = {entry['path'] for entry in manifest['files']
+                  if entry['path'].startswith('clef-omni-')}
+        self.assertEqual(actual, allowed)
+
     def test_omni_oracle_audits_without_layer_or_binary_payloads(self):
         for name in ('clef-omni-audio-f32-arbitrated','clef-omni-video-f32-input-shift','clef-omni-vision-f32-residual-order'):
             path=self.root/name;(path/'layers').mkdir(parents=True)

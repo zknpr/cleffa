@@ -271,8 +271,11 @@ for both builds, then `tests/compare_fp64_errors.py BASE CANDIDATE`. Over all qu
 logit and probability errors may grow by at most the larger of 5% and the spread between the two
 FP32 PyTorch references (7.2% and 6.7% today), and the count beyond the fixed limits by at most
 their difference in it (2). Block-compensated attention passed the bound but failed this
-([rejected](rejected-experiments.md#default-path-speed-candidates)). The earlier FP32-only gates remain a diagnostic. `tests/test_omni_qualification.py`
-still applies fixed limits to whichever reference it is given, so it does not implement this rule.
+([rejected](rejected-experiments.md#default-path-speed-candidates)). The earlier FP32-only gates remain a diagnostic. With
+`--reference fp64`, `tests/test_omni_qualification.py` bounds its parity gates by each inventory
+entry's FP32 reference, but it does not run this comparison and takes one FP64 reference per
+corpus; the text references are split by length and the 64,000-token fixture has none, so
+acceptance runs `test_parity.py` per reference.
 
 **FP32 reference.** The bound uses the "FP32 reference (blocked attention)":
 `ref/oracle_f32_stream.py --omni-attention blocked`, from layer zero for every corpus. It bounds
@@ -309,7 +312,7 @@ FP32 image/audio preprocessing and the release loader's BF16 weight rounding bef
 `ref/omni_fp64_policy.py` fixes the method: no native inputs, online softmax over 128-query by
 2,048-key tiles, paged weights, per-layer captures and runtime dtype checks against downcasts;
 `tests/test_omni_fp64.py` compares it with dense FP64 calculations. Qualification against it
-requires an explicit `--reference fp64`, with the same limits. FP64 agreement cannot establish
+requires an explicit `--reference fp64` and the per-question bound above. FP64 agreement cannot establish
 superiority to hosted serving.
 
 ```sh
@@ -341,7 +344,11 @@ requests after model load.
 Acceptance run of 2026-10-17 on the working default (engine commit `64ea114`), with
 `tests/test_parity.py --bound-by` per FP64 reference and the matching FP32 blocked-attention
 reference as the bound. Maxima are the script's four-decimal summaries. Evidence:
-`golden/omni-fp64-bounded-20261016/` (`rope/` for this run).
+`golden/omni-fp64-bounded-20261016/` (`rope/` for this run). The FP64 references are
+`golden/clef-omni-text-short-f64-v1/` (`r000`-`r018`), `clef-omni-text-mid-f64-v1/` (`r019`),
+`clef-omni-text-8k-f64-v2/` (`r020`), `clef-omni-text-16k-f64-v2/` (`r021`) and
+`clef-omni-{vision,video,audio,av}-f64-v1/`; the bounds are the matching
+`clef-omni-*-f32-blocked-d2/` references.
 
 | FP64 reference | Requests / questions | Max logit / probability error vs FP64 | Beyond fixed limits: native / FP32 reference | FP64-bounded |
 |---|---:|---:|---:|---|

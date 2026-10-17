@@ -201,7 +201,12 @@ def main():
             # Captures were bound above to this exact CLI/model. The following
             # all-record layer gate checks them; --dump would repeat the first
             # prefill just to compare a subset of the same residual evidence.
-            gates.append((label+'-parity',py('tests/test_parity.py',args.model,golden)))
+            # FP64 acceptance allows each question the larger of the fixed limits and the FP32
+            # blocked reference's own error; fixed limits alone reject accepted questions. The
+            # 64,000-token fixture has no FP32 entry and keeps the fixed limits.
+            parity=py('tests/test_parity.py',args.model,golden)
+            if args.reference=='fp64' and name!='long':parity+=['--bound-by',str(args.golden_root/entry['fp32'])]
+            gates.append((label+'-parity',parity))
             gates.append((label+'-layers',py('tests/compare_omni_layers.py',golden,entry['captures'],'--reference',args.reference,
                                            '--output',artifacts/(label+'-layers.json'))))
             # Corrupt or missing route evidence is an error; route differences are
