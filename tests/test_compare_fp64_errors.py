@@ -38,9 +38,11 @@ class CompareFP64Errors(unittest.TestCase):
                 for k, e in zip(self.keys, logit_errors)]
         (directory / "text-short-f64-v1.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
 
-    def run_compare(self):
+    def run_compare(self, corpus=None):
         out = io.StringIO()
-        with patch("sys.argv", ["compare", str(self.base), str(self.cand), "--golden-root", str(self.golden)]), \
+        # The fixture holds one FP64 reference; the real inventory spans eight.
+        with patch.object(compare, "CORPUS", corpus or {"text-short-f64-v1": "text"}), \
+                patch("sys.argv", ["compare", str(self.base), str(self.cand), "--golden-root", str(self.golden)]), \
                 contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as code:
             compare.main()
         return code.exception.code, out.getvalue()
@@ -72,10 +74,32 @@ class CompareFP64Errors(unittest.TestCase):
         self.write(self.base, [0.01] * 10)
         rows = (self.base / "text-short-f64-v1.jsonl").read_text().splitlines()[:9]
         (self.cand / "text-short-f64-v1.jsonl").write_text("\n".join(rows) + "\n")
-        with self.assertRaises(SystemExit) as code, contextlib.redirect_stdout(io.StringIO()), \
-                patch("sys.argv", ["compare", str(self.base), str(self.cand), "--golden-root", str(self.golden)]):
-            compare.main()
-        self.assertIn("question sets differ", str(code.exception.code))
+        self.assertIn("question sets differ", str(self.run_compare()[0]))
+
+    def test_reports_must_cover_every_referenced_question(self):
+        # On a subset the FP32 spread, and so the allowance, depends on which questions were picked.
+        for directory in (self.base, self.cand):
+            self.write(directory, [0.01] * 10)
+            rows = (directory / "text-short-f64-v1.jsonl").read_text().splitlines()[:9]
+            (directory / "text-short-f64-v1.jsonl").write_text("\n".join(rows) + "\n")
+        self.assertIn("reports cover 9 of the 10", str(self.run_compare()[0]))
+
+    def test_missing_references_fail(self):
+        self.write(self.base, [0.01] * 10)
+        self.write(self.cand, [0.01] * 10)
+        corpus = {"text-short-f64-v1": "text", "text-mid-f64-v1": "text"}
+        self.assertIn("missing", str(self.run_compare(corpus)[0]))
+        sdpa = self.golden / "clef-omni-text-f32-sdpa-control-d2" / "logits.safetensors"
+        save_file({k: np.array([1.0101, 0.0], dtype=np.float32) for k in self.keys[:9]}, str(sdpa))
+        self.assertIn("FP32 references cover", str(self.run_compare()[0]))
+
+    def test_bound_comes_from_the_reference_not_the_report(self):
+        # Reports recorded with relaxed limits must not move a question inside its bound.
+        self.write(self.base, [0.01] * 9 + [0.06], limits=5)
+        self.write(self.cand, [0.01] * 9 + [0.06], limits=5)
+        code, out = self.run_compare()
+        self.assertEqual(code, 1)
+        self.assertIn("1 questions outside the bound", out)
 
 
 if __name__ == "__main__":

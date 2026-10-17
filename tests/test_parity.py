@@ -17,14 +17,18 @@ BF16 references contain their own rounding error and are not the acceptance targ
 routing has near-ties finer than FP32 resolves, so no FP32 implementation, the FP32 PyTorch
 reference included, stays within fixed limits of FP64 everywhere. A question passes when its
 logit and probability errors against FP64 are each within the larger of the limit and
-FP32_GOLDEN's own error on that question, and its argmax matches FP64 or FP32_GOLDEN. Both
-references must have encoded identical token ids. Layer relative L2 is then a diagnostic;
-non-finite values still fail.
+FP32_GOLDEN's own error on that question, and its argmax matches FP64 or FP32_GOLDEN. GOLDEN
+must be a complete independent FP64 reference whose request, encoding and logits files match its
+manifest, and FP32_GOLDEN the independent blocked-attention FP32 reference of the same corpus,
+with byte-equal request records and identical token ids. The fixed limits cannot be relaxed.
+Layer relative L2 is then a diagnostic; non-finite values still fail. Whether the FP64 reference
+was made by the current reference sources is the qualification runner's check, not this one.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import subprocess
@@ -49,6 +53,52 @@ def softmax(x: np.ndarray) -> np.ndarray:
     return e / e.sum()
 
 
+def bound_reference_problems(golden: Path, bound: Path, request_lines: list[str]) -> list[str]:
+    """Why GOLDEN and FP32_GOLDEN cannot serve as the FP64 reference and its bound.
+
+    Matching token ids alone accepted an FP32 directory as GOLDEN, an arbitrated, SDPA-control
+    or BF16 directory as the bound, and a bound made from other image bytes.
+    """
+    # From this file, not ROOT: the unit tests point ROOT at a fixture tree.
+    sys.path.append(str(Path(__file__).resolve().parent.parent / "ref"))
+    import omni_fp64_policy as v1
+    import oracle_fp64_bounded as v2
+    try:
+        fp64 = json.loads((golden / "manifest.json").read_text())
+        fp32 = json.loads((bound / "manifest.json").read_text())
+        bound_bytes = (bound / "requests.jsonl").read_bytes()
+    except (OSError, ValueError) as e:
+        return [f"unreadable reference: {e}"]
+    problems = []
+    if not (fp64.get("complete") is True and fp64.get("revision") == v1.REVISION and
+            fp64.get("precision") == "float64-streamed" and fp64.get("independent_from_native") is True and
+            "arbitration" not in fp64 and fp64.get("fp64_policy") in (v1.POLICY, v2.POLICY)):
+        problems.append(f"{golden} is not the complete independent FP64 reference")
+    # Every request of the manifest must be checked: dropping one from both requests.jsonl and
+    # encoded.jsonl would otherwise shrink the gate without an error.
+    ids = [json.loads(line)["id"] for line in request_lines]
+    if [r.get("id") for r in fp64.get("records", [])] != ids:
+        problems.append(f"{golden} requests differ from its manifest's record inventory")
+    try:
+        v1.verify_artifacts(golden, fp64)
+    except (OSError, KeyError, TypeError, ValueError) as e:
+        problems.append(f"{golden}: {e}")
+    attention = fp32.get("attention_reference") or {}
+    if not (fp32.get("complete") is True and fp32.get("revision") == v1.REVISION and
+            fp32.get("precision") == "float32-streamed" and fp32.get("independent_from_native") is True and
+            "arbitration" not in fp32 and attention.get("value_reduction") == "blocked" and
+            attention.get("first_layer") == 0 and fp32.get("corpus") == fp64.get("corpus")):
+        problems.append(f"{bound} is not the independent blocked-attention FP32 reference of this corpus")
+    if hashlib.sha256(bound_bytes).hexdigest() != fp32.get("corpus_sha256"):
+        problems.append(f"{bound} requests.jsonl differs from its manifest's corpus hash")
+    # Token ids do not cover media bytes: compare whole request records, by id.
+    bound_requests = {r["id"]: r for r in map(json.loads, io.StringIO(bound_bytes.decode()))}
+    differ = [r["id"] for r in map(json.loads, request_lines) if bound_requests.get(r["id"]) != r]
+    if differ:
+        problems.append(f"{len(differ)} requests differ between {golden} and {bound}")
+    return problems
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("gguf")
@@ -64,6 +114,9 @@ def main() -> None:
     parser.add_argument("--report", type=Path, metavar="JSONL",
                         help="write each question's errors (and the bound's) for comparing builds")
     args = parser.parse_args()
+    if args.bound_by and (args.max_logit_error > 0.05 or args.max_prob_error > 0.002):
+        # The FP64 policy's fixed limits; the bound already widens them per question.
+        parser.error("--bound-by keeps the fixed logit and probability limits; they cannot be relaxed")
     gguf, golden, do_dump = args.gguf, args.golden, args.dump
     requests = golden / "requests.jsonl"
     failures = 0
@@ -96,6 +149,9 @@ def main() -> None:
         if mismatched:
             print(f"bound: FAIL {len(mismatched)} requests missing or encoded differently in {args.bound_by}")
             failures += len(mismatched)
+        for problem in bound_reference_problems(golden, args.bound_by, request_lines):
+            print(f"bound: FAIL {problem}")
+            failures += 1
 
     # 2. residual stream of the first request
     layers_path = golden / "layers" / f"{enc_g[0]['id']}.safetensors"

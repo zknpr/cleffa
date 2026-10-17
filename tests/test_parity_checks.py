@@ -1,16 +1,27 @@
 """Exercise parity acceptance criteria without running inference or modifying golden data."""
 
 import contextlib
+import hashlib
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import numpy as np
 import test_parity as parity
+
+sys.path.append(str(Path(__file__).resolve().parents[1] / "ref"))
+import omni_fp64_policy  # noqa: E402
+import oracle_fp64_bounded  # noqa: E402
+
+
+def sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 class ParityChecks(unittest.TestCase):
@@ -33,9 +44,31 @@ class ParityChecks(unittest.TestCase):
         self.bound_dir = self.root / "bound"
         self.bound_dir.mkdir()
         (self.bound_dir / "encoded.jsonl").write_text(json.dumps(self.encoded) + '\n')
+        (self.bound_dir / "requests.jsonl").write_text('{"id":"r0"}\n')
+        for directory in (self.golden, self.bound_dir):
+            (directory / "logits.safetensors").touch()  # load_file is patched; the bytes are hashed
         self.bound = self.reference.copy()
+        # Under --bound-by, GOLDEN must be the complete independent FP64 reference and the bound
+        # the independent blocked-attention FP32 reference of the same corpus.
+        self.fp64_manifest: dict[str, Any] = dict(complete=True, revision=omni_fp64_policy.REVISION, precision="float64-streamed",
+                                  independent_from_native=True, fp64_policy=omni_fp64_policy.POLICY,
+                                  corpus="text", records=[dict(id="r0", tokens=2, dump_start=0)])
+        self.fp32_manifest: dict[str, Any] = dict(complete=True, revision=omni_fp64_policy.REVISION, precision="float32-streamed",
+                                  independent_from_native=True, corpus="text",
+                                  attention_reference=dict(value_reduction="blocked", first_layer=0))
+
+    def seal(self):
+        """Write both manifests over the current files; a test's own hash entries take precedence."""
+        names = ["requests.jsonl", "encoded.jsonl", "logits.safetensors"]
+        names += [f"layers/{r['id']}.safetensors" for r in self.fp64_manifest["records"]]
+        hashes = {name: sha256(self.golden / name) for name in names}
+        (self.golden / "manifest.json").write_text(json.dumps({"artifacts_sha256": hashes, **self.fp64_manifest}))
+        (self.bound_dir / "manifest.json").write_text(json.dumps(
+            {"corpus_sha256": sha256(self.bound_dir / "requests.jsonl"), **self.fp32_manifest}))
 
     def check(self, *flags):
+        if '--bound-by' in flags:
+            self.seal()
         def run(args, **kwargs):
             if "encode" in args:
                 text = json.dumps(self.encoded, ensure_ascii=False) + '\n'
@@ -181,6 +214,68 @@ class ParityChecks(unittest.TestCase):
         self.assertIn("diagnostic", output)
         self.dump[1, 0, 0] = np.nan
         self.assertNotEqual(self.check('--dump', '--bound-by', str(self.bound_dir))[0], 0)
+
+    def test_bound_accepts_both_fp64_capture_policies(self):
+        for policy in (omni_fp64_policy.POLICY, oracle_fp64_bounded.POLICY):
+            with self.subTest(policy=policy["name"]):
+                self.fp64_manifest["fp64_policy"] = policy
+                self.assertEqual(self.check('--bound-by', str(self.bound_dir))[0], 0)
+
+    def test_bound_requires_the_complete_independent_fp64_reference(self):
+        # Matching token ids alone accepted an FP32 or incomplete directory as GOLDEN.
+        valid = dict(self.fp64_manifest)
+        for change in (dict(precision="float32-streamed"), dict(complete=False), dict(arbitration={}),
+                       dict(independent_from_native=False), dict(fp64_policy={}), dict(revision="main")):
+            with self.subTest(change=change):
+                self.fp64_manifest = {**valid, **change}
+                code, output = self.check('--bound-by', str(self.bound_dir))
+                self.assertNotEqual(code, 0)
+                self.assertIn("not the complete independent FP64 reference", output)
+
+    def test_bound_requires_the_fp64_artifacts_and_record_inventory(self):
+        self.fp64_manifest["artifacts_sha256"] = {name: "0" * 64 for name in (
+            "requests.jsonl", "encoded.jsonl", "logits.safetensors", "layers/r0.safetensors")}
+        code, output = self.check('--bound-by', str(self.bound_dir))
+        self.assertNotEqual(code, 0)
+        self.assertIn("artifact hash mismatch", output)
+        # A record dropped from requests.jsonl and encoded.jsonl must not shrink the gate silently.
+        del self.fp64_manifest["artifacts_sha256"]
+        (self.golden / "layers/r1.safetensors").touch()
+        self.fp64_manifest["records"] = [dict(id="r0", tokens=2, dump_start=0), dict(id="r1", tokens=2, dump_start=0)]
+        code, output = self.check('--bound-by', str(self.bound_dir))
+        self.assertNotEqual(code, 0)
+        self.assertIn("record inventory", output)
+
+    def test_bound_must_be_the_independent_blocked_fp32_reference(self):
+        # Arbitrated, SDPA-control, partial and BF16 references, or another corpus, are not the bound.
+        valid = dict(self.fp32_manifest)
+        for change in (dict(arbitration={}), dict(attention_reference=dict(value_reduction="sdpa", first_layer=0)),
+                       dict(attention_reference=dict(value_reduction="blocked", first_layer=12)),
+                       dict(precision="bfloat16"), dict(independent_from_native=False), dict(complete=False),
+                       dict(corpus="omni-vision")):
+            with self.subTest(change=change):
+                self.fp32_manifest = {**valid, **change}
+                code, output = self.check('--bound-by', str(self.bound_dir))
+                self.assertNotEqual(code, 0)
+                self.assertIn("not the independent blocked-attention FP32 reference", output)
+
+    def test_bound_must_share_the_request_bytes(self):
+        # Identical token ids do not tie media bytes: a bound built from other pixels passed.
+        (self.bound_dir / "requests.jsonl").write_text('{"id":"r0","images":["other"]}\n')
+        code, output = self.check('--bound-by', str(self.bound_dir))
+        self.assertNotEqual(code, 0)
+        self.assertIn("requests differ", output)
+        (self.bound_dir / "requests.jsonl").write_text('{"id":"r0"}\n')
+        self.fp32_manifest["corpus_sha256"] = "0" * 64
+        code, output = self.check('--bound-by', str(self.bound_dir))
+        self.assertNotEqual(code, 0)
+        self.assertIn("corpus hash", output)
+
+    def test_bound_refuses_relaxed_fixed_limits(self):
+        for flags in (('--max-logit-error', '5'), ('--max-prob-error', '1')):
+            with self.subTest(flags=flags), contextlib.redirect_stderr(io.StringIO()):
+                self.assertNotEqual(self.check('--bound-by', str(self.bound_dir), *flags)[0], 0)
+        self.assertEqual(self.check('--bound-by', str(self.bound_dir), '--max-logit-error', '0.01')[0], 0)
 
     def test_invalid_tolerance_fails(self):
         for value in ('nan', 'inf', '-1'):

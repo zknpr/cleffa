@@ -13,6 +13,11 @@ A candidate is non-inferior when its mean logit error and mean probability error
 baseline's by no more than the larger of 5% and that FP32 spread (relative), and the number of
 questions beyond the fixed limits grows by no more than the two FP32 references differ in it. Every question must still pass its bound
 (test_parity.py exits non-zero otherwise). Exit status 1 means not shown non-inferior.
+
+The reports must cover every question of the FP64 references in CORPUS, and both FP32 references
+every one of those: on a subset the spread, and so the allowance, depends on which questions were
+picked (the two FP32 references are bitwise equal on most short requests). Each question's bound
+is recomputed from the blocked FP32 reference rather than taken from the report.
 """
 
 from __future__ import annotations
@@ -51,23 +56,24 @@ def load(directory: Path) -> dict[tuple[str, str], dict]:
     return rows
 
 
-def reference_errors(root: Path, keys: set[tuple[str, str]]) -> dict[str, dict]:
-    """Logit/probability errors of the two FP32 references against FP64, per question."""
-    out = {"blocked": {}, "sdpa": {}}
+def reference_errors(root: Path) -> tuple[set[tuple[str, str]], dict[str, dict]]:
+    """Every FP64-referenced question, and the two FP32 references' errors against FP64 on it."""
+    inventory, out = set(), {"blocked": {}, "sdpa": {}}
     for name, corpus in CORPUS.items():
         fp64_dir = root / f"clef-omni-{name}"
         if not fp64_dir.exists():
-            continue
+            sys.exit(f"missing FP64 reference {fp64_dir}")
         fp64 = load_file(str(fp64_dir / "logits.safetensors"))
+        inventory |= {tuple(k.split("/", 1)) for k in fp64}
         for arm, suffix in (("blocked", "blocked-d2"), ("sdpa", "sdpa-control-d2")):
             ref = load_file(str(root / f"clef-omni-{corpus}-f32-{suffix}" / "logits.safetensors"))
             for k, g in fp64.items():
-                rid, q = k.split("/", 1)
-                if (rid, q) not in keys or k not in ref:
+                if k not in ref:
                     continue
                 g64, r = g.astype(np.float64), ref[k].astype(np.float64)
+                rid, q = k.split("/", 1)
                 out[arm][(rid, q)] = (float(np.abs(r - g64).max()), float(np.abs(softmax(r) - softmax(g64)).max()))
-    return out
+    return inventory, out
 
 
 def summary(errors: list[tuple[float, float]]) -> tuple[float, float, int]:
@@ -85,8 +91,13 @@ def main() -> None:
     if base.keys() != cand.keys():
         sys.exit(f"question sets differ: {len(base)} baseline, {len(cand)} candidate")
     keys = set(base)
-    refs = reference_errors(args.golden_root, keys)
-    shared = sorted(keys & refs["blocked"].keys() & refs["sdpa"].keys())
+    inventory, refs = reference_errors(args.golden_root)
+    if keys != inventory:
+        sys.exit(f"reports cover {len(keys & inventory)} of the {len(inventory)} FP64-referenced questions"
+                 f" (and {len(keys - inventory)} others); non-inferiority is judged on all of them")
+    if refs["blocked"].keys() != inventory or refs["sdpa"].keys() != inventory:
+        sys.exit("FP32 references cover only part of the FP64-referenced questions")
+    shared = sorted(keys)
 
     def row(label: str, errs: list[tuple[float, float]]) -> tuple[float, float, int]:
         ml, mp, beyond = summary(errs)
@@ -109,7 +120,9 @@ def main() -> None:
     for k in worse:
         print(f"  largest increase {k[0]}/{k[1]}: |d p| {base[k]['prob_error']:.6f} -> {cand[k]['prob_error']:.6f}, "
               f"|d logit| {base[k]['logit_error']:.6f} -> {cand[k]['logit_error']:.6f}")
-    unbounded = [k for k in keys if cand[k]["logit_error"] > cand[k]["limit_logit"] or cand[k]["prob_error"] > cand[k]["limit_prob"]]
+    # test_parity.py's bound, from the reference: a report's own limits may have been relaxed.
+    unbounded = [k for k in keys if cand[k]["logit_error"] > max(FIXED_LOGIT, refs["blocked"][k][0]) or
+                 cand[k]["prob_error"] > max(FIXED_PROB, refs["blocked"][k][1])]
     allow_count = abs(rb[2] - rs[2])
     print(f"beyond-fixed allowance from the FP32 references: {allow_count}")
     ok = grow_l <= allow_l and grow_p <= allow_p and c[2] - b[2] <= allow_count and not unbounded
