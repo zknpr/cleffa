@@ -50,7 +50,8 @@ def native_features(request,folder,layout):
     meta=json.loads(result.stdout)
     want=[dict(frames=c['frames'],padded_frames=c['padded_frames'],tokens=len(c['token_rows'])) for c in layout]
     if meta!=want:raise ValueError('native frontend padding/mask/token geometry differs')
-    return [np.fromfile(frontend/f'{i}-features.bin',dtype='<f4').reshape(128,c['padded_frames']) for i,c in enumerate(layout)]
+    # The frontend stores each clip's own frames; the tower reads nothing beyond them.
+    return [np.fromfile(frontend/f'{i}-features.bin',dtype='<f4').reshape(128,c['frames']) for i,c in enumerate(layout)]
 
 
 def compare(model,golden,output,*,poison=False,frontend=False,reference='fp32'):
@@ -81,10 +82,11 @@ def compare(model,golden,output,*,poison=False,frontend=False,reference='fp32'):
                 mel=reference.get_tensor(f'audio.{i}.features')
                 if mel.shape!=(128,clip['padded_frames']) or not np.isfinite(mel).all():raise ValueError('invalid mel reference')
                 if features is not None:
-                    delta=features[i].astype('f8')-mel
-                    if abs(delta).max()>5e-5 or np.linalg.norm(delta)/max(1e-30,np.linalg.norm(mel.astype('f8')))>5e-6:
+                    own=mel[:,:clip['frames']]
+                    delta=features[i].astype('f8')-own
+                    if abs(delta).max()>5e-5 or np.linalg.norm(delta)/max(1e-30,np.linalg.norm(own.astype('f8')))>5e-6:
                         raise ValueError('native frontend exceeds approved bounds against golden')
-                    mel=features[i]
+                    mel=mel.copy();mel[:,:clip['frames']]=features[i]
                 path=folder/f'mel.{i}.f32';mel.astype('<f4').tofile(path)
                 command.extend([str(path),str(clip['frames'])])
             env=dict(os.environ)

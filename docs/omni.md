@@ -93,12 +93,13 @@ sets these fields and preserves frame/audio association automatically.
 
 **Limits.** CLI/server defaults are four audio clips, including soundtracks, and 4,800,000 total
 samples per request. `--max-audio` and `--max-audio-samples` override those limits; zero removes
-only that soft limit. Context, body, finite-value and integer bounds still apply. The frontend pads
-every clip to the record's longest clip, as the reference processor does, so its time and memory
-grow with clips × longest clip: each clip holds 128 × longest/160 floats (15.4 MB beside a
-4,800,000-sample clip), and a one-sample clip costs that as well as its few tokens. `--max-audio`
-is the bound on this cost; with zero, only the context limits the number of clips, which leaves no
-practical memory bound.
+only that soft limit. Context, body, finite-value and integer bounds still apply. The reference
+processor pads every clip to the record's longest and normalizes each against its peak over those
+padded frames. The frontend keeps that arithmetic but stores and evaluates only the frames whose
+window reaches a clip's samples; frames of pure padding enter the peak as their exact constant. Own
+features are bitwise what full evaluation gives, and time and memory follow the total audio, not
+clips × longest clip: 256 one-sample clips beside a 3,800,000-sample clip took 0.24 s and 29.5 MB
+peak resident memory, against 65.2 s and 3.15 GB before.
 `--max-image-requests` also bounds concurrently held audio requests. The default 8 MiB HTTP body
 limit can be reached before the sample cap: a full 4,800,000-sample PCM16 request passes with
 `--max-body 16777216`, and the default cap rejects it with 413.

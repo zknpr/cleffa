@@ -52,7 +52,7 @@ static void check_features(const clef_audio_features *f, int n, int32_t want_tok
     int64_t tokens = 0;
     for (int i = 0; i < n; i++) {
         CHECK(f[i].mel && f[i].frames >= 1 && f[i].frames <= f[i].padded_frames && f[i].padded_frames == f[0].padded_frames);
-        for (size_t j = 0; j < 128 * f[i].padded_frames; j++) CHECK(isfinite(f[i].mel[j]));
+        for (size_t j = 0; j < 128 * f[i].frames; j++) CHECK(isfinite(f[i].mel[j]));
         tokens += f[i].n_tokens;
     }
     if (want_tokens >= 0) CHECK(tokens == want_tokens);

@@ -155,7 +155,7 @@ bool clef_audio_gpu_run(clef_gpu *g,const clef_engine *e,const clef_audio_featur
                 const clef_audio_chunk *chunk=layout.chunks+first+c;
                 const clef_audio_features *clip=clips+chunk->clip;
                 for(int f=0;f<128;f++)for(int t=0;t<chunk->frames;t++) {
-                    float value=clip->mel[(size_t)f*clip->padded_frames+chunk->frame+t];
+                    float value=clip->mel[(size_t)f*clip->frames+chunk->frame+t];
                     if(!isfinite(value)){snprintf(err,errlen,"metal: nonfinite audio features");goto done;}
                     input[((size_t)c*128+f)*width+t]=value;
                 }

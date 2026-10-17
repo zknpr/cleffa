@@ -4,10 +4,13 @@
 #include <float.h>
 #include "../clef_audio.h"
 static int allocation, fail_at;
-static void *test_malloc(size_t n) { return ++allocation==fail_at ? NULL : malloc(n); }
-static void *test_calloc(size_t n,size_t s) { return ++allocation==fail_at ? NULL : calloc(n,s); }
+static size_t sizes[16];
+static void *test_malloc(size_t n) { if(allocation<16)sizes[allocation]=n; return ++allocation==fail_at ? NULL : malloc(n); }
+static void *test_calloc(size_t n,size_t s) { if(allocation<16)sizes[allocation]=n*s; return ++allocation==fail_at ? NULL : calloc(n,s); }
 #define malloc test_malloc
 #define calloc test_calloc
+static size_t computed[4];  // STFT frames each clip evaluated, from the production stage tap
+#define CLEF_AUDIO_STAGE(clip, name, frame, data, count) ((void)(frame),(void)(data),(void)(count),computed[clip]+=!strcmp(name,"real"))
 #include "../clef_audio.c"
 #undef malloc
 #undef calloc
@@ -26,8 +29,23 @@ int main(void) {
     assert(clef_audio_mel_batch(clips,2,out,err,sizeof(err)));
     assert(out[0].frames==1 && out[1].frames==2 && out[0].padded_frames==2 && out[1].padded_frames==2);
     assert(out[0].n_tokens==1 && out[1].n_tokens==1);
-    for(int i=0;i<256;i++){assert(isfinite(out[0].mel[i]));assert(out[1].mel[i]==-1.5f);}
+    for(int i=0;i<128;i++)assert(isfinite(out[0].mel[i]));
+    for(int i=0;i<256;i++)assert(out[1].mel[i]==-1.5f);
     for(int i=0;i<2;i++)clef_audio_features_free(out+i);
+    {
+        // A one-sample clip beside a 10 s clip: features hold its own frame only, and only the
+        // frames whose window reaches its sample are evaluated, not all 1,000 padded frames.
+        float *longer=calloc(160000,sizeof(float));assert(longer);longer[80000]=1;
+        clef_audio_samples pair[]={{short_clip,1},{longer,160000}};
+        clef_audio_features f[2]={{0}};
+        allocation=0;computed[0]=computed[1]=0;
+        assert(clef_audio_mel_batch(pair,2,f,err,sizeof(err)));
+        assert(f[0].frames==1 && f[0].padded_frames==1000 && f[1].frames==1000);
+        assert(sizes[1]==128*sizeof(float) && sizes[2]==128*1000*sizeof(float));  // [0] is the array
+        assert(computed[0]<=3 && computed[1]==1000);
+        for(int i=0;i<2;i++)clef_audio_features_free(f+i);
+        free(longer);
+    }
     wave[3]=INFINITY;
     assert(!clef_audio_mel_batch(clips,2,out,err,sizeof(err)) && !out[0].mel && !out[1].mel);
     wave[3]=FLT_MAX;

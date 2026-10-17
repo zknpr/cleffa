@@ -25,7 +25,10 @@ decoder, and `clef_metal_audio.m` owns the audio tower. Omni uses FP32 activatio
 ordinary execution for prefix-cache requests. DeepStack mergers inject only into
 visual rows after decoder blocks 0/1/2. Audio padding is per record, including its
 associated soundtracks, and video wins ties in temporal audio/video token merging.
-`clef_audio.c` owns bounded sample decoding/frontend processing; `clef_record_omni.c`
+`clef_audio.c` owns bounded sample decoding/frontend processing. Its features hold each
+clip's own frames only, and it evaluates only frames whose window reaches the clip's samples;
+pure-padding frames enter the normalization peak as their exact `log10(1e-10)` constant, so
+cost follows total audio, not clips × longest clip. `clef_record_omni.c`
 owns audio placements and multimodal positions. Float frontend parity follows the
 bounded policy in the Omni report. Omni acceptance is FP64-bounded (user decision,
 2026-10-16): `tests/test_parity.py MODEL FP64_GOLDEN --bound-by FP32_GOLDEN` against the

@@ -72,11 +72,13 @@ class Frontend(unittest.TestCase):
                 self.close_stage(power,re.astype('f8')**2+im.astype('f8')**2,'power')
                 mel=read(i,'mel',(128,frames))
                 self.close_stage(mel,self.filters.astype('f8').T@power.astype('f8'),'mel')
-                features=read(i,'features',(128,frames))
+                # Features hold the clip's own frames, normalized by the peak over all padded
+                # frames; the stages above cover the padded frames (zero where never evaluated).
+                features=read(i,'features',(128,valid))
                 log=np.log10(np.maximum(mel.astype('f8'),1e-10))
                 local=(np.maximum(log,log.max()-8)+4)/4
-                self.close_stage(features,local,'log and dynamic range')
-                want=reference['input_features'][i].astype('f8');delta=features-want
+                self.close_stage(features,local[:,:valid],'log and dynamic range')
+                want=reference['input_features'][i][:,:valid].astype('f8');delta=features-want
                 absolute=float(abs(delta).max());relative=float(np.linalg.norm(delta)/max(1e-30,np.linalg.norm(want)))
                 Frontend.worst_absolute=max(Frontend.worst_absolute,absolute)
                 Frontend.worst_relative=max(Frontend.worst_relative,relative)
@@ -96,6 +98,17 @@ class Frontend(unittest.TestCase):
             with self.subTest(signal=name): self.check([signals[name].astype('f4')])
         rng=np.random.default_rng(SPEC['seed'])
         self.check([rng.uniform(-.2,.2,n).astype('f4') for n in SPEC['unequal_lengths']])
+
+    def test_short_clips_near_the_longest(self):
+        # Within 200 samples of the longest, the end reflection reads a shorter clip's own
+        # samples, so its frames past the zero run are evaluated too; a loud tail makes the
+        # peak come from frames beyond its own.
+        rng=np.random.default_rng(SPEC['seed'])
+        for longest in (1601,16000):
+            for lengths in ((longest,longest-1,longest-41,longest-199),(longest,longest-200,longest-201,longest-360)):
+                clips=[rng.uniform(-.2,.2,n).astype('f4') for n in lengths]
+                for clip in clips[1:]:clip[-150:]*=40
+                with self.subTest(lengths=lengths):self.check(clips)
 
     def test_longer_than_thirty_seconds_is_not_truncated(self):
         rng=np.random.default_rng(SPEC['seed'])

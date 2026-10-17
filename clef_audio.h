@@ -30,8 +30,10 @@ bool clef_audio_from_json(const jval *value, size_t max_samples,
 void clef_audio_samples_free(clef_audio_samples *samples);
 
 /* clips are one record: right-pad to its longest clip before centered STFT.
- * Output is [128][padded_frames]. Every output must be empty; failure leaves
- * all outputs empty. The caller enforces item/sample/context limits first. */
+ * Output is [128][frames], the clip's own frames, normalized against the peak over
+ * all padded_frames as the reference is; the tower reads nothing beyond them, and
+ * memory and time follow each clip's length. Every output must be empty; failure
+ * leaves all outputs empty. The caller enforces item/sample/context limits first. */
 bool clef_audio_mel_batch(const clef_audio_samples *clips, int n, clef_audio_features *out,
                           char *err, size_t errlen);
 void clef_audio_features_free(clef_audio_features *features);

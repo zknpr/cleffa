@@ -60,7 +60,7 @@ int main(int argc, char **argv) {
     for (int i = 0; i < n; i++) {
         const char *names[] = {"real","imag","power","mel"};
         for (int s = 0; s < 4; s++) if (!write_stage(argv[1],i,names[s],captured[i][s],(s == 3 ? 128 : 201)*captured_frames)) goto done;
-        if (!write_stage(argv[1],i,"features",features[i].mel,128*captured_frames)) goto done;
+        if (!write_stage(argv[1],i,"features",features[i].mel,128*features[i].frames)) goto done;
     }
     printf("[");
     for (int i = 0; i < n; i++) printf("%s{\"frames\":%zu,\"padded_frames\":%zu,\"tokens\":%d}",

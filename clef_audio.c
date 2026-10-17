@@ -145,6 +145,19 @@ void clef_audio_features_free(clef_audio_features *features) {
     if (features) { free(features->mel); *features = (clef_audio_features){0}; }
 }
 
+/* Lowest waveform index frame t reads: a centered 400-sample window, reflected at both ends of
+ * the record's padded waveform (longest > 200 samples, so one reflection suffices). A clip reads
+ * zeros at and beyond its own count, so a frame whose lowest index reaches the count reads only
+ * zeros. The index first rises with t, then falls once the window reflects off the end, so those
+ * frames form one run. */
+static size_t frame_low(size_t t, size_t longest) {
+    const int64_t a = (int64_t)t*160-200, b = a+399;
+    if (a <= 0) return 0;
+    if ((uint64_t)b < longest) return (size_t)a;
+    const int64_t reflected = 2*(int64_t)longest-2-b;
+    return (size_t)(reflected < a ? reflected : a);
+}
+
 bool clef_audio_mel_batch(const clef_audio_samples *clips, int n, clef_audio_features *out,
                           char *err, size_t errlen) {
     if (!clips || !out || n <= 0 || (size_t)n > SIZE_MAX/sizeof(*out))
@@ -175,14 +188,26 @@ bool clef_audio_mel_batch(const clef_audio_samples *clips, int n, clef_audio_fea
     }
     for (int i = 0; i < n; i++) {
         clef_audio_features *f = next+i;
-        f->mel = malloc(128*frames*sizeof(float));
-        if (!f->mel) goto fail;
         f->padded_frames = frames;
         f->frames = (clips[i].count+159)/160;
         if (f->frames > frames) f->frames = frames;
         f->n_tokens = (int)(13*(f->frames/100)+(f->frames%100+7)/8);
-        float peak = -INFINITY;
+        /* The reference pads every clip to the longest and normalizes against the peak over
+         * all its padded frames, but the tower reads only the clip's own frames. Store those,
+         * and evaluate only frames whose window reaches the clip's samples: frames [first,
+         * last) read zeros, giving log10(1e-10) in every bin, which enters the peak as a
+         * constant. fmaxf is exact, so own frames are bitwise what full evaluation gives, and
+         * cost follows the clip's length rather than the record's longest clip. */
+        size_t first = 0, last = frames;
+        while (first < frames && frame_low(first, longest) < clips[i].count) first++;
+        while (last > first && frame_low(last-1, longest) < clips[i].count) last--;
+        if (first < f->frames) { failure = "audio frame range"; goto fail; }  // own frames read samples
+        f->mel = malloc(128*f->frames*sizeof(float));
+        if (!f->mel) goto fail;
+        float peak = first < last ? log10f(1e-10f) : -INFINITY;
         for (size_t t = 0; t < frames; t++) {
+            if (t == first) t = last;
+            if (t >= frames) break;
             audio_complex block[400], spectrum[400];
             for (int j = 0; j < 400; j++) {
                 int64_t at = (int64_t)t*160+j-200;
@@ -207,7 +232,7 @@ bool clef_audio_mel_batch(const clef_audio_samples *clips, int n, clef_audio_fea
                 mel[m] = sum;
                 const float value = log10f(fmaxf(sum, 1e-10f));
                 if (!isfinite(value)) { failure = "audio mel overflow"; goto fail; }
-                f->mel[(size_t)m*frames+t] = value;
+                if (t < f->frames) f->mel[(size_t)m*f->frames+t] = value;
                 peak = fmaxf(peak, value);
             }
             CLEF_AUDIO_STAGE(i, "real", t, real, 201);
@@ -215,7 +240,7 @@ bool clef_audio_mel_batch(const clef_audio_samples *clips, int n, clef_audio_fea
             CLEF_AUDIO_STAGE(i, "power", t, power, 201);
             CLEF_AUDIO_STAGE(i, "mel", t, mel, 128);
         }
-        for (size_t j = 0; j < 128*frames; j++) f->mel[j] = (fmaxf(f->mel[j], peak-8.f)+4.f)/4.f;
+        for (size_t j = 0; j < 128*f->frames; j++) f->mel[j] = (fmaxf(f->mel[j], peak-8.f)+4.f)/4.f;
     }
     memcpy(out, next, (size_t)n*sizeof(*out));
     free(next);

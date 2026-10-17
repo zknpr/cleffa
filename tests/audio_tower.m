@@ -35,6 +35,8 @@ int main(int argc,char **argv) { @autoreleasepool {
         bool ok=fread(features[i].mel,4,(size_t)128*padded,f)==(size_t)128*padded && fgetc(f)==EOF && !ferror(f);
         if(fclose(f))ok=false;
         if(!ok)goto done;
+        // The fixture holds the reference's padded [128][padded]; the tower takes own frames.
+        for(int m=1;m<128;m++)memmove(features[i].mel+(size_t)m*frames,features[i].mel+(size_t)m*padded,(size_t)frames*4);
     }
     {
         id<MTLBuffer> out=nil;
