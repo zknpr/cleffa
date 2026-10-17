@@ -25,7 +25,7 @@ Edit `metal/clef.metal`, then let Make regenerate `clef_metal_src.inc`. Regenera
 
 ## Testing guidelines
 
-Tests use standalone Python scripts, C assertions/comparisons, and shell checks. Follow `tests/test_*.py`, `test_*.c`, and `test_*.sh` naming. No coverage percentage is configured. Add regression cases for changed behavior. Require byte parity for host processing; use the FP32 reference as the engineering gate for numerical changes; hosted agreement and labeled accuracy are the headline metrics. Kernel changes must pass batch-invariance and NaN-poison checks, on the vision corpus too when they touch the tower or the embedding. Run relevant server tests for HTTP changes. Changing any `ref/corpus*.py` file invalidates the corresponding golden data.
+Tests use standalone Python scripts, C assertions/comparisons, and shell checks. Follow `tests/test_*.py`, `test_*.c`, and `test_*.sh` naming. No coverage percentage is configured. Add regression cases for changed behavior. Require byte parity for host processing; use the FP32 reference as the engineering gate for numerical changes (Clef-Omni instead uses the FP64-bounded rule in `CLAUDE.md`); hosted agreement and labeled accuracy are the headline metrics. Kernel changes must pass batch-invariance and NaN-poison checks, on the vision corpus too when they touch the tower or the embedding. Run relevant server tests for HTTP changes. Changing any `ref/corpus*.py` file invalidates the corresponding golden data.
 
 ## Commits and pull requests
 

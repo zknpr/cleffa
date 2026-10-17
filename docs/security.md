@@ -47,8 +47,10 @@ Requests and GGUF files are treated as untrusted:
   (`tests/test_server_encoded_video.py`, `tests/test_cli_errors.py`). `clef-tool`, the host test
   driver, always allows them. libav
   decodes each clip in a child process started without a shell. It inherits only stdin (a private,
-  unlinked copy of the clip), stdout and stderr, may open no other resource, and is killed after 30
-  seconds. Input is capped at 64 MiB, sampled RGB at 256 MiB and its JSON output at 384 MiB
+  unlinked copy of the clip), stdout and stderr, and is killed after 30 seconds. libav reads the
+  clip through an in-memory reader and can open no other input: `io_open` is denied, the protocol
+  whitelist is empty and MOV external references are off. Input is capped at 64 MiB, sampled RGB
+  at 256 MiB and its JSON output at 384 MiB
   ([docs/video.md](video.md#encoded-uploads)). This is process isolation, not an OS sandbox:
   the worker runs as the server's user with that user's files and network, so a libav bug reached
   by an uploaded clip runs code with those privileges. Frames are PNG/JPEG under the
