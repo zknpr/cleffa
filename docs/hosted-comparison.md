@@ -14,26 +14,19 @@ not interleaved, so they are absolute observations rather than paired comparison
 
 ## Fresh core comparison, 2026-10-10
 
-The final plan has 135 requests: 46 each for Flash and 27B, and 43 for Omni. Every native
-request went through strict localhost HTTP with the same serialized bytes as hosted, including
-encoded MOV videos. The hosted passes H1 and H2 ran at least 60 seconds apart for each model. No
-response exposed a model revision, all successful hosted answer objects were identical between
-passes, and failed calls count as failed coverage, not inferred answers.
-
-C is the integration branch's strict HTTP server, with media soft limits raised to admit the
-fixtures and startup warm-up and keep-warm disabled; its encoding and inference stay strict. B
-is stock BF16 on MPS with PyTorch 2.11.0 ([stock
-controls](performance-history.md#stock-pytorch-controls-2026-10-10)). F is the historical FP32
-reference used for attribution. The 2026-10-11 causal-attention finding
-[below](#corrected-bf16-comparison-2026-10-11) invalidates B as a precision-noise control; its
-answers and timings remain observations of the affected version. The historical Omni F arm
-includes native-input routing arbitration and cannot serve as independent numerical
-qualification.
-
-C/H1 agreement is the primary result. H2 gives the same values and is not pooled with H1.
-Probability statistics take each question's maximum absolute option difference, then its mean,
-linearly interpolated p99 and maximum. Wilson intervals treat questions as units; they are
-nominal because several questions can share a request.
+The plan has 135 requests: 46 each for Flash and 27B, 43 for Omni. C is the integration branch's
+strict localhost HTTP server, sent the same serialized bytes as hosted (encoded MOV videos
+included), with media soft limits raised to admit the fixtures and startup warm-up and keep-warm
+disabled. H1 and H2 are hosted passes at least 60 seconds apart; all successful answer objects
+were identical between them, so H2 is not pooled. B is stock BF16 on MPS with PyTorch 2.11.0
+([stock controls](performance-history.md#stock-pytorch-controls-2026-10-10)), no longer a
+precision-noise control after the [causal-attention
+finding](#corrected-bf16-comparison-2026-10-11). F is the historical FP32 reference used for
+attribution; Omni's F includes native-input routing arbitration and is not independent numerical
+qualification. Failed calls count as failed coverage. Probability statistics are the mean,
+linearly interpolated p99 and maximum of each question's maximum absolute option difference.
+Wilson intervals treat questions as units and are nominal, since several questions can share a
+request.
 
 | Model | C/H1 decisions | Wilson 95% | Mean / p99 / max probability difference | H1/H2 decisions | B/H1 decisions |
 |---|---:|---:|---:|---:|---:|
@@ -41,18 +34,16 @@ nominal because several questions can share a request.
 | 27B | 80/81 | 93.33–99.78% | 0.03353 / 0.24742 / 0.33790 | 81/81 | Unmeasured: stock load guard |
 | Omni | 86/93 | 85.27–96.31% | 0.04378 / 0.39530 / 0.47470 | 93/93 | Unmeasured: stock load guard |
 
-Hosted rejects ten of the 46 requests for each dense model: `v011`, `v012`, `vd001` and `vd004`
-for their explicit `media_kwargs`, and the other six video requests for audio/video input. These
-ten carry 22 questions, which is why the denominator is 81 rather than 103; no processor
-settings were removed to turn the rejections into passes. Omni hosted accepts every planned
-modality. Stock Flash completes 38 requests (87 questions) and fails its eight encoded-video
-requests in the processor; stock 27B and Omni stop while loading.
-
-`r001` and `r017` keep two-token hosted count differences on all three models (see the [number
+Hosted rejects ten of each dense model's 46 requests, carrying 22 questions (hence 81, not 103):
+`v011`, `v012`, `vd001` and `vd004` for explicit `media_kwargs`, the other six video requests for
+audio/video input. No processor settings were removed to admit them; Omni hosted accepts every
+modality. Stock Flash completes 38 requests (87 questions), failing its eight encoded-video
+requests in the processor; stock 27B and Omni stop while loading. `r001` and `r017` keep
+two-token hosted count differences on all three models ([number
 probe](#object-state-number-probe-2026-10-10)). On questions with matching reported counts and
-verified local C/F token IDs, C/H1 agreement is 74/75 for each dense model (95% interval
-92.83–99.76%) and 83/90 for Omni (84.81–96.18%). The fresh long requests have full hosted
-counts, so the older truncation observations below do not carry over to this deployment.
+verified C/F token IDs, C/H1 agreement is 74/75 for each dense model (92.83–99.76%) and 83/90 for
+Omni (84.81–96.18%). The fresh long requests have full hosted counts, so the older truncation
+observations below do not carry over.
 
 | Model / modality | C/H1 decisions | Mean / p99 / max probability difference |
 |---|---:|---:|
@@ -68,17 +59,13 @@ counts, so the older truncation observations below do not carry over to this dep
 | Omni video | 6/10 | 0.21903 / 0.46693 / 0.47470 |
 | Omni audio/video | 9/10 | 0.07892 / 0.19810 / 0.20110 |
 
-The probability differences are material even where decisions agree. Omni's video gap remains
-unresolved after the [transport probe](#omni-encoded-video-transport-probe-2026-10-10). Neither
-agreement with F nor the absence of a stock arm identifies hosted as wrong.
-
-A precision band was frozen before C/H scoring as the linear 95th percentile of B/F maximum
-option-probability differences: 87 Flash control questions and a threshold of 0.0822865884. The
-larger models have no B distribution and so no threshold. The causal-attention finding withdrew
-the band, because it reflects a backend correctness defect, not only precision variation. Its
-value and original classification remain in `precision-bands-wire.json` and
-`comparison-wire.json`; no replacement threshold was fitted after seeing C/H. Every disagreement
-is therefore unexplained:
+Probability differences are material even where decisions agree, and Omni's video gap survives
+the [transport probe](#omni-encoded-video-transport-probe-2026-10-10). Neither agreement with F
+nor the absence of a stock arm identifies hosted as wrong. The precision band frozen before C/H
+scoring (95th percentile of B/F differences over 87 Flash control questions, 0.0822865884) was
+withdrawn after the causal-attention finding; it remains in `precision-bands-wire.json` and
+`comparison-wire.json`, and no replacement was fitted after seeing C/H. Every disagreement is
+therefore unexplained, including small F margins without B evidence:
 
 | Model / disagreement | Native → hosted | FP32 top-two probability margin | Max probability difference | Stock control |
 |---|---|---:|---:|---|
@@ -92,9 +79,8 @@ is therefore unexplained:
 | Omni `ot004/direction` | right → still | 0.57130 | 0.47470 | Unavailable |
 | Omni `oav002/audible` | false → true | 0.05661 | 0.03070 | Unavailable |
 
-H2 repeats every listed disagreement. All have matching reported counts and verified C/F token
-IDs; hosted token IDs and media pixels are not exposed. Missing B evidence never classifies a
-small F margin as precision noise.
+All have matching reported counts and verified C/F token IDs; hosted token IDs and media pixels
+are not exposed.
 
 | Control comparison | Decisions agreeing | Mean / p99 / max probability difference |
 |---|---:|---:|
@@ -108,29 +94,22 @@ small F margin as precision noise.
 | Omni C/F, historical arbitrated reference | 93/93 | 0.000034 / 0.000049 / 0.000050 |
 | Omni H1/F, same values for H2/F | 86/93 | 0.04378 / 0.39532 / 0.47473 |
 
-All 27B and Omni comparisons involving B are unmeasured. H1/H2 probability differences are zero
-on every successful question. Evidence is in `golden/evaluation-standard-2026-10-10/`:
-`wire-plan.json`, `protocol.json`, `precision-bands-wire.json`, `hosted-wire-*.jsonl`, the
-native and stock captures, and `comparison-wire.json`, which records coverage failures, every
-question and every disagreement.
+Evidence is in `golden/evaluation-standard-2026-10-10/`: `wire-plan.json`, `protocol.json`,
+`precision-bands-wire.json`, `hosted-wire-*.jsonl`, the native and stock captures, and
+`comparison-wire.json` (coverage failures, every question and every disagreement).
 
 ## Labeled evaluation coverage, 2026-10-10
 
-`bench/labeled_eval.py` builds BANKING77 and CLINC150+OOS requests from pinned public test
-splits with the community Decision Index 0.2.1 templates and option ordering, and scores them
-with that harness's macro-F1, averaged over labels observed in gold or predictions. Cloudflare's
-run artifacts are unpublished, so this reproduces the public request construction, not its
-hosted evaluation row for row. BFCL and Amazon ESCI have not been run. Paired arms must send
-identical serialized bytes: an older local capture with literal Unicode is not paired with a
-hosted capture using ASCII escapes, even when the parsed JSON matches.
-
-Hosted captures have one pass each: 385 BANKING77 and 453 CLINC150+OOS requests for Flash, and
-329 BANKING77 and 70 CLINC150+OOS requests for Omni. The last covers fewer than half of CLINC's
-classes and cannot estimate a full-suite score. There is no 27B hosted labeled capture.
-Collection has stopped; later comparisons reuse these files without API calls.
-
-The integration branch answered all 838 paired Flash requests through strict HTTP with matching
-body bytes and reported token counts, and every answer equals the released engine's.
+`bench/labeled_eval.py` builds BANKING77 and CLINC150+OOS requests from pinned public test splits
+with the community Decision Index 0.2.1 templates and option ordering, and scores that harness's
+macro-F1, averaged over labels observed in gold or predictions. It reproduces the public request
+construction, not Cloudflare's unpublished hosted evaluation row for row; BFCL and Amazon ESCI
+have not been run. Pairs require identical serialized bytes, so captures with literal Unicode and
+with ASCII escapes are never paired. Hosted has one pass each: 385 BANKING77 and 453
+CLINC150+OOS requests for Flash, 329 and 70 for Omni (fewer than half of CLINC's classes, so no
+full-suite estimate), none for 27B. Native Flash (integration branch, strict HTTP) answered all
+838 paired requests with matching body bytes and reported token counts, and every answer equals
+the released engine's.
 
 | Flash subset | Examples / classes | Native accuracy / macro-F1 | Hosted accuracy / macro-F1 | Stock BF16 accuracy / macro-F1 | C/H agreement, Wilson 95% |
 |---|---:|---:|---:|---:|---:|
@@ -142,17 +121,14 @@ body bytes and reported token counts, and every answer equals the released engin
 | BANKING77 | 12 / 2 | 0.0129 | +0.0206, [0.0037, 0.0441] | 0.12882 / 0.44429 / 0.71380 |
 | CLINC150+OOS | 17 / 17 | 1.0 | +0.0047, [-0.0226, 0.0265] | 0.14106 / 0.44050 / 0.55910 |
 
-Macro-F1 intervals use 2,000 paired request-bootstrap replicates with seed 20261010, without
-label stratification; p-values are not adjusted for multiple comparisons. BANKING77 shows a
-native advantage on this sample. CLINC establishes neither superiority nor equivalence, and its
-identical accuracy hides many cases where both arms miss the label differently. Subset scores do
-not reproduce full-split leaderboard scores.
-
-Stock Flash answered all 838 requests without errors or runtime overrides: 339/385 BANKING77 and
-276/453 CLINC correct, against native's 336/385 and 247/453. These paired statistics describe
-the affected PyTorch 2.11 attention path; the [corrected
-comparison](#corrected-bf16-comparison-2026-10-11) no longer shows a significant CLINC
-advantage.
+Macro-F1 intervals use 2,000 paired request-bootstrap replicates, seed 20261010, without label
+stratification; p-values are not adjusted for multiple comparisons. BANKING77 shows a native
+advantage on this sample. CLINC establishes neither superiority nor equivalence; its equal
+accuracy hides many rows where both arms miss the label differently. Subset scores do not
+reproduce full-split leaderboard scores. Stock Flash answered all 838 requests without errors or
+runtime overrides (339/385 BANKING77 and 276/453 CLINC correct, against native's 336/385 and
+247/453) on the affected PyTorch 2.11 attention path; the [corrected
+comparison](#corrected-bf16-comparison-2026-10-11) shows no significant CLINC advantage.
 
 | Flash subset / pair | Decision agreement, Wilson 95% | Correct only first / only second | Exact McNemar p | First minus second macro-F1, paired 95% interval | Mean / p99 / max probability difference |
 |---|---:|---:|---:|---:|---:|
@@ -161,14 +137,11 @@ advantage.
 | CLINC150+OOS C/B | 311/453, 64.24–72.75% | 5 / 34 | 0.00000243 | -0.0500, [-0.0830, -0.0307] | 0.09253 / 0.34548 / 0.49740 |
 | CLINC150+OOS H/B | 371/453, 78.09–85.17% | 11 / 40 | 0.0000570 | -0.0547, [-0.0900, -0.0304] | 0.12754 / 0.50769 / 0.73550 |
 
-On all 19 BANKING77 C/H disagreements, stock chooses the native answer. Of the 164 CLINC C/H
-disagreements, stock matches hosted on 102, native on 42 and neither on 20
-(`labeled/decision-relationships.json`). These are decision relationships, not precision
-explanations: the labeled rows have no FP32 margin, and the core precision band does not
-transfer to this workload.
-
-The integration branch also answered all 399 available paired Omni requests through strict HTTP
-with matching body bytes and token counts.
+Stock chooses the native answer on all 19 BANKING77 C/H disagreements; of the 164 CLINC ones it
+matches hosted on 102, native on 42 and neither on 20 (`labeled/decision-relationships.json`).
+These are decision relationships, not precision explanations: the labeled rows have no FP32
+margin, and the core precision band does not transfer. Native Omni answered all 399 available
+paired requests through strict HTTP with matching body bytes and token counts:
 
 | Omni subset | Examples / observed gold classes | Native accuracy / macro-F1 | Hosted accuracy / macro-F1 | C/H agreement, Wilson 95% |
 |---|---:|---:|---:|---:|
@@ -180,39 +153,36 @@ with matching body bytes and token counts.
 | BANKING77 | 0 / 1 | 1.0 | -0.0033, [-0.0144, 0.0008] | 0.01212 / 0.07632 / 0.10830 |
 | CLINC150+OOS | 0 / 0 | 1.0 | 0.0000, [0.0000, 0.0000] | 0.00938 / 0.03545 / 0.03600 |
 
-The two BANKING77 disagreements are `test:1751` (native `option_39`, hosted and gold
-`option_43`) and `test:2675` (native `option_45`, hosted `option_39`, gold `option_66`; both
-wrong). Stock Omni produced no answers, so neither has a stock attribution. Identical CLINC
-decisions give a zero-width interval on these 70 rows, not a zero population difference. These
-text-task results do not bear on the core video discrepancies.
+The BANKING77 disagreements are `test:1751` (native `option_39`, hosted and gold `option_43`) and
+`test:2675` (native `option_45`, hosted `option_39`, gold `option_66`); without stock Omni
+answers, neither has a stock attribution. The zero-width CLINC interval reflects identical
+decisions on 70 rows, not a zero population difference. These text-task results do not bear on
+the core video discrepancies.
 
 Full-split local runs on the released `fce959f` engine have no hosted arm. Flash on all 3,080
 BANKING77 examples reaches accuracy **0.9078** and macro-F1 **0.9075**, request-bootstrap 95%
-interval **[0.8965, 0.9163]** (2,000 replicates, seed 20261010). That is close to the reported
-Flash leaderboard macro-F1 of 0.909, but not a paired comparison with Cloudflare's unpublished
-run. The paired full CLINC150+OOS run against stock BF16 PyTorch on MPS covers all 5,500
-requests, including 1,000 OOS examples, with identical request bytes:
+interval **[0.8965, 0.9163]** (2,000 replicates, seed 20261010): close to the reported Flash
+leaderboard macro-F1 of 0.909, but not paired with Cloudflare's unpublished run. Full
+CLINC150+OOS against stock BF16 PyTorch on MPS covers all 5,500 requests, including 1,000 OOS
+examples, with identical request bytes:
 
 | Full CLINC150+OOS arm | Accuracy | Macro-F1 | Macro-F1 95% interval |
 |---|---:|---:|---:|
 | Released native `fce959f` | 0.6318 | 0.6661 | [0.6506, 0.6740] |
 | Stock BF16 PyTorch, MPS | 0.6478 | 0.7110 | [0.6970, 0.7188] |
 
-Decisions agree on 3,956/5,500 rows. Native alone is correct on 212 rows and stock alone on 300
-(`p=0.0001164`, exact McNemar). The paired macro-F1 difference, native minus stock, is
-`-0.04485`, 95% interval `[-0.05258, -0.03871]` (1,000 replicates). This larger sample favors
-the affected stock implementation on these labels and cannot establish the quality of correctly
-masked BF16 inference; the corrected 5,500-row eager run and a full current-branch rerun have
-not been collected.
+Decisions agree on 3,956/5,500 rows; native alone is correct on 212 and stock alone on 300
+(`p=0.0001164`, exact McNemar). Native minus stock macro-F1 is `-0.04485`, 95% interval
+`[-0.05258, -0.03871]` (1,000 replicates). This favors the affected stock implementation and
+cannot establish the quality of correctly masked BF16 inference; the corrected 5,500-row eager
+run and a full current-branch rerun have not been collected.
 
-Three diagnostics used the same Flash requests. A stock FP32 control agrees with the released
-engine on all 384 BANKING77 rows whose bytes match across arms (`BANKING77:test:170` used
-literal Unicode in that local harness); it is a labeled diagnostic, not the BF16 baseline.
-Sorting CLINC request keys gives exactly the same 453 native responses; the changed bodies are
-not admitted as another hosted pair, and the probe does not explain the C/H gap. On the 453
-CLINC requests, `CLEF_HEAD_BF16=1` leaves every decision unchanged (247 correct), and adding
-`CLEF_ACT_F16=0` changes three decisions (245 correct). The stock CLINC shift is the attention
-defect below, not a missing native rounding switch; the defaults are unchanged.
+Diagnostics on the same Flash requests leave the defaults unchanged. A stock FP32 control, not
+the BF16 baseline, agrees with the released engine on all 384 byte-matched BANKING77 rows.
+Sorting CLINC request keys gives the same 453 native responses (not admitted as another hosted
+pair), so it does not explain the C/H gap. On CLINC, `CLEF_HEAD_BF16=1` changes no decision (247
+correct) and adding `CLEF_ACT_F16=0` changes three (245 correct): the stock CLINC shift is the
+attention defect below, not a missing native rounding switch.
 
 Sources and labels are pinned in `golden/labeled-evals-20261010/`. Scores are in
 `golden/evaluation-standard-2026-10-10/labeled/`: `released-flash-banking77-full-score.json`,
@@ -222,12 +192,11 @@ Sources and labels are pinned in `golden/labeled-evals-20261010/`. Scores are in
 ## Expanded Omni labeled results, 2026-10-11
 
 Completed local Omni and 27B subsets and an extended saved hosted Omni collection were rescored
-with zero new hosted calls. Omni's numerical qualification remains incomplete. Every paired row
-has identical recorded request bytes. The native arm combines strict HTTP captures with CLI
-captures: 329 HTTP plus 56 CLI rows on BANKING77, and 70 HTTP plus 262 CLI rows on the hosted
-CLINC subset. All 399 overlapping HTTP/CLI answer objects are identical. `BANKING77:test:170`
-uses its matching HTTP response, because the CLI request has literal Unicode and the hosted
-request ASCII escapes.
+with zero new hosted calls; Omni's numerical qualification remains incomplete. Native combines
+strict HTTP and CLI captures (329 HTTP plus 56 CLI rows on BANKING77, 70 HTTP plus 262 CLI rows
+on the hosted CLINC subset), whose 399 overlapping answer objects are identical;
+`BANKING77:test:170` uses its HTTP response, because the CLI request has literal Unicode and the
+hosted request ASCII escapes.
 
 | Exact-byte paired subset | Native correct / macro-F1 | Hosted correct / macro-F1 | Decision agreement, Wilson 95% | Exact McNemar p |
 |---|---:|---:|---:|---:|
@@ -235,14 +204,13 @@ request ASCII escapes.
 | CLINC150+OOS, 332 rows | 327/332 / 0.9854 | 326/332 / 0.9828 | 331/332, 98.31–99.95% | 1.0 |
 
 Native minus hosted macro-F1 is `-0.002624` on BANKING77, interval `[-0.011222, 0.000742]`, and
-`0.002649` on CLINC, interval `[0, 0.011029]`, from 1,000 pooled paired-request replicates with
-seed 20261010; neither establishes an accuracy advantage or equivalence. CLINC covers all 151
-gold classes but only 332 of 453 planned rows; the missing 121 hosted responses are not
-inferred, and only one hosted pass exists. Mean / p99 / maximum probability differences are
-`0.012604 / 0.083528 / 0.1083` for BANKING77 and `0.011024 / 0.069828 / 0.1383` for CLINC, on
-four-decimal responses. The two BANKING77 disagreements are unchanged; CLINC adds
-`CLINC150+OOS:test:264`, where native is correct and hosted wrong. Without a stock Omni capture,
-these differences have no stock attribution.
+`0.002649` on CLINC, interval `[0, 0.011029]` (1,000 pooled paired-request replicates, seed
+20261010); neither establishes an accuracy advantage or equivalence. CLINC covers all 151 gold
+classes but only 332 of 453 planned rows, from one hosted pass; the missing 121 hosted responses
+are not inferred. Mean / p99 / maximum probability differences on four-decimal responses are
+`0.012604 / 0.083528 / 0.1083` for BANKING77 and `0.011024 / 0.069828 / 0.1383` for CLINC. The
+two BANKING77 disagreements are unchanged; CLINC adds `CLINC150+OOS:test:264`, native correct and
+hosted wrong.
 
 | Local model | BANKING77 accuracy / macro-F1, 385 rows | CLINC accuracy / macro-F1, 453 rows |
 |---|---:|---:|
@@ -250,45 +218,37 @@ these differences have no stock attribution.
 | 27B, producer-reported released engine | 0.9169 / 0.9138 | 0.9735 / 0.9735 |
 
 The 27B handoff names the released `fce959f` engine but has no per-run binary record, so its
-provenance is producer-reported. These small stratified subsets are not the published full-split
-benchmark. Evidence:
-`golden/evaluation-standard-2026-10-10/labeled/omni-completed-20261011/manifest.json`.
-
-A 2026-10-17 recapture with the exact-rotary Omni default (CLI) reproduces every native decision
-on both subsets and the core 86/93 agreement with the same seven disagreements, scored against
-these saved hosted answers with no new calls. Ground truth for the core disagreements is in
-[the Omni report](omni.md#hosted-and-labeled-agreement); evidence is in `golden/omni-recheck-20261017/`.
+provenance is producer-reported. Evidence:
+`golden/evaluation-standard-2026-10-10/labeled/omni-completed-20261011/manifest.json`. A
+2026-10-17 CLI recapture with the exact-rotary Omni default, scored against these saved hosted
+answers, reproduces every native decision on both subsets and the core 86/93 agreement with the
+same seven disagreements; ground truth for those is in [the Omni
+report](omni.md#hosted-and-labeled-agreement), evidence in `golden/omni-recheck-20261017/`.
 
 ## Corrected BF16 comparison, 2026-10-11
 
 The stock Flash CLINC shift comes from PyTorch 2.11 MPS `scaled_dot_product_attention(...,
 is_causal=True)` on FP16/BF16 inputs, which the pinned HF path uses for unpadded records.
-`ref/mps_sdpa_causal.py` compares implicit causal masking with explicit masking and a CPU FP64
-calculation on exactly the same dtype-rounded operands. Across nine cases (head dimensions
-64/128/256, eight heads, 512 tokens, FP32/FP16/BF16), implicit FP16/BF16 causal attention has
-relative L2 error 0.402–0.432. Explicit masking reduces it to about 0.00020 for FP16 and 0.00160
-for BF16, and implicit FP32 stays below 4.53e-7.
-
-A follow-up with cuts at tokens 1, 2, 7, 17 and 256 shows that **all six implicit FP16/BF16
-cases leak future values**: changing values from token 1 onward changes token 0's output by as
-much as 3.9296875, despite its causal mask. All three FP32 cases and all nine explicit-mask
-controls keep exact prefix independence. The midpoint shows no change, which is why an earlier
-midpoint-only probe missed the defect. This proves leakage on the tested shapes; it does not
-identify the upstream fix. `ref/safe_attn.py` uses explicit masks with `is_causal=False`; the
-independent FP32 and FP64 Omni qualification failures are separate. Evidence under
-`golden/evaluation-standard-2026-10-10/`: `mps-causal-audit.json` and
+`ref/mps_sdpa_causal.py` compares implicit and explicit causal masking with CPU FP64 on exactly
+the same dtype-rounded operands. Across nine cases (head dimensions 64/128/256, eight heads, 512
+tokens, FP32/FP16/BF16), implicit FP16/BF16 causal attention has relative L2 error 0.402–0.432;
+explicit masking gives about 0.00020 for FP16 and 0.00160 for BF16, and implicit FP32 stays below
+4.53e-7. With cuts at tokens 1, 2, 7, 17 and 256, **all six implicit FP16/BF16 cases leak future
+values**: changing values from token 1 onward changes token 0's output by as much as 3.9296875,
+while all three FP32 cases and all nine explicit-mask controls keep exact prefix independence
+(the midpoint shows no change, so an earlier midpoint-only probe missed the defect). This proves
+leakage on the tested shapes, not the upstream fix. `ref/safe_attn.py` uses explicit masks
+with `is_causal=False`; the independent FP32 and FP64 Omni qualification failures are separate.
+Evidence under `golden/evaluation-standard-2026-10-10/`: `mps-causal-audit.json` and
 `mps-causal-early-boundaries-summary.json`.
 
 The finding changes evaluation attribution, not Cleffa inference or its numerical limits.
 Historical B arms, the old Flash BF16 golden and their timings remain available but cannot
-represent pure BF16 precision variation. A correctness audit can revoke a frozen control with
-source-bound evidence, but cannot alter its frozen threshold. Flash `r004/urgency` returns to
-unexplained. Recomputing every statistic from the original captures
+represent pure BF16 precision variation. The source-bound audit revokes the frozen control
+without altering its threshold; recomputing every statistic from the original captures
 (`comparison-wire-audited.json`, which binds `stock-control-correctness-audit.json`) leaves them
-all unchanged; only the invalid precision attribution is withdrawn.
-
-BF16 runs with eager attention were rescored as a separately named corrected variant on the same
-pinned dependencies, not a silent replacement for stock B:
+all unchanged. BF16 with eager attention, on the same pinned dependencies, is scored as a
+separately named corrected variant, not a silent replacement for stock B:
 
 | Exact-byte paired subset | Native correct | Eager BF16 correct | Decision agreement | Exact McNemar p | Native / eager macro-F1 |
 |---|---:|---:|---:|---:|---:|
@@ -296,23 +256,22 @@ pinned dependencies, not a silent replacement for stock B:
 | Current branch, CLINC150+OOS | 247/453 | 250/453 | 449/453 | 0.25 | 0.6156 / 0.6222 |
 | Released engine, full BANKING77 subset | 336/385 | 337/385 | 384/385 | 1.0 | 0.8709 / 0.8733 |
 
-The current BANKING77 pairing excludes `BANKING77:test:170`, whose saved native request uses
-ASCII escapes while the eager and released-engine requests use literal Unicode; all 838 current
-native answers, that row included, match the released engine's. On current CLINC, native minus
-eager macro-F1 is `-0.00657`, paired bootstrap 95% interval `[-0.01473, 0.00003]`, with mean/max
-probability difference `0.007679 / 0.0753`. BANKING77's mean/max is `0.004292 / 0.0287` on the
-384 paired rows. Intervals use 1,000 pooled paired-request replicates, seed 20261010. There is
-no significant accuracy difference on these subsets; that is not an equivalence test. The
-5,500-row corrected baseline and stock inference on a newer PyTorch remain unmeasured. Evidence:
+The current-branch BANKING77 pairing excludes `BANKING77:test:170`, whose saved native request
+uses ASCII escapes while the eager and released-engine requests use literal Unicode. On current
+CLINC, native minus eager macro-F1 is `-0.00657`, 95% interval `[-0.01473, 0.00003]` (1,000
+pooled paired-request replicates, seed 20261010). Mean/max probability difference is
+`0.007679 / 0.0753` on CLINC and `0.004292 / 0.0287` on the 384 BANKING77 rows. There is no
+significant accuracy difference on these subsets; that is not an equivalence test. The 5,500-row
+corrected baseline and stock inference on a newer PyTorch remain unmeasured. Evidence:
 `golden/evaluation-standard-2026-10-10/labeled/eager-corrected/manifest.json`.
 
 ## Omni encoded-video transport probe, 2026-10-10
 
-Five lossless MOV variants vary source frame rate, duration and frame count. Both hosted passes
-received the same encoded bodies as the local encoder. Before any hosted call, the native C
-worker's RGB bytes were checked against the pinned PyAV loader and native token IDs against the
-pinned processor. Doubling the source rate while repeating every frame (`vp000` versus `vp003`)
-gives identical local RGB, patches, positions, tokens and processor tensors.
+Five lossless MOV variants vary source frame rate, duration and frame count; both hosted passes
+received the local encoder's bodies. Native C-worker RGB bytes were first checked against the
+pinned PyAV loader and native token IDs against the pinned processor. Doubling the source rate
+while repeating every frame (`vp000` versus `vp003`) gives identical local RGB, patches,
+positions, tokens and processor tensors.
 
 | Variant | Source frames / FPS | Duration | Locally sampled frames | Local / hosted tokens | Hosted moving probability |
 |---|---:|---:|---:|---:|---:|
@@ -322,22 +281,18 @@ gives identical local RGB, patches, positions, tokens and processor tensors.
 | `vp003`, duplicated at double rate | 12 / 4 | 3 s | 6 | 652 / 652 | 0.4009 |
 | `vp004`, longer duplicated sequence | 12 / 2 | 6 s | 12 | 1,072 / 1,072 | 0.1583 |
 
-Every response was identical across two passes at least 60 seconds apart, and the three locally
-equivalent encodings `vp000`, `vp001` and `vp003` returned identical hosted answer objects.
-Token counts follow the sampled sequence length. This gives no evidence of frame-count or FPS
-transport loss on these fixtures, but does not expose hosted pixel values or resize arithmetic.
-Hosted selects `still` for all five variants, so transport alone does not explain the
-native/hosted video decision gap. The eleven calls reserved 105.43 neurons; conservative daily
-accounting after the probe was 6,087.89 neurons, below the [10,000-neuron free
-allowance](https://developers.cloudflare.com/workers-ai/platform/pricing/). Evidence:
+Responses were identical across two passes at least 60 seconds apart, and the locally equivalent
+`vp000`, `vp001` and `vp003` returned identical hosted answer objects. Token counts follow the
+sampled sequence length: no evidence of frame-count or FPS transport loss on these fixtures,
+though hosted pixel values and resize arithmetic are not exposed. Hosted selects `still` for all
+five variants, so transport alone does not explain the video decision gap. Evidence:
 `golden/evaluation-standard-2026-10-10/` (`video-transport-plan.json`,
 `hosted-video-transport.jsonl`, `video-transport-summary.json`, `free-budget-ledger.jsonl`).
 
 ## Object-state number probe, 2026-10-10
 
 Six hosted Flash calls, including the warm-up, are in
-`golden/cloudflare-serialization-probe-20261010/run.jsonl`; offline validation checked the plan,
-every response and all planned calls.
+`golden/cloudflare-serialization-probe-20261010/run.jsonl`.
 
 | Payload | Local tokens | Hosted tokens | Hosted answers |
 |---|---:|---:|---|
@@ -347,16 +302,15 @@ every response and all planned calls.
 | Original `r017` | 200 | 198 | Baseline |
 | `r017`, JavaScript-style numeric representation | 198 | 198 | Identical to original |
 
-Identical means equal returned answer objects, whose probabilities are rounded to four decimals;
-the changed-value control shows that this precision can distinguish a nearby value on `r001`.
-The results support normalization of integral floats and signed zero before hosted encoding. The
-`r017` variant also replaced `12345678901234567890` with `12345678901234567000`, as a JavaScript
-JSON round trip would. Because that change was bundled with the signed-zero normalization,
-hosted large-integer rounding remains an inference; Cleffa and the pinned Python encoder keep
-the exact integer. Only Flash received this probe, and hosted token IDs and the server's
-serializer are not exposed. The core comparison keeps its original payloads and reports the
-count mismatch. The user chose to keep Cleffa's Python-compatible numeric behavior; no
-hosted-compatible serialization mode will be added for this integration.
+Identical means equal returned answer objects, with probabilities rounded to four decimals; the
+changed-value control shows this precision can distinguish a nearby value on `r001`. The results
+support normalization of integral floats and signed zero before hosted encoding. The `r017`
+variant also replaced `12345678901234567890` with `12345678901234567000`, as a JavaScript JSON
+round trip would, but bundled with the signed-zero normalization, so hosted large-integer
+rounding remains an inference; Cleffa and the pinned Python encoder keep the exact integer. Only
+Flash received this probe, and hosted token IDs and the server's serializer are not exposed. The
+core comparison keeps its original payloads. The user chose to keep Cleffa's Python-compatible
+numeric behavior; no hosted-compatible serialization mode will be added for this integration.
 
 ## Checkout fixtures over Workers AI, 2026-10-04
 
